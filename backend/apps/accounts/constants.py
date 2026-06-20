@@ -1,0 +1,13 @@
+ROLE_SYSTEM_ADMIN = "system_admin"
+ROLE_SHIFT_MANAGER = "shift_manager"
+ROLE_SUPERVISOR = "supervisor"
+ROLE_STAFF = "staff"
+ROLE_VIEWER = "viewer"
+
+ROLE_CHOICES = [
+    ROLE_SYSTEM_ADMIN,
+    ROLE_SHIFT_MANAGER,
+    ROLE_SUPERVISOR,
+    ROLE_STAFF,
+    ROLE_VIEWER,
+]

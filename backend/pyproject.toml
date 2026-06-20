@@ -1,0 +1,44 @@
+[project]
+name = "findmanager-backend"
+version = "0.1.0"
+description = "Find Sports Club management backend"
+requires-python = ">=3.13"
+dependencies = [
+  "Django>=5.2,<5.3",
+  "djangorestframework>=3.16,<3.17",
+  "drf-spectacular>=0.28,<0.29",
+  "psycopg[binary]>=3.2,<3.3",
+  "django-filter>=25.1,<26",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4,<9",
+  "pytest-django>=4.11,<5",
+  "ruff>=0.12,<0.13",
+]
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["config", "apps", "apps.accounts", "apps.common"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings"
+pythonpath = ["."]
+testpaths = ["apps"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"apps/*/migrations/*.py" = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"

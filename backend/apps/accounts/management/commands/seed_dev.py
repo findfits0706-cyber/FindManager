@@ -1,3 +1,5 @@
+import os
+
 from django.conf import settings
 from django.contrib.auth.models import Group
 from django.core.management.base import BaseCommand, CommandError
@@ -15,6 +17,13 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         if not settings.DEBUG:
             raise CommandError("本番環境では seed_dev を実行できません。")
+
+        seed_password = os.getenv("DEV_SEED_PASSWORD")
+        if not seed_password:
+            seed_password = DEFAULT_PASSWORD
+            self.stdout.write(
+                self.style.WARNING("DEV_SEED_PASSWORD が未設定のため、既定の開発用パスワードを使用します。")
+            )
 
         ensure_roles()
         for role in ROLE_CHOICES:
@@ -36,9 +45,9 @@ class Command(BaseCommand):
             if role == "system_admin":
                 user.is_staff = True
                 user.is_superuser = True
-            user.set_password(DEFAULT_PASSWORD)
+            user.set_password(seed_password)
             user.save()
             user.groups.set(Group.objects.filter(name=role))
             label = "created" if created else "updated"
             self.stdout.write(f"{label}: {username}")
-        self.stdout.write(self.style.SUCCESS(f"Initial password: {DEFAULT_PASSWORD}"))
+        self.stdout.write(self.style.SUCCESS("開発用ユーザーの投入が完了しました。"))

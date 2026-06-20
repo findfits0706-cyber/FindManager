@@ -4,6 +4,10 @@
 - Backend: Django + DRF
 - Frontend: React + Vite
 - DB: PostgreSQL 本番想定、ローカル簡易実行は SQLite 対応
+- SQLite は簡易ローカル開発専用
+- 正式な開発確認、CI、本番は PostgreSQL を使用
+- 予約競合、排他制御、制約の正式検証は PostgreSQL を前提とする
+- SQLite のみのテスト成功は完了条件にしない
 
 ## 認証方式
 - Django セッション認証

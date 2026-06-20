@@ -4,6 +4,7 @@ from django.middleware.csrf import get_token
 from django.utils import timezone
 from rest_framework import permissions, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
@@ -29,6 +30,7 @@ from .services import (
     create_audit_event,
     invalidate_user_sessions,
     is_last_system_admin,
+    would_remove_last_system_admin,
 )
 
 
@@ -182,7 +184,7 @@ class StaffViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         roles = serializer.validated_data["roles"]
         if not can_assign_roles(self.request.user, roles):
-            raise permissions.PermissionDenied("指定された権限グループを付与できません。")
+            raise PermissionDenied("指定された権限グループを付与できません。")
         user = serializer.save()
         create_audit_event(
             event_type=AuditEvent.EventType.ACCOUNT_CREATED,
@@ -202,8 +204,12 @@ class StaffViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         current_roles = instance.role_keys
         new_roles = serializer.validated_data.get("roles", current_roles)
+        if self.request.user.has_role(ROLE_SHIFT_MANAGER) and instance.has_role(ROLE_SYSTEM_ADMIN):
+            raise PermissionDenied("system_adminは編集できません。")
         if not can_assign_roles(self.request.user, new_roles):
-            raise permissions.PermissionDenied("指定された権限グループを付与できません。")
+            raise PermissionDenied("指定された権限グループを付与できません。")
+        if would_remove_last_system_admin(instance, new_roles):
+            raise PermissionDenied("最後のsystem_admin権限は解除できません。")
         user = serializer.save()
         create_audit_event(
             event_type=AuditEvent.EventType.ACCOUNT_UPDATED,

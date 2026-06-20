@@ -110,8 +110,24 @@ def can_assign_roles(actor: User, role_names: list[str]) -> bool:
     return False
 
 
+def eligible_system_admins():
+    return User.objects.filter(
+        groups__name=ROLE_SYSTEM_ADMIN,
+        is_active=True,
+        employment_status__in=[
+            User.EmploymentStatus.ACTIVE,
+            User.EmploymentStatus.LEAVE_OF_ABSENCE,
+        ],
+    ).distinct()
+
+
 def is_last_system_admin(user: User) -> bool:
+    return user.has_role(ROLE_SYSTEM_ADMIN) and eligible_system_admins().exclude(pk=user.pk).count() == 0
+
+
+def would_remove_last_system_admin(target: User, new_roles: list[str]) -> bool:
     return (
-        user.has_role(ROLE_SYSTEM_ADMIN)
-        and User.objects.filter(groups__name=ROLE_SYSTEM_ADMIN, is_active=True).exclude(pk=user.pk).count() == 0
+        target.has_role(ROLE_SYSTEM_ADMIN)
+        and ROLE_SYSTEM_ADMIN not in new_roles
+        and eligible_system_admins().exclude(pk=target.pk).count() == 0
     )

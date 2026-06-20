@@ -44,6 +44,11 @@ class BaseAPITestCase(APITestCase):
         self.client.get("/api/v1/auth/csrf/")
         return self.client.post("/api/v1/auth/login/", {"username": username, "password": password}, format="json")
 
+    def force_client(self, user):
+        client = APIClient()
+        client.force_authenticate(user=user)
+        return client
+
 
 class TestAuth(BaseAPITestCase):
     def test_login_success(self):
@@ -131,7 +136,6 @@ class TestStaffPermissions(BaseAPITestCase):
             "username": "newstaff",
             "display_name": "New Staff",
             "employee_code": "EMP-NEW",
-            "employment_status": "active",
             "must_change_password": True,
             "roles": ["staff"],
             "temporary_password": "TempPass123!",
@@ -151,15 +155,13 @@ class TestStaffPermissions(BaseAPITestCase):
             self.assertEqual(response.status_code, expected)
 
     def test_non_admin_cannot_assign_system_admin(self):
-        client = APIClient()
-        client.force_authenticate(user=self.shift_manager)
+        client = self.force_client(self.shift_manager)
         response = client.post(
             "/api/v1/staff/",
             {
                 "username": "admin2",
                 "display_name": "Admin 2",
                 "employee_code": "EMP-A2",
-                "employment_status": "active",
                 "must_change_password": True,
                 "roles": ["system_admin"],
                 "temporary_password": "TempPass123!",
@@ -169,8 +171,7 @@ class TestStaffPermissions(BaseAPITestCase):
         self.assertEqual(response.status_code, 400)
 
     def test_cannot_deactivate_self(self):
-        client = APIClient()
-        client.force_authenticate(user=self.system_admin)
+        client = self.force_client(self.system_admin)
         response = client.post(
             f"/api/v1/staff/{self.system_admin.pk}/deactivate/",
             {"reason": "self", "employment_status": "suspended"},
@@ -179,8 +180,7 @@ class TestStaffPermissions(BaseAPITestCase):
         self.assertEqual(response.status_code, 400)
 
     def test_cannot_deactivate_last_system_admin(self):
-        client = APIClient()
-        client.force_authenticate(user=self.shift_manager)
+        client = self.force_client(self.shift_manager)
         response = client.post(
             f"/api/v1/staff/{self.system_admin.pk}/deactivate/",
             {"reason": "test", "employment_status": "suspended"},
@@ -190,8 +190,7 @@ class TestStaffPermissions(BaseAPITestCase):
 
     def test_staff_deactivate_and_reject_new_login(self):
         self.login()
-        client = APIClient()
-        client.force_authenticate(user=self.system_admin)
+        client = self.force_client(self.system_admin)
         response = client.post(
             f"/api/v1/staff/{self.staff.pk}/deactivate/",
             {"reason": "stop", "employment_status": "suspended"},
@@ -208,8 +207,7 @@ class TestStaffPermissions(BaseAPITestCase):
         client.get("/api/v1/auth/csrf/")
         client.post("/api/v1/auth/login/", {"username": "staff", "password": PASSWORD}, format="json")
         self.assertEqual(Session.objects.count(), 1)
-        admin_client = APIClient()
-        admin_client.force_authenticate(user=self.system_admin)
+        admin_client = self.force_client(self.system_admin)
         admin_client.post(
             f"/api/v1/staff/{self.staff.pk}/deactivate/",
             {"reason": "stop", "employment_status": "suspended"},
@@ -221,8 +219,7 @@ class TestStaffPermissions(BaseAPITestCase):
         self.staff.is_active = False
         self.staff.employment_status = User.EmploymentStatus.SUSPENDED
         self.staff.save()
-        client = APIClient()
-        client.force_authenticate(user=self.system_admin)
+        client = self.force_client(self.system_admin)
         response = client.post(
             f"/api/v1/staff/{self.staff.pk}/reactivate/",
             {"employment_status": "active"},
@@ -233,17 +230,120 @@ class TestStaffPermissions(BaseAPITestCase):
         self.assertTrue(self.staff.is_active)
 
     def test_delete_not_allowed(self):
-        client = APIClient()
-        client.force_authenticate(user=self.system_admin)
+        client = self.force_client(self.system_admin)
         response = client.delete(f"/api/v1/staff/{self.staff.pk}/")
         self.assertEqual(response.status_code, 405)
 
     def test_audit_events_recorded(self):
-        client = APIClient()
-        client.force_authenticate(user=self.system_admin)
+        client = self.force_client(self.system_admin)
         client.patch(
             f"/api/v1/staff/{self.staff.pk}/",
             {"display_name": "Updated", "roles": ["staff"]},
             format="json",
         )
         self.assertTrue(AuditEvent.objects.filter(event_type="account_updated").exists())
+
+    def test_created_staff_is_always_active(self):
+        client = self.force_client(self.system_admin)
+        response = client.post(
+            "/api/v1/staff/",
+            {
+                "username": "createdstaff",
+                "display_name": "Created Staff",
+                "employee_code": "EMP-CREATED",
+                "must_change_password": True,
+                "roles": ["staff"],
+                "temporary_password": "TempPass123!",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        created = User.objects.get(username="createdstaff")
+        self.assertTrue(created.is_active)
+        self.assertEqual(created.employment_status, User.EmploymentStatus.ACTIVE)
+
+    def test_create_rejects_employment_status_override(self):
+        client = self.force_client(self.system_admin)
+        response = client.post(
+            "/api/v1/staff/",
+            {
+                "username": "badcreate",
+                "display_name": "Bad Create",
+                "employee_code": "EMP-BADCREATE",
+                "employment_status": User.EmploymentStatus.SUSPENDED,
+                "must_change_password": True,
+                "roles": ["staff"],
+                "temporary_password": "TempPass123!",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("employment_status", response.data)
+
+    def test_patch_rejects_employment_status_update(self):
+        client = self.force_client(self.system_admin)
+        response = client.patch(
+            f"/api/v1/staff/{self.staff.pk}/",
+            {"employment_status": User.EmploymentStatus.SUSPENDED, "roles": ["staff"]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("employment_status", response.data)
+
+    def test_patch_rejects_is_active_update(self):
+        client = self.force_client(self.system_admin)
+        response = client.patch(
+            f"/api/v1/staff/{self.staff.pk}/",
+            {"is_active": False, "roles": ["staff"]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("is_active", response.data)
+
+    def test_patch_rejects_deactivation_fields_update(self):
+        client = self.force_client(self.system_admin)
+        response = client.patch(
+            f"/api/v1/staff/{self.staff.pk}/",
+            {
+                "deactivated_at": "2026-06-21T00:00:00+09:00",
+                "deactivated_by": str(self.system_admin.pk),
+                "deactivation_reason": "manual",
+                "roles": ["staff"],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("deactivated_at", response.data)
+        self.assertIn("deactivated_by", response.data)
+        self.assertIn("deactivation_reason", response.data)
+
+    def test_last_system_admin_role_cannot_be_removed(self):
+        client = self.force_client(self.system_admin)
+        response = client.patch(
+            f"/api/v1/staff/{self.system_admin.pk}/",
+            {"roles": ["shift_manager"]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["roles"][0], "最後のsystem_admin権限は解除できません。")
+
+    def test_system_admin_role_can_be_removed_when_multiple_admins_exist(self):
+        another_admin = self.create_user("system_admin_2", ROLE_SYSTEM_ADMIN)
+        client = self.force_client(self.system_admin)
+        response = client.patch(
+            f"/api/v1/staff/{another_admin.pk}/",
+            {"roles": ["staff"]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        another_admin.refresh_from_db()
+        self.assertFalse(another_admin.has_role(ROLE_SYSTEM_ADMIN))
+
+    def test_shift_manager_cannot_edit_system_admin(self):
+        client = self.force_client(self.shift_manager)
+        response = client.patch(
+            f"/api/v1/staff/{self.system_admin.pk}/",
+            {"display_name": "Edited by shift manager"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)

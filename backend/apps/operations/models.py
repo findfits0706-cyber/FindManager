@@ -202,32 +202,36 @@ class StaffLocation(ActiveOrderedModel):
         if self.valid_until and self.valid_from > self.valid_until:
             errors["valid_until"] = "valid_until must be on or after valid_from."
 
-        overlapping_periods = StaffLocation.objects.filter(
-            staff_id=self.staff_id,
-            location_id=self.location_id,
-            valid_from__lte=self.valid_until or self.valid_from,
-        ).filter(models.Q(valid_until__isnull=True) | models.Q(valid_until__gte=self.valid_from))
-        if self.valid_until is None:
+        if self.is_active:
             overlapping_periods = StaffLocation.objects.filter(
                 staff_id=self.staff_id,
                 location_id=self.location_id,
+                is_active=True,
+                valid_from__lte=self.valid_until or self.valid_from,
             ).filter(models.Q(valid_until__isnull=True) | models.Q(valid_until__gte=self.valid_from))
-        if self.pk:
-            overlapping_periods = overlapping_periods.exclude(pk=self.pk)
-        if overlapping_periods.exists():
-            errors["non_field_errors"] = "This staff location period overlaps an existing record."
-
-        if self.is_primary:
-            primary_overlap = StaffLocation.objects.filter(
-                staff_id=self.staff_id,
-                is_primary=True,
-            ).filter(models.Q(valid_until__isnull=True) | models.Q(valid_until__gte=self.valid_from))
-            if self.valid_until is not None:
-                primary_overlap = primary_overlap.filter(valid_from__lte=self.valid_until)
+            if self.valid_until is None:
+                overlapping_periods = StaffLocation.objects.filter(
+                    staff_id=self.staff_id,
+                    location_id=self.location_id,
+                    is_active=True,
+                ).filter(models.Q(valid_until__isnull=True) | models.Q(valid_until__gte=self.valid_from))
             if self.pk:
-                primary_overlap = primary_overlap.exclude(pk=self.pk)
-            if primary_overlap.exists():
-                errors["is_primary"] = "Primary location periods cannot overlap."
+                overlapping_periods = overlapping_periods.exclude(pk=self.pk)
+            if overlapping_periods.exists():
+                errors["non_field_errors"] = "This staff location period overlaps an existing active record."
+
+            if self.is_primary:
+                primary_overlap = StaffLocation.objects.filter(
+                    staff_id=self.staff_id,
+                    is_primary=True,
+                    is_active=True,
+                ).filter(models.Q(valid_until__isnull=True) | models.Q(valid_until__gte=self.valid_from))
+                if self.valid_until is not None:
+                    primary_overlap = primary_overlap.filter(valid_from__lte=self.valid_until)
+                if self.pk:
+                    primary_overlap = primary_overlap.exclude(pk=self.pk)
+                if primary_overlap.exists():
+                    errors["is_primary"] = "Primary location periods cannot overlap."
 
         if errors:
             raise ValidationError(errors)
@@ -282,16 +286,18 @@ class StaffCapability(ActiveOrderedModel):
         if self.valid_until and self.valid_from > self.valid_until:
             errors["valid_until"] = "valid_until must be on or after valid_from."
 
-        overlap_query = StaffCapability.objects.filter(
-            staff_id=self.staff_id,
-            work_type_id=self.work_type_id,
-            location_id=self.location_id,
-        ).filter(models.Q(valid_until__isnull=True) | models.Q(valid_until__gte=self.valid_from))
-        if self.valid_until is not None:
-            overlap_query = overlap_query.filter(valid_from__lte=self.valid_until)
-        if self.pk:
-            overlap_query = overlap_query.exclude(pk=self.pk)
-        if overlap_query.exists():
-            errors["non_field_errors"] = "This staff capability period overlaps an existing record."
+        if self.is_active:
+            overlap_query = StaffCapability.objects.filter(
+                staff_id=self.staff_id,
+                work_type_id=self.work_type_id,
+                location_id=self.location_id,
+                is_active=True,
+            ).filter(models.Q(valid_until__isnull=True) | models.Q(valid_until__gte=self.valid_from))
+            if self.valid_until is not None:
+                overlap_query = overlap_query.filter(valid_from__lte=self.valid_until)
+            if self.pk:
+                overlap_query = overlap_query.exclude(pk=self.pk)
+            if overlap_query.exists():
+                errors["non_field_errors"] = "This staff capability period overlaps an existing active record."
         if errors:
             raise ValidationError(errors)

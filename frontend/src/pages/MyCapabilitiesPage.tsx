@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
+import { formatCapabilityLevel } from "../lib/capabilityLevels";
 import type { MyCapability, MyStaffLocation, Paginated } from "../lib/types";
 
 export function MyCapabilitiesPage({ section = "both" }: { section?: "both" | "locations" | "capabilities" }) {
@@ -27,7 +28,7 @@ export function MyCapabilitiesPage({ section = "both" }: { section?: "both" | "l
       <div className="section-header">
         <div>
           <p className="eyebrow">Operations</p>
-          <h2>自分の所属・対応可能業務</h2>
+          <h2>自分の所属・対応可能資格</h2>
         </div>
       </div>
       {(section === "both" || section === "locations") && (
@@ -36,7 +37,7 @@ export function MyCapabilitiesPage({ section = "both" }: { section?: "both" | "l
           <table className="table">
             <thead>
               <tr>
-                <th>施設名</th>
+                <th>拠点名</th>
                 <th>主所属</th>
                 <th>有効開始日</th>
                 <th>有効終了日</th>
@@ -59,13 +60,13 @@ export function MyCapabilitiesPage({ section = "both" }: { section?: "both" | "l
       )}
       {(section === "both" || section === "capabilities") && (
         <>
-          <h3>対応可能業務</h3>
+          <h3>対応可能資格</h3>
           <table className="table">
             <thead>
               <tr>
-                <th>業務名</th>
+                <th>業務種別</th>
                 <th>レベル</th>
-                <th>施設名</th>
+                <th>拠点名</th>
                 <th>有効開始日</th>
                 <th>承認者</th>
                 <th>承認日時</th>
@@ -76,7 +77,7 @@ export function MyCapabilitiesPage({ section = "both" }: { section?: "both" | "l
               {capabilitiesQuery.data?.results.map((capability) => (
                 <tr key={capability.id}>
                   <td>{capability.work_type_name}</td>
-                  <td>{capability.level}</td>
+                  <td>{formatCapabilityLevel(capability.level)}</td>
                   <td>{capability.location_name ?? "-"}</td>
                   <td>{capability.valid_from}</td>
                   <td>{capability.approved_by_display_name || "-"}</td>

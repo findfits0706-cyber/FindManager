@@ -2,16 +2,51 @@ import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { api } from "../api/client";
 import { useAuth } from "../features/auth/AuthContext";
 
+type NavItem = {
+  to: string;
+  label: string;
+};
+
 export function AppShell() {
   const { user, setUser } = useAuth();
   const navigate = useNavigate();
 
-  const isSystemAdmin = user?.roles.includes("system_admin") ?? false;
-  const isShiftManager = user?.roles.includes("shift_manager") ?? false;
-  const isSupervisor = user?.roles.includes("supervisor") ?? false;
+  const roles = user?.roles ?? [];
+  const isSystemAdmin = roles.includes("system_admin");
+  const isShiftManager = roles.includes("shift_manager");
+  const isSupervisor = roles.includes("supervisor");
+  const isStaff = roles.includes("staff");
+  const isViewer = roles.includes("viewer");
+
+  const canViewStaff = isSystemAdmin || isShiftManager || isSupervisor;
   const canViewOperations = isSystemAdmin || isShiftManager || isSupervisor;
-  const canManageAssignments = isSystemAdmin || isShiftManager;
-  const isSelfOnly = user?.roles.includes("staff") || user?.roles.includes("viewer");
+  const canViewAssignments = isSystemAdmin || isShiftManager || isSupervisor;
+  const canViewSelfPages = canViewOperations || isStaff || isViewer;
+
+  const navItems: NavItem[] = [
+    ...(canViewStaff ? [{ to: "/staff", label: "スタッフ管理" }] : []),
+    ...(canViewOperations
+      ? [
+          { to: "/operations/locations", label: "拠点管理" },
+          { to: "/operations/work-areas", label: "業務エリア" },
+          { to: "/operations/work-categories", label: "業務カテゴリ" },
+          { to: "/operations/work-types", label: "業務種別" },
+          { to: "/operations/work-type-availabilities", label: "業務種別適用" },
+        ]
+      : []),
+    ...(canViewAssignments
+      ? [
+          { to: "/operations/staff-locations", label: "スタッフ所属" },
+          { to: "/operations/staff-capabilities", label: "スタッフ対応可能資格" },
+        ]
+      : []),
+    ...(canViewSelfPages
+      ? [
+          { to: "/operations/my-staff-locations", label: "自分の所属" },
+          { to: "/operations/my-capabilities", label: "自分の対応可能資格" },
+        ]
+      : []),
+  ];
 
   const logout = async () => {
     await api("/api/v1/auth/logout/", { method: "POST", body: JSON.stringify({}) });
@@ -27,28 +62,11 @@ export function AppShell() {
           <h1>FindManager</h1>
         </div>
         <nav className="side-nav">
-          {(isSystemAdmin || isShiftManager || isSupervisor) && <NavLink to="/staff">スタッフ管理</NavLink>}
-          {isSystemAdmin && (
-            <>
-              <NavLink to="/operations/locations">施設管理</NavLink>
-              <NavLink to="/operations/work-areas">作業エリア</NavLink>
-              <NavLink to="/operations/work-categories">作業カテゴリ</NavLink>
-              <NavLink to="/operations/work-types">作業種別</NavLink>
-            </>
-          )}
-          {canViewOperations && <NavLink to="/operations/work-type-availabilities">作業種別適用</NavLink>}
-          {canManageAssignments && (
-            <>
-              <NavLink to="/operations/staff-locations">スタッフ所属</NavLink>
-              <NavLink to="/operations/staff-capabilities">スタッフ対応可能業務</NavLink>
-            </>
-          )}
-          {(isSelfOnly || canViewOperations) && (
-            <>
-              <NavLink to="/operations/my-staff-locations">自分の所属</NavLink>
-              <NavLink to="/operations/my-capabilities">自分の対応可能業務</NavLink>
-            </>
-          )}
+          {navItems.map((item) => (
+            <NavLink key={item.to} to={item.to}>
+              {item.label}
+            </NavLink>
+          ))}
         </nav>
       </aside>
       <div className="content-area">
@@ -56,7 +74,7 @@ export function AppShell() {
           <div>
             <strong>{user?.display_name}</strong>
             <div className="subtle-text">
-              {user?.employee_code} / {user?.roles.join(", ")}
+              {user?.employee_code} / {roles.join(", ")}
             </div>
           </div>
           <button type="button" onClick={() => void logout()}>

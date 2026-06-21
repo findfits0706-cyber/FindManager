@@ -1,6 +1,10 @@
 from collections.abc import Iterable
 
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
+from rest_framework.serializers import ValidationError as DRFValidationError
 
 from apps.accounts.constants import (
     ROLE_SHIFT_MANAGER,
@@ -23,7 +27,8 @@ from .models import (
 )
 
 MASTER_ADMIN_ROLES = {ROLE_SYSTEM_ADMIN}
-MASTER_VIEW_ROLES = {ROLE_SYSTEM_ADMIN, ROLE_SHIFT_MANAGER, ROLE_SUPERVISOR}
+MASTER_INACTIVE_VIEW_ROLES = {ROLE_SYSTEM_ADMIN, ROLE_SHIFT_MANAGER, ROLE_SUPERVISOR}
+MASTER_ACTIVE_VIEW_ROLES = MASTER_INACTIVE_VIEW_ROLES | {ROLE_STAFF, ROLE_VIEWER}
 STAFF_SELF_ROLES = {ROLE_STAFF, ROLE_VIEWER}
 
 
@@ -36,9 +41,11 @@ def can_manage_masters(user: User) -> bool:
 
 
 def can_view_master_records(user: User) -> bool:
-    return user.is_authenticated and (
-        user_has_any_role(user, MASTER_VIEW_ROLES) or user_has_any_role(user, STAFF_SELF_ROLES)
-    )
+    return user.is_authenticated and user_has_any_role(user, MASTER_ACTIVE_VIEW_ROLES)
+
+
+def can_view_inactive_master_records(user: User) -> bool:
+    return user.is_authenticated and user_has_any_role(user, MASTER_INACTIVE_VIEW_ROLES)
 
 
 def can_manage_staff_relationships(user: User) -> bool:
@@ -62,11 +69,27 @@ def filter_queryset_for_user(queryset, user: User, staff_field: str = "staff"):
 
 
 def visible_master_queryset(queryset, user: User):
-    if user_has_any_role(user, MASTER_VIEW_ROLES):
+    if can_view_inactive_master_records(user):
         return queryset
-    if user_has_any_role(user, STAFF_SELF_ROLES):
+    if not user_has_any_role(user, STAFF_SELF_ROLES):
+        return queryset.none()
+
+    model = queryset.model
+    if model is Location:
         return queryset.filter(is_active=True)
-    return queryset.none()
+    if model is WorkArea:
+        return queryset.filter(is_active=True, location__is_active=True)
+    if model is WorkCategory:
+        return queryset.filter(is_active=True)
+    if model is WorkType:
+        return queryset.filter(is_active=True, category__is_active=True)
+    if model is WorkTypeAvailability:
+        return queryset.filter(
+            is_active=True,
+            work_type__is_active=True,
+            location__is_active=True,
+        ).filter(Q(work_area__isnull=True) | Q(work_area__is_active=True))
+    return queryset.filter(is_active=True)
 
 
 EVENT_MAP = {
@@ -136,13 +159,36 @@ def reactivate_instance(instance):
     instance.save(update_fields=["is_active", "updated_at"])
 
 
+def validate_and_reactivate(instance, extra_updates: dict | None = None):
+    extra_updates = extra_updates or {}
+    original_values = {"is_active": instance.is_active}
+    original_values.update({field_name: getattr(instance, field_name) for field_name in extra_updates})
+
+    try:
+        with transaction.atomic():
+            instance.is_active = True
+            for field_name, value in extra_updates.items():
+                setattr(instance, field_name, value)
+            instance.full_clean()
+            update_fields = ["is_active", "updated_at", *extra_updates.keys()]
+            instance.save(update_fields=list(dict.fromkeys(update_fields)))
+    except DjangoValidationError as exc:
+        for field_name, value in original_values.items():
+            setattr(instance, field_name, value)
+        raise DRFValidationError(
+            exc.message_dict if hasattr(exc, "message_dict") else {"non_field_errors": exc.messages}
+        ) from exc
+
+    return instance
+
+
 def seed_operations(dev_users: dict[str, User]) -> None:
     locations = {
         "main": Location.objects.update_or_create(
             code="main",
             defaults={
                 "name": "ファインドスポーツクラブ",
-                "short_name": "本部",
+                "short_name": "本館",
                 "timezone": "Asia/Tokyo",
                 "display_order": 10,
             },
@@ -174,8 +220,8 @@ def seed_operations(dev_users: dict[str, User]) -> None:
             ("front", "フロント"),
             ("pool", "プール"),
             ("studio", "スタジオ"),
-            ("office", "事務所"),
-            ("all", "全部署共通"),
+            ("office", "事務局"),
+            ("all", "全部門共通"),
         ],
         "findfits": [
             ("training", "トレーニングエリア"),
@@ -219,8 +265,8 @@ def seed_operations(dev_users: dict[str, User]) -> None:
         ("gym_duty", "ジムメニュー", "general", 60, "blue", False, False, False, False),
         ("front_duty", "受付対応", "reception", 60, "green", False, False, False, False),
         ("office_work", "バックオフィス", "general", 60, "slate", False, False, False, False),
-        ("open_tasks", "オープン作業", "general", 30, "amber", False, False, False, False),
-        ("close_tasks", "クローズ作業", "general", 30, "amber", False, False, False, False),
+        ("open_tasks", "オープン業務", "general", 30, "amber", False, False, False, False),
+        ("close_tasks", "クローズ業務", "general", 30, "amber", False, False, False, False),
         ("gym_cleaning", "ジム清掃", "cleaning", 30, "cyan", False, False, False, False),
         ("findfits_cleaning", "FindFits清掃", "cleaning", 30, "cyan", False, False, False, False),
         ("facility_cleaning", "館内清掃", "cleaning", 45, "cyan", False, False, False, False),

@@ -113,6 +113,35 @@ class TestOperationModels(OperationsBaseTestCase):
         with self.assertRaises(ValidationError):
             instance.clean()
 
+    def test_inactive_staff_location_does_not_block_active_overlap(self):
+        existing = self.staff.staff_locations.first()
+        existing.is_active = False
+        existing.save(update_fields=["is_active", "updated_at"])
+        instance = StaffLocation(
+            staff=self.staff,
+            location=existing.location,
+            is_primary=True,
+            valid_from=existing.valid_from,
+            valid_until=None,
+            is_active=True,
+        )
+        instance.clean()
+
+    def test_inactive_staff_capability_does_not_block_active_overlap(self):
+        existing = self.staff.staff_capabilities.first()
+        existing.is_active = False
+        existing.save(update_fields=["is_active", "updated_at"])
+        instance = StaffCapability(
+            staff=self.staff,
+            work_type=existing.work_type,
+            location=existing.location,
+            level=StaffCapability.Level.TRAINEE,
+            valid_from=existing.valid_from,
+            valid_until=None,
+            is_active=True,
+        )
+        instance.clean()
+
     def test_work_type_validation_rules(self):
         work_type = WorkType(
             category=WorkCategory.objects.get(code="general"),
@@ -196,6 +225,49 @@ class TestOperationPermissions(OperationsBaseTestCase):
         response = client.get(f"/api/v1/locations/{location.pk}/")
         self.assertEqual(response.status_code, 404)
 
+    def test_staff_cannot_list_inactive_locations_even_with_filter(self):
+        location = Location.objects.get(code="findfits")
+        location.is_active = False
+        location.save(update_fields=["is_active", "updated_at"])
+        client = self.force_client(self.staff)
+        response = client.get("/api/v1/locations/?is_active=false")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 0)
+
+    def test_staff_cannot_view_work_area_under_inactive_location(self):
+        location = Location.objects.get(code="findfits")
+        location.is_active = False
+        location.save(update_fields=["is_active", "updated_at"])
+        work_area = WorkArea.objects.filter(location=location).first()
+        client = self.force_client(self.staff)
+        response = client.get(f"/api/v1/work-areas/{work_area.pk}/")
+        self.assertEqual(response.status_code, 404)
+
+    def test_staff_cannot_view_work_type_under_inactive_category(self):
+        category = WorkCategory.objects.get(code="general")
+        category.is_active = False
+        category.save(update_fields=["is_active", "updated_at"])
+        work_type = WorkType.objects.filter(category=category).first()
+        client = self.force_client(self.staff)
+        response = client.get(f"/api/v1/work-types/{work_type.pk}/")
+        self.assertEqual(response.status_code, 404)
+
+    def test_staff_cannot_view_inactive_work_type_availability(self):
+        availability = WorkTypeAvailability.objects.filter(work_area__isnull=False).first()
+        availability.is_active = False
+        availability.save(update_fields=["is_active", "updated_at"])
+        client = self.force_client(self.staff)
+        response = client.get(f"/api/v1/work-type-availabilities/{availability.pk}/")
+        self.assertEqual(response.status_code, 404)
+
+    def test_supervisor_can_view_inactive_master_records(self):
+        location = Location.objects.get(code="findfits")
+        location.is_active = False
+        location.save(update_fields=["is_active", "updated_at"])
+        client = self.force_client(self.supervisor)
+        response = client.get(f"/api/v1/locations/{location.pk}/")
+        self.assertEqual(response.status_code, 200)
+
 
 class TestOperationApi(OperationsBaseTestCase):
     def test_location_list_filter(self):
@@ -274,6 +346,22 @@ class TestOperationApi(OperationsBaseTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(AuditEvent.objects.filter(event_type="staff_location_reactivated").exists())
 
+    def test_staff_location_reactivate_validation_returns_400(self):
+        client = self.force_client(self.shift_manager)
+        existing = self.staff.staff_locations.first()
+        conflicting = StaffLocation.objects.create(
+            staff=self.staff,
+            location=existing.location,
+            is_primary=False,
+            valid_from=existing.valid_from,
+            valid_until=None,
+            is_active=False,
+        )
+        response = client.post(f"/api/v1/staff-locations/{conflicting.pk}/reactivate/", {}, format="json")
+        self.assertEqual(response.status_code, 400)
+        conflicting.refresh_from_db()
+        self.assertFalse(conflicting.is_active)
+
     def test_staff_capability_reactivate(self):
         client = self.force_client(self.shift_manager)
         capability = StaffCapability.objects.create(
@@ -291,6 +379,52 @@ class TestOperationApi(OperationsBaseTestCase):
         self.assertEqual(capability.approved_by_id, self.shift_manager.pk)
         self.assertIsNotNone(capability.approved_at)
         self.assertTrue(AuditEvent.objects.filter(event_type="staff_capability_reactivated").exists())
+
+    def test_staff_capability_reactivate_validation_returns_400(self):
+        client = self.force_client(self.shift_manager)
+        existing = self.staff.staff_capabilities.first()
+        capability = StaffCapability.objects.create(
+            staff=self.staff,
+            work_type=existing.work_type,
+            location=existing.location,
+            level="assisted",
+            valid_from=existing.valid_from,
+            valid_until=None,
+            is_active=False,
+        )
+        response = client.post(f"/api/v1/staff-capabilities/{capability.pk}/reactivate/", {}, format="json")
+        self.assertEqual(response.status_code, 400)
+        capability.refresh_from_db()
+        self.assertFalse(capability.is_active)
+        self.assertIsNone(capability.approved_by)
+        self.assertIsNone(capability.approved_at)
+
+    def test_work_type_availability_reactivate_validation_returns_400(self):
+        client = self.force_client(self.system_admin)
+        inactive_location = Location.objects.get(code="findpilates")
+        inactive_location.is_active = False
+        inactive_location.save(update_fields=["is_active", "updated_at"])
+        availability = WorkTypeAvailability.objects.create(
+            work_type=WorkType.objects.get(code="meeting"),
+            location=inactive_location,
+            work_area=None,
+            is_active=False,
+        )
+        response = client.post(f"/api/v1/work-type-availabilities/{availability.pk}/reactivate/", {}, format="json")
+        self.assertEqual(response.status_code, 400)
+        availability.refresh_from_db()
+        self.assertFalse(availability.is_active)
+
+    def test_location_reactivate_validation_returns_400(self):
+        client = self.force_client(self.system_admin)
+        inactive = Location.objects.get(code="findpilates")
+        inactive.is_active = False
+        inactive.name = ""
+        inactive.save(update_fields=["is_active", "name", "updated_at"])
+        response = client.post(f"/api/v1/locations/{inactive.pk}/reactivate/", {}, format="json")
+        self.assertEqual(response.status_code, 400)
+        inactive.refresh_from_db()
+        self.assertFalse(inactive.is_active)
 
     def test_delete_api_absent(self):
         client = self.force_client(self.system_admin)

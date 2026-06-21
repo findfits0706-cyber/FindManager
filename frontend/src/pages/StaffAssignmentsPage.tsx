@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Navigate } from "react-router-dom";
 import { api } from "../api/client";
 import { useAuth } from "../features/auth/AuthContext";
+import { capabilityLevelOptions, formatCapabilityLevel } from "../lib/capabilityLevels";
 import type { Location, Paginated, Staff, WorkType } from "../lib/types";
 
 type ResourceKey = "staff-locations" | "staff-capabilities";
@@ -15,7 +16,8 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
   const canView = canManage || roles.includes("supervisor");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [error, setError] = useState("");
-  const [filters, setFilters] = useState({ staff: "", location: "", level: "", search: "" });
+  const [actionId, setActionId] = useState<string | null>(null);
+  const [filters, setFilters] = useState({ staff: "", location: "", level: "" });
 
   const staffQuery = useQuery({
     enabled: canView,
@@ -33,32 +35,35 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
     queryFn: () => api<Paginated<WorkType>>("/api/v1/work-types/?page_size=100"),
   });
 
-  const config = useMemo(() => {
-    return resource === "staff-locations"
-      ? {
-          title: "スタッフ所属",
-          endpoint: "/api/v1/staff-locations/",
-          initial: { staff: "", location: "", is_primary: false, valid_from: "", valid_until: "" } as FormState,
-        }
-      : {
-          title: "スタッフ対応可能業務",
-          endpoint: "/api/v1/staff-capabilities/",
-          initial: {
-            staff: "",
-            work_type: "",
-            location: "",
-            level: "trainee",
-            valid_from: "",
-            valid_until: "",
-            notes: "",
-          } as FormState,
-        };
-  }, [resource]);
+  const config = useMemo(
+    () =>
+      resource === "staff-locations"
+        ? {
+            title: "スタッフ所属",
+            endpoint: "/api/v1/staff-locations/",
+            initial: { staff: "", location: "", is_primary: false, valid_from: "", valid_until: "" } as FormState,
+          }
+        : {
+            title: "スタッフ対応可能資格",
+            endpoint: "/api/v1/staff-capabilities/",
+            initial: {
+              staff: "",
+              work_type: "",
+              location: "",
+              level: "trainee",
+              valid_from: "",
+              valid_until: "",
+              notes: "",
+            } as FormState,
+          },
+    [resource],
+  );
 
   const [form, setForm] = useState<FormState>(config.initial);
   useEffect(() => {
     setForm(config.initial);
     setEditingId(null);
+    setError("");
   }, [config.initial]);
 
   const listQuery = useQuery({
@@ -85,6 +90,7 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
 
   const handleEdit = (item: Record<string, unknown>) => {
     setEditingId(String(item.id));
+    setError("");
     setForm({
       ...config.initial,
       ...Object.fromEntries(
@@ -109,9 +115,24 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
   };
 
   const toggleActive = async (itemId: string, active: boolean) => {
-    const action = active ? "deactivate" : "reactivate";
-    await api(`${config.endpoint}${itemId}/${action}/`, { method: "POST", body: JSON.stringify({ confirm: true }) });
-    await listQuery.refetch();
+    const message = active
+      ? "このデータを無効化します。よろしいですか？"
+      : "このデータを再有効化します。よろしいですか？";
+    if (!window.confirm(message)) {
+      return;
+    }
+
+    setError("");
+    setActionId(itemId);
+    try {
+      const action = active ? "deactivate" : "reactivate";
+      await api(`${config.endpoint}${itemId}/${action}/`, { method: "POST", body: JSON.stringify({ confirm: true }) });
+      await listQuery.refetch();
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : "状態変更に失敗しました。");
+    } finally {
+      setActionId(null);
+    }
   };
 
   if (listQuery.isLoading) {
@@ -143,7 +164,7 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
           </select>
         </label>
         <label>
-          施設絞り込み
+          拠点絞り込み
           <select value={filters.location} onChange={(e) => setFilters((current) => ({ ...current, location: e.target.value }))}>
             <option value="">すべて</option>
             {locationQuery.data?.results.map((item) => (
@@ -158,10 +179,11 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
             レベル絞り込み
             <select value={filters.level} onChange={(e) => setFilters((current) => ({ ...current, level: e.target.value }))}>
               <option value="">すべて</option>
-              <option value="trainee">trainee</option>
-              <option value="assisted">assisted</option>
-              <option value="independent">independent</option>
-              <option value="trainer">trainer</option>
+              {capabilityLevelOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
             </select>
           </label>
         )}
@@ -183,7 +205,7 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
             {resource === "staff-locations" ? (
               <>
                 <label>
-                  施設
+                  拠点
                   <select value={String(form.location ?? "")} onChange={(e) => setForm((current) => ({ ...current, location: e.target.value }))}>
                     <option value="">選択してください</option>
                     {locationQuery.data?.results.map((item) => (
@@ -209,7 +231,7 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
             ) : (
               <>
                 <label>
-                  作業種別
+                  業務種別
                   <select value={String(form.work_type ?? "")} onChange={(e) => setForm((current) => ({ ...current, work_type: e.target.value }))}>
                     <option value="">選択してください</option>
                     {workTypeQuery.data?.results.map((item) => (
@@ -220,7 +242,7 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
                   </select>
                 </label>
                 <label>
-                  施設
+                  拠点
                   <select value={String(form.location ?? "")} onChange={(e) => setForm((current) => ({ ...current, location: e.target.value }))}>
                     <option value="">共通</option>
                     {locationQuery.data?.results.map((item) => (
@@ -233,10 +255,11 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
                 <label>
                   レベル
                   <select value={String(form.level ?? "")} onChange={(e) => setForm((current) => ({ ...current, level: e.target.value }))}>
-                    <option value="trainee">trainee</option>
-                    <option value="assisted">assisted</option>
-                    <option value="independent">independent</option>
-                    <option value="trainer">trainer</option>
+                    {capabilityLevelOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
                   </select>
                 </label>
                 <label>
@@ -269,7 +292,7 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
         <thead>
           <tr>
             <th>スタッフ</th>
-            <th>{resource === "staff-locations" ? "施設" : "作業種別"}</th>
+            <th>{resource === "staff-locations" ? "拠点" : "業務種別"}</th>
             <th>{resource === "staff-locations" ? "主所属" : "レベル"}</th>
             <th>有効開始日</th>
             <th>有効終了日</th>
@@ -281,8 +304,8 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
           {listQuery.data?.results.map((item) => (
             <tr key={String(item.id)}>
               <td>{String(item.staff_display_name ?? item.staff ?? "-")}</td>
-              <td>{String(item.location_name ?? item.work_type_name ?? item.work_type ?? "-")}</td>
-              <td>{resource === "staff-locations" ? (item.is_primary ? "主所属" : "-") : String(item.level ?? "-")}</td>
+              <td>{resource === "staff-locations" ? String(item.location_name ?? item.location ?? "-") : String(item.work_type_name ?? item.work_type ?? "-")}</td>
+              <td>{resource === "staff-locations" ? (item.is_primary ? "主所属" : "-") : formatCapabilityLevel(String(item.level ?? ""))}</td>
               <td>{String(item.valid_from ?? "-")}</td>
               <td>{String(item.valid_until ?? "-")}</td>
               <td>{item.is_active ? "有効" : "無効"}</td>
@@ -292,7 +315,11 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
                     <button type="button" onClick={() => handleEdit(item)}>
                       編集
                     </button>
-                    <button type="button" onClick={() => void toggleActive(String(item.id), Boolean(item.is_active))}>
+                    <button
+                      type="button"
+                      disabled={actionId === String(item.id)}
+                      onClick={() => void toggleActive(String(item.id), Boolean(item.is_active))}
+                    >
                       {item.is_active ? "無効化" : "再有効化"}
                     </button>
                   </>

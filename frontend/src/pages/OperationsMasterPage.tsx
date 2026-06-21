@@ -28,6 +28,7 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
+  const [actionId, setActionId] = useState<string | null>(null);
 
   const config: ResourceConfig = useMemo(() => {
     const canViewOperations = (items: string[]) =>
@@ -35,28 +36,28 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
     const canManageMasters = (items: string[]) => items.includes("system_admin");
     return {
       locations: {
-        title: "施設管理",
+        title: "拠点管理",
         endpoint: "/api/v1/locations/",
         canAccess: canViewOperations,
         canManage: canManageMasters,
         initial: { code: "", name: "", short_name: "", timezone: "Asia/Tokyo" } as FormState,
       },
       "work-areas": {
-        title: "作業エリア",
+        title: "業務エリア",
         endpoint: "/api/v1/work-areas/",
         canAccess: canViewOperations,
         canManage: canManageMasters,
         initial: { location: "", code: "", name: "" } as FormState,
       },
       "work-categories": {
-        title: "作業カテゴリ",
+        title: "業務カテゴリ",
         endpoint: "/api/v1/work-categories/",
         canAccess: canViewOperations,
         canManage: canManageMasters,
         initial: { code: "", name: "" } as FormState,
       },
       "work-types": {
-        title: "作業種別",
+        title: "業務種別",
         endpoint: "/api/v1/work-types/",
         canAccess: canViewOperations,
         canManage: canManageMasters,
@@ -77,7 +78,7 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
         } as FormState,
       },
       "work-type-availabilities": {
-        title: "作業種別適用",
+        title: "業務種別適用",
         endpoint: "/api/v1/work-type-availabilities/",
         canAccess: canViewOperations,
         canManage: canManageMasters,
@@ -91,6 +92,7 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
     setForm(config.initial);
     setEditingId(null);
     setSearch("");
+    setError("");
   }, [config.initial, resource]);
 
   const locationQuery = useQuery({
@@ -131,6 +133,7 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
 
   const handleEdit = (item: Record<string, unknown>) => {
     setEditingId(String(item.id));
+    setError("");
     setForm({
       ...config.initial,
       ...Object.fromEntries(
@@ -165,9 +168,24 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
   };
 
   const toggleActive = async (itemId: string, active: boolean) => {
-    const action = active ? "deactivate" : "reactivate";
-    await api(`${config.endpoint}${itemId}/${action}/`, { method: "POST", body: JSON.stringify({ confirm: true }) });
-    await listQuery.refetch();
+    const message = active
+      ? "このデータを無効化します。よろしいですか？"
+      : "このデータを再有効化します。よろしいですか？";
+    if (!window.confirm(message)) {
+      return;
+    }
+
+    setError("");
+    setActionId(itemId);
+    try {
+      const action = active ? "deactivate" : "reactivate";
+      await api(`${config.endpoint}${itemId}/${action}/`, { method: "POST", body: JSON.stringify({ confirm: true }) });
+      await listQuery.refetch();
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : "状態変更に失敗しました。");
+    } finally {
+      setActionId(null);
+    }
   };
 
   if (listQuery.isLoading) {
@@ -187,7 +205,7 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
         </div>
       </div>
       <div className="toolbar">
-        <input placeholder="名称・コード検索" value={search} onChange={(event) => setSearch(event.target.value)} />
+        <input placeholder="名称・コードで検索" value={search} onChange={(event) => setSearch(event.target.value)} />
         {editingId ? (
           <button type="button" onClick={resetForm}>
             編集をキャンセル
@@ -206,11 +224,11 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
                       <input value={String(form.code ?? "")} onChange={(e) => setForm((current) => ({ ...current, code: e.target.value }))} />
                     </label>
                     <label>
-                      施設名
+                      拠点名
                       <input value={String(form.name ?? "")} onChange={(e) => setForm((current) => ({ ...current, name: e.target.value }))} />
                     </label>
                     <label>
-                      省略名
+                      略称
                       <input value={String(form.short_name ?? "")} onChange={(e) => setForm((current) => ({ ...current, short_name: e.target.value }))} />
                     </label>
                     <label>
@@ -235,7 +253,7 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
             {resource === "work-areas" && (
               <>
                 <label>
-                  施設
+                  拠点
                   <select value={String(form.location ?? "")} onChange={(e) => setForm((current) => ({ ...current, location: e.target.value }))}>
                     <option value="">選択してください</option>
                     {locationQuery.data?.results.map((item) => (
@@ -273,7 +291,7 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
                   <input value={String(form.code ?? "")} onChange={(e) => setForm((current) => ({ ...current, code: e.target.value }))} />
                 </label>
                 <label>
-                  業務名
+                  名称
                   <input value={String(form.name ?? "")} onChange={(e) => setForm((current) => ({ ...current, name: e.target.value }))} />
                 </label>
                 <label>
@@ -281,11 +299,11 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
                   <input value={String(form.short_name ?? "")} onChange={(e) => setForm((current) => ({ ...current, short_name: e.target.value }))} />
                 </label>
                 <label>
-                  所要時間
+                  標準時間
                   <input type="number" value={String(form.default_duration_minutes ?? "")} onChange={(e) => setForm((current) => ({ ...current, default_duration_minutes: e.target.value }))} />
                 </label>
                 <label>
-                  最少人数
+                  最小人数
                   <input type="number" value={String(form.minimum_staff_count ?? "")} onChange={(e) => setForm((current) => ({ ...current, minimum_staff_count: e.target.value }))} />
                 </label>
                 <label>
@@ -304,11 +322,11 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
                 </label>
                 <label className="checkbox">
                   <input type="checkbox" checked={toBoolean(form.requires_capability ?? false)} onChange={(e) => setForm((current) => ({ ...current, requires_capability: e.target.checked }))} />
-                  対応可能業務必須
+                  対応可能資格が必要
                 </label>
                 <label className="checkbox">
                   <input type="checkbox" checked={toBoolean(form.can_overlap ?? false)} onChange={(e) => setForm((current) => ({ ...current, can_overlap: e.target.checked }))} />
-                  重複可
+                  重複可能
                 </label>
                 <label className="checkbox">
                   <input type="checkbox" checked={toBoolean(form.is_break ?? false)} onChange={(e) => setForm((current) => ({ ...current, is_break: e.target.checked }))} />
@@ -327,7 +345,7 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
             {resource === "work-type-availabilities" && (
               <>
                 <label>
-                  作業種別
+                  業務種別
                   <select value={String(form.work_type ?? "")} onChange={(e) => setForm((current) => ({ ...current, work_type: e.target.value }))}>
                     <option value="">選択してください</option>
                     {workTypeQuery.data?.results.map((item) => (
@@ -338,7 +356,7 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
                   </select>
                 </label>
                 <label>
-                  施設
+                  拠点
                   <select value={String(form.location ?? "")} onChange={(e) => setForm((current) => ({ ...current, location: e.target.value }))}>
                     <option value="">選択してください</option>
                     {locationQuery.data?.results.map((item) => (
@@ -349,9 +367,9 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
                   </select>
                 </label>
                 <label>
-                  作業エリア
+                  業務エリア
                   <select value={String(form.work_area ?? "")} onChange={(e) => setForm((current) => ({ ...current, work_area: e.target.value }))}>
-                    <option value="">全体共通</option>
+                    <option value="">全エリア共通</option>
                     {workAreaQuery.data?.results.map((item) => (
                       <option key={item.id} value={item.id}>
                         {item.name}
@@ -368,6 +386,8 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
           </div>
         </form>
       ) : null}
+      {!canManage ? <p className="subtle-text">この画面は閲覧のみです。</p> : null}
+      {!canManage && error ? <p className="error">{error}</p> : null}
       <table className="table">
         <thead>
           <tr>
@@ -391,7 +411,11 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
                     <button type="button" onClick={() => handleEdit(item)}>
                       編集
                     </button>
-                    <button type="button" onClick={() => void toggleActive(String(item.id), Boolean(item.is_active))}>
+                    <button
+                      type="button"
+                      disabled={actionId === String(item.id)}
+                      onClick={() => void toggleActive(String(item.id), Boolean(item.is_active))}
+                    >
                       {item.is_active ? "無効化" : "再有効化"}
                     </button>
                   </>

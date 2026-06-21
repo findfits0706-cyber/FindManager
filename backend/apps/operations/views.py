@@ -28,11 +28,10 @@ from .serializers import (
 from .services import (
     can_manage_masters,
     can_manage_staff_relationships,
-    can_view_master_records,
     deactivate_instance,
     filter_queryset_for_user,
-    reactivate_instance,
     record_operations_event,
+    validate_and_reactivate,
     visible_master_queryset,
 )
 
@@ -108,8 +107,7 @@ class MasterViewSet(OperationsBaseViewSet):
         if not can_manage_masters(request.user):
             raise PermissionDenied("Only system admins can perform this action.")
         instance = self.get_object()
-        instance.full_clean()
-        reactivate_instance(instance)
+        validate_and_reactivate(instance)
         record_operations_event(
             entity=self.entity_name,
             action="reactivate",
@@ -218,9 +216,7 @@ class WorkTypeAvailabilityViewSet(OperationsBaseViewSet):
         return [permissions.IsAuthenticated()]
 
     def get_queryset(self):
-        queryset = self.queryset
-        if not can_view_master_records(self.request.user):
-            queryset = queryset.filter(is_active=True)
+        queryset = visible_master_queryset(self.queryset, self.request.user)
         params = self.request.query_params
         if params.get("work_type"):
             queryset = queryset.filter(work_type_id=params["work_type"])
@@ -288,8 +284,7 @@ class WorkTypeAvailabilityViewSet(OperationsBaseViewSet):
         if not can_manage_masters(request.user):
             raise PermissionDenied("Only system admins can perform this action.")
         instance = self.get_object()
-        instance.full_clean()
-        reactivate_instance(instance)
+        validate_and_reactivate(instance)
         record_operations_event(
             entity="work_type_availability",
             action="reactivate",
@@ -389,8 +384,7 @@ class StaffLocationViewSet(OperationsBaseViewSet):
         if not can_manage_staff_relationships(request.user):
             raise PermissionDenied("You do not have permission to manage staff assignments.")
         instance = self.get_object()
-        instance.full_clean()
-        reactivate_instance(instance)
+        validate_and_reactivate(instance)
         record_operations_event(
             entity="staff_location",
             action="reactivate",
@@ -502,11 +496,13 @@ class StaffCapabilityViewSet(OperationsBaseViewSet):
         if not can_manage_staff_relationships(request.user):
             raise PermissionDenied("You do not have permission to manage staff capabilities.")
         instance = self.get_object()
-        instance.approved_by = request.user
-        instance.approved_at = timezone.now()
-        instance.full_clean()
-        reactivate_instance(instance)
-        instance.save(update_fields=["approved_by", "approved_at", "updated_at"])
+        validate_and_reactivate(
+            instance,
+            extra_updates={
+                "approved_by": request.user,
+                "approved_at": timezone.now(),
+            },
+        )
         record_operations_event(
             entity="staff_capability",
             action="reactivate",

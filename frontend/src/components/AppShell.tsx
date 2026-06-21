@@ -37,13 +37,13 @@ export function AppShell() {
     ...(canViewAssignments
       ? [
           { to: "/operations/staff-locations", label: "スタッフ所属" },
-          { to: "/operations/staff-capabilities", label: "スタッフ対応可能資格" },
+          { to: "/operations/staff-capabilities", label: "スタッフ対応可能業務" },
         ]
       : []),
     ...(canViewSelfPages
       ? [
           { to: "/operations/my-staff-locations", label: "自分の所属" },
-          { to: "/operations/my-capabilities", label: "自分の対応可能資格" },
+          { to: "/operations/my-capabilities", label: "自分の対応可能業務" },
         ]
       : []),
   ];

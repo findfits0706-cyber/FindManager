@@ -28,7 +28,7 @@ export function MyCapabilitiesPage({ section = "both" }: { section?: "both" | "l
       <div className="section-header">
         <div>
           <p className="eyebrow">Operations</p>
-          <h2>自分の所属・対応可能資格</h2>
+          <h2>自分の所属・対応可能業務</h2>
         </div>
       </div>
       {(section === "both" || section === "locations") && (
@@ -60,7 +60,7 @@ export function MyCapabilitiesPage({ section = "both" }: { section?: "both" | "l
       )}
       {(section === "both" || section === "capabilities") && (
         <>
-          <h3>対応可能資格</h3>
+          <h3>対応可能業務</h3>
           <table className="table">
             <thead>
               <tr>

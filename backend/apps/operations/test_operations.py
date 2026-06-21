@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.db import IntegrityError
@@ -284,7 +286,7 @@ class TestOperationApi(OperationsBaseTestCase):
 
     def test_staff_capability_reference_date_filter(self):
         client = self.force_client(self.system_admin)
-        response = client.get("/api/v1/staff-capabilities/?reference_date=2026-06-21")
+        response = client.get(f"/api/v1/staff-capabilities/?reference_date={timezone.localdate()}")
         self.assertEqual(response.status_code, 200)
         self.assertGreaterEqual(response.data["count"], 1)
 
@@ -349,11 +351,12 @@ class TestOperationApi(OperationsBaseTestCase):
     def test_staff_location_reactivate_validation_returns_400(self):
         client = self.force_client(self.shift_manager)
         existing = self.staff.staff_locations.first()
+        valid_from = existing.valid_from + timedelta(days=1)
         conflicting = StaffLocation.objects.create(
             staff=self.staff,
             location=existing.location,
             is_primary=False,
-            valid_from=existing.valid_from,
+            valid_from=valid_from,
             valid_until=None,
             is_active=False,
         )
@@ -383,12 +386,13 @@ class TestOperationApi(OperationsBaseTestCase):
     def test_staff_capability_reactivate_validation_returns_400(self):
         client = self.force_client(self.shift_manager)
         existing = self.staff.staff_capabilities.first()
+        valid_from = existing.valid_from + timedelta(days=1)
         capability = StaffCapability.objects.create(
             staff=self.staff,
             work_type=existing.work_type,
             location=existing.location,
             level="assisted",
-            valid_from=existing.valid_from,
+            valid_from=valid_from,
             valid_until=None,
             is_active=False,
         )

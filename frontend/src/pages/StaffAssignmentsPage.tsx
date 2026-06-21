@@ -17,6 +17,7 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [actionId, setActionId] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [filters, setFilters] = useState({ staff: "", location: "", level: "" });
 
   const staffQuery = useQuery({
@@ -44,7 +45,7 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
             initial: { staff: "", location: "", is_primary: false, valid_from: "", valid_until: "" } as FormState,
           }
         : {
-            title: "スタッフ対応可能資格",
+            title: "スタッフ対応可能業務",
             endpoint: "/api/v1/staff-capabilities/",
             initial: {
               staff: "",
@@ -101,7 +102,11 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (isSubmitting) {
+      return;
+    }
     setError("");
+    setIsSubmitting(true);
     try {
       const payload = Object.fromEntries(Object.entries(form).filter(([, value]) => value !== ""));
       const path = editingId ? `${config.endpoint}${editingId}/` : config.endpoint;
@@ -111,6 +116,8 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
       await listQuery.refetch();
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "保存に失敗しました。");
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -284,7 +291,9 @@ export function StaffAssignmentsPage({ resource }: { resource: ResourceKey }) {
                 編集をキャンセル
               </button>
             ) : null}
-            <button type="submit">{editingId ? "更新" : "新規作成"}</button>
+            <button type="submit" disabled={isSubmitting}>
+              {isSubmitting ? "保存中..." : editingId ? "更新" : "新規作成"}
+            </button>
           </div>
         </form>
       ) : null}

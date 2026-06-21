@@ -60,7 +60,7 @@ describe("AppShell", () => {
     expect(screen.getByRole("link", { name: "業務種別" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "業務種別適用" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "スタッフ所属" })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "スタッフ対応可能資格" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "スタッフ対応可能業務" })).toBeInTheDocument();
   });
 
   it("shows the same navigation set for supervisors in read-only mode", async () => {
@@ -69,16 +69,16 @@ describe("AppShell", () => {
     expect(await screen.findByRole("link", { name: "スタッフ管理" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "拠点管理" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "スタッフ所属" })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "スタッフ対応可能資格" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "スタッフ対応可能業務" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "自分の所属" })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "自分の対応可能資格" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "自分の対応可能業務" })).toBeInTheDocument();
   });
 
   it("shows self pages only for staff users", async () => {
     mockAuthUser(["staff"]);
     renderShell();
     expect(await screen.findByRole("link", { name: "自分の所属" })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "自分の対応可能資格" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "自分の対応可能業務" })).toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "スタッフ管理" })).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "拠点管理" })).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "スタッフ所属" })).not.toBeInTheDocument();

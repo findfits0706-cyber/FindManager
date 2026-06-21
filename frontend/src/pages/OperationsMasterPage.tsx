@@ -29,6 +29,7 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
   const [actionId, setActionId] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const config: ResourceConfig = useMemo(() => {
     const canViewOperations = (items: string[]) =>
@@ -144,7 +145,11 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (isSubmitting) {
+      return;
+    }
     setError("");
+    setIsSubmitting(true);
     try {
       const payload = Object.fromEntries(
         Object.entries(form)
@@ -164,6 +169,8 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
       await listQuery.refetch();
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "保存に失敗しました。");
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -322,7 +329,7 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
                 </label>
                 <label className="checkbox">
                   <input type="checkbox" checked={toBoolean(form.requires_capability ?? false)} onChange={(e) => setForm((current) => ({ ...current, requires_capability: e.target.checked }))} />
-                  対応可能資格が必要
+                  対応可能業務の登録が必要
                 </label>
                 <label className="checkbox">
                   <input type="checkbox" checked={toBoolean(form.can_overlap ?? false)} onChange={(e) => setForm((current) => ({ ...current, can_overlap: e.target.checked }))} />
@@ -382,7 +389,9 @@ export function OperationsMasterPage({ resource }: { resource: ResourceKey }) {
           </div>
           {error ? <p className="error">{error}</p> : null}
           <div className="actions">
-            <button type="submit">{editingId ? "更新" : "新規作成"}</button>
+            <button type="submit" disabled={isSubmitting}>
+              {isSubmitting ? "保存中..." : editingId ? "更新" : "新規作成"}
+            </button>
           </div>
         </form>
       ) : null}

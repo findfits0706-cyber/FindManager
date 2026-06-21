@@ -96,7 +96,7 @@ describe("Operations pages", () => {
 
     renderWithAuth(<StaffAssignmentsPage resource="staff-capabilities" />);
 
-    expect(await screen.findByRole("heading", { name: "スタッフ対応可能資格" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "スタッフ対応可能業務" })).toBeInTheDocument();
     expect(screen.getAllByRole("option", { name: "研修中" }).length).toBeGreaterThan(0);
     expect(screen.getAllByRole("option", { name: "補助付きで対応可能" }).length).toBeGreaterThan(0);
     expect(screen.getAllByRole("option", { name: "単独対応可能" }).length).toBeGreaterThan(0);
@@ -190,5 +190,82 @@ describe("Operations pages", () => {
     await userEvent.click(await screen.findByRole("button", { name: "無効化" }));
     await waitFor(() => expect(confirmMock).toHaveBeenCalled());
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/deactivate/"))).toBe(false);
+  });
+
+  it("prevents duplicate master submissions while saving", async () => {
+    let postCount = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/api/v1/auth/me/")) {
+        return {
+          ok: true,
+          json: async () => ({
+            id: "1",
+            username: "admin",
+            display_name: "管理者",
+            employee_code: "EMP-1",
+            email: "",
+            employment_status: "active",
+            must_change_password: false,
+            roles: ["system_admin"],
+            permissions: [],
+          }),
+        } as Response;
+      }
+      if (url.endsWith("/api/v1/auth/csrf/")) {
+        return { ok: true, json: async () => ({ csrfToken: "token" }) } as Response;
+      }
+      if (url.endsWith("/api/v1/locations/") && init?.method === "POST") {
+        postCount += 1;
+        return new Promise<Response>(() => undefined);
+      }
+      if (url.includes("/api/v1/locations/?page_size=100")) {
+        return { ok: true, json: async () => ({ count: 0, next: null, previous: null, results: [] }) } as Response;
+      }
+      return { ok: true, json: async () => ({ count: 0, next: null, previous: null, results: [] }) } as Response;
+    });
+
+    renderWithAuth(<OperationsMasterPage resource="locations" />);
+    await userEvent.click(await screen.findByRole("button", { name: "新規作成" }));
+    expect(await screen.findByRole("button", { name: "保存中..." })).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", { name: "保存中..." }));
+    expect(postCount).toBe(1);
+  });
+
+  it("prevents duplicate staff assignment submissions while saving", async () => {
+    let postCount = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/api/v1/auth/me/")) {
+        return {
+          ok: true,
+          json: async () => ({
+            id: "1",
+            username: "manager",
+            display_name: "管理者",
+            employee_code: "EMP-1",
+            email: "",
+            employment_status: "active",
+            must_change_password: false,
+            roles: ["shift_manager"],
+            permissions: [],
+          }),
+        } as Response;
+      }
+      if (url.endsWith("/api/v1/auth/csrf/")) {
+        return { ok: true, json: async () => ({ csrfToken: "token" }) } as Response;
+      }
+      if (url.endsWith("/api/v1/staff-locations/") && init?.method === "POST") {
+        postCount += 1;
+        return new Promise<Response>(() => undefined);
+      }
+      return { ok: true, json: async () => ({ count: 0, next: null, previous: null, results: [] }) } as Response;
+    });
+
+    renderWithAuth(<StaffAssignmentsPage resource="staff-locations" />);
+    await userEvent.click(await screen.findByRole("button", { name: "新規作成" }));
+    expect(await screen.findByRole("button", { name: "保存中..." })).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", { name: "保存中..." }));
+    expect(postCount).toBe(1);
   });
 });

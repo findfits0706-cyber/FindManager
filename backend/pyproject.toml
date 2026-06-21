@@ -23,7 +23,7 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["config", "apps", "apps.accounts", "apps.common"]
+packages = ["config", "apps", "apps.accounts", "apps.common", "apps.operations"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "config.settings"
@@ -38,7 +38,7 @@ target-version = "py313"
 select = ["E", "F", "I", "B"]
 
 [tool.ruff.lint.per-file-ignores]
-"apps/*/migrations/*.py" = ["E501"]
+"apps/*/migrations/*.py" = ["E501", "I001"]
 
 [tool.ruff.format]
 quote-style = "double"

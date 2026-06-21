@@ -23,7 +23,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
   const data = (await response.json()) as T & { detail?: string };
   if (!response.ok) {
-    throw new Error(data.detail ?? "リクエストに失敗しました。");
+    throw new Error(data.detail ?? "Request failed.");
   }
   return data;
 }

@@ -26,6 +26,7 @@ INSTALLED_APPS = [
     "django_filters",
     "apps.common",
     "apps.accounts",
+    "apps.operations",
 ]
 
 MIDDLEWARE = [

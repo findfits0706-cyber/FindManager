@@ -15,42 +15,45 @@ export function StaffListPage() {
   });
 
   const deactivate = async (staff: Staff) => {
-    const confirmed = window.confirm(`${staff.display_name} を利用停止しますか？`);
+    const confirmed = window.confirm(`Deactivate ${staff.display_name}?`);
     if (!confirmed) return;
     await api(`/api/v1/staff/${staff.id}/deactivate/`, {
       method: "POST",
-      body: JSON.stringify({ reason: "画面から実行", employment_status: "suspended" }),
+      body: JSON.stringify({ reason: "Managed from staff list", employment_status: "suspended" }),
     });
     await query.refetch();
   };
 
   if (query.isLoading) {
-    return <div>読み込み中...</div>;
+    return <div>Loading staff...</div>;
   }
 
   if (query.isError) {
-    return <div className="error">一覧の取得に失敗しました。</div>;
+    return <div className="error">Failed to load staff.</div>;
   }
 
   return (
     <section className="card">
       <div className="section-header">
-        <h2>スタッフ一覧</h2>
+        <div>
+          <p className="eyebrow">Accounts</p>
+          <h2>Staff</h2>
+        </div>
         {canManage ? (
           <button type="button" onClick={() => navigate("/staff/new")}>
-            新規作成
+            Add Staff
           </button>
         ) : null}
       </div>
       <table className="table">
         <thead>
           <tr>
-            <th>氏名</th>
-            <th>社員コード</th>
-            <th>ユーザー名</th>
-            <th>状態</th>
-            <th>権限</th>
-            <th>操作</th>
+            <th>Name</th>
+            <th>Employee Code</th>
+            <th>Username</th>
+            <th>Status</th>
+            <th>Roles</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -62,10 +65,10 @@ export function StaffListPage() {
               <td>{staff.employment_status}</td>
               <td>{staff.roles.join(", ")}</td>
               <td className="actions">
-                <Link to={`/staff/${staff.id}`}>詳細</Link>
+                <Link to={`/staff/${staff.id}`}>Open</Link>
                 {canManage && staff.is_active ? (
                   <button type="button" onClick={() => void deactivate(staff)}>
-                    利用停止
+                    Deactivate
                   </button>
                 ) : null}
               </td>

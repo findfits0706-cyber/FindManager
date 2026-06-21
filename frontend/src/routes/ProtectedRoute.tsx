@@ -5,7 +5,7 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { loading, user } = useAuth();
 
   if (loading) {
-    return <div className="centered">読み込み中...</div>;
+    return <div className="centered">Loading...</div>;
   }
 
   if (!user) {

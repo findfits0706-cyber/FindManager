@@ -23,8 +23,13 @@ function renderPage() {
 }
 
 describe("LoginPage", () => {
+  beforeEach(() => {
+    fetchMock.mockReset();
+  });
+
   it("renders form and submits", async () => {
     fetchMock
+      .mockResolvedValueOnce({ ok: false, json: async () => ({ detail: "unauthorized" }) })
       .mockResolvedValueOnce({ ok: true, json: async () => ({ csrfToken: "token" }) })
       .mockResolvedValueOnce({
         ok: true,
@@ -44,9 +49,9 @@ describe("LoginPage", () => {
       });
 
     renderPage();
-    await userEvent.type(screen.getByLabelText("ユーザー名"), "staff");
-    await userEvent.type(screen.getByLabelText("パスワード"), "password");
-    await userEvent.click(screen.getByRole("button", { name: "ログイン" }));
+    await userEvent.type(screen.getByLabelText("Username"), "staff");
+    await userEvent.type(screen.getByLabelText("Password"), "password");
+    await userEvent.click(screen.getByRole("button", { name: "Sign In" }));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledTimes(3);
@@ -57,12 +62,13 @@ describe("LoginPage", () => {
     fetchMock
       .mockResolvedValueOnce({ ok: false, json: async () => ({ detail: "unauthorized" }) })
       .mockResolvedValueOnce({ ok: true, json: async () => ({ csrfToken: "token" }) })
-      .mockResolvedValueOnce({ ok: false, json: async () => ({ detail: "ログイン失敗" }) });
+      .mockResolvedValueOnce({ ok: false, json: async () => ({ detail: "Login failed." }) });
 
     renderPage();
-    await userEvent.type(screen.getByLabelText("ユーザー名"), "staff");
-    await userEvent.type(screen.getByLabelText("パスワード"), "wrong");
-    await userEvent.click(screen.getByRole("button", { name: "ログイン" }));
-    expect(await screen.findByText("ログイン失敗")).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("Username"), "staff");
+    await userEvent.type(screen.getByLabelText("Password"), "wrong");
+    await userEvent.click(screen.getByRole("button", { name: "Sign In" }));
+
+    expect(await screen.findByText("Login failed.")).toBeInTheDocument();
   });
 });

@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
 import type { Staff } from "../lib/types";
@@ -18,17 +18,33 @@ export function StaffEditPage({ mode }: { mode: "create" | "edit" }) {
   const staff = query.data;
 
   const [form, setForm] = useState({
-    username: staff?.username ?? "",
-    display_name: staff?.display_name ?? "",
-    employee_code: staff?.employee_code ?? "",
-    email: staff?.email ?? "",
-    employment_status: staff?.employment_status ?? "active",
-    hire_date: staff?.hire_date ?? "",
-    termination_date: staff?.termination_date ?? "",
-    roles: staff?.roles ?? ["staff"],
+    username: "",
+    display_name: "",
+    employee_code: "",
+    email: "",
+    employment_status: "active",
+    hire_date: "",
+    termination_date: "",
+    roles: ["staff"],
     temporary_password: "",
     must_change_password: true,
   });
+
+  useEffect(() => {
+    if (!staff) return;
+    setForm({
+      username: staff.username ?? "",
+      display_name: staff.display_name ?? "",
+      employee_code: staff.employee_code ?? "",
+      email: staff.email ?? "",
+      employment_status: staff.employment_status ?? "active",
+      hire_date: staff.hire_date ?? "",
+      termination_date: staff.termination_date ?? "",
+      roles: staff.roles ?? ["staff"],
+      temporary_password: "",
+      must_change_password: staff.must_change_password,
+    });
+  }, [staff]);
 
   const onChange = (key: string, value: string | boolean | string[]) => {
     setForm((current) => ({ ...current, [key]: value }));
@@ -44,42 +60,38 @@ export function StaffEditPage({ mode }: { mode: "create" | "edit" }) {
       await api(path, { method, body: JSON.stringify(payload) });
       navigate("/staff");
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "保存に失敗しました。");
+      setError(submitError instanceof Error ? submitError.message : "Save failed.");
     }
   };
 
   return (
     <section className="card">
-      <h2>{mode === "create" ? "スタッフ新規作成" : "スタッフ編集"}</h2>
+      <div className="section-header">
+        <div>
+          <p className="eyebrow">Accounts</p>
+          <h2>{mode === "create" ? "Create Staff" : "Edit Staff"}</h2>
+        </div>
+      </div>
       <form className="form-grid" onSubmit={submit}>
         <label>
-          氏名
-          <input
-            value={form.display_name}
-            onChange={(e) => onChange("display_name", e.target.value)}
-          />
+          Display name
+          <input value={form.display_name} onChange={(e) => onChange("display_name", e.target.value)} />
         </label>
         <label>
-          社員コード
-          <input
-            value={form.employee_code}
-            onChange={(e) => onChange("employee_code", e.target.value)}
-          />
+          Employee code
+          <input value={form.employee_code} onChange={(e) => onChange("employee_code", e.target.value)} />
         </label>
         <label>
-          ユーザー名
+          Username
           <input value={form.username} onChange={(e) => onChange("username", e.target.value)} />
         </label>
         <label>
-          メール
+          Email
           <input value={form.email} onChange={(e) => onChange("email", e.target.value)} />
         </label>
         <label>
-          状態
-          <select
-            value={form.employment_status}
-            onChange={(e) => onChange("employment_status", e.target.value)}
-          >
+          Employment status
+          <select value={form.employment_status} onChange={(e) => onChange("employment_status", e.target.value)}>
             <option value="active">active</option>
             <option value="leave_of_absence">leave_of_absence</option>
             <option value="suspended">suspended</option>
@@ -87,19 +99,19 @@ export function StaffEditPage({ mode }: { mode: "create" | "edit" }) {
           </select>
         </label>
         <label>
-          入社日
-          <input type="date" value={form.hire_date ?? ""} onChange={(e) => onChange("hire_date", e.target.value)} />
+          Hire date
+          <input type="date" value={form.hire_date} onChange={(e) => onChange("hire_date", e.target.value)} />
         </label>
         <label>
-          退職日
+          Termination date
           <input
             type="date"
-            value={form.termination_date ?? ""}
+            value={form.termination_date}
             onChange={(e) => onChange("termination_date", e.target.value)}
           />
         </label>
         <label>
-          一時パスワード
+          Temporary password
           <input
             type="password"
             value={form.temporary_password}
@@ -107,24 +119,24 @@ export function StaffEditPage({ mode }: { mode: "create" | "edit" }) {
           />
         </label>
         <fieldset>
-          <legend>権限グループ</legend>
-          {roleOptions.map((role) => (
-            <label key={role} className="checkbox">
-              <input
-                type="checkbox"
-                checked={form.roles.includes(role)}
-                onChange={(e) =>
-                  onChange(
-                    "roles",
-                    e.target.checked
-                      ? [...form.roles, role]
-                      : form.roles.filter((item) => item !== role),
-                  )
-                }
-              />
-              {role}
-            </label>
-          ))}
+          <legend>Roles</legend>
+          <div className="checkbox-list">
+            {roleOptions.map((role) => (
+              <label key={role} className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={form.roles.includes(role)}
+                  onChange={(e) =>
+                    onChange(
+                      "roles",
+                      e.target.checked ? [...form.roles, role] : form.roles.filter((item) => item !== role),
+                    )
+                  }
+                />
+                {role}
+              </label>
+            ))}
+          </div>
         </fieldset>
         <label className="checkbox">
           <input
@@ -132,10 +144,10 @@ export function StaffEditPage({ mode }: { mode: "create" | "edit" }) {
             checked={form.must_change_password}
             onChange={(e) => onChange("must_change_password", e.target.checked)}
           />
-          初回変更必須
+          Require password change on next login
         </label>
         {error ? <p className="error">{error}</p> : null}
-        <button type="submit">保存</button>
+        <button type="submit">Save</button>
       </form>
     </section>
   );

@@ -3,7 +3,6 @@ import uuid
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
-from django.utils import timezone
 
 
 class ActiveOrderedModel(models.Model):
@@ -43,6 +42,10 @@ class WorkArea(ActiveOrderedModel):
 
     class Meta(ActiveOrderedModel.Meta):
         constraints = [models.UniqueConstraint(fields=["location", "code"], name="unique_work_area_code_per_location")]
+
+    def clean(self):
+        if self.location_id and not self.location.is_active:
+            raise ValidationError({"location": "Inactive locations cannot be assigned."})
 
     def __str__(self):
         return f"{self.location.short_name} / {self.name}"
@@ -90,12 +93,36 @@ class WorkType(ActiveOrderedModel):
     class Meta(ActiveOrderedModel.Meta):
         verbose_name = "Work type"
         verbose_name_plural = "Work types"
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(default_duration_minutes__gt=0),
+                name="work_type_duration_gt_zero",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(minimum_staff_count__gte=1),
+                name="work_type_minimum_staff_at_least_one",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(maximum_staff_count__isnull=True)
+                | models.Q(maximum_staff_count__gte=models.F("minimum_staff_count")),
+                name="work_type_maximum_staff_gte_minimum",
+            ),
+        ]
 
     def clean(self):
+        errors = {}
+        if self.category_id and not self.category.is_active:
+            errors["category"] = "Inactive categories cannot be assigned."
+        if self.default_duration_minutes <= 0:
+            errors["default_duration_minutes"] = "default_duration_minutes must be greater than 0."
+        elif self.default_duration_minutes % 15 != 0:
+            errors["default_duration_minutes"] = "default_duration_minutes must be in 15-minute increments."
+        if self.minimum_staff_count < 1:
+            errors["minimum_staff_count"] = "minimum_staff_count must be at least 1."
         if self.maximum_staff_count is not None and self.maximum_staff_count < self.minimum_staff_count:
-            raise ValidationError(
-                {"maximum_staff_count": ("maximum_staff_count must be greater than or equal to minimum_staff_count.")}
-            )
+            errors["maximum_staff_count"] = "maximum_staff_count must be greater than or equal to minimum_staff_count."
+        if errors:
+            raise ValidationError(errors)
 
     def __str__(self):
         return self.name
@@ -122,12 +149,32 @@ class WorkTypeAvailability(models.Model):
             models.UniqueConstraint(
                 fields=["work_type", "location", "work_area"],
                 name="unique_work_type_availability",
+                nulls_distinct=False,
             )
         ]
 
     def clean(self):
-        if self.work_area and self.work_area.location_id != self.location_id:
-            raise ValidationError({"work_area": "work_area must belong to the selected location."})
+        errors = {}
+        if self.work_type_id and not self.work_type.is_active:
+            errors["work_type"] = "Inactive work types cannot be assigned."
+        if self.location_id and not self.location.is_active:
+            errors["location"] = "Inactive locations cannot be assigned."
+        if self.work_area_id:
+            if not self.work_area.is_active:
+                errors["work_area"] = "Inactive work areas cannot be assigned."
+            elif self.work_area.location_id != self.location_id:
+                errors["work_area"] = "work_area must belong to the selected location."
+        duplicate_query = WorkTypeAvailability.objects.filter(
+            work_type_id=self.work_type_id,
+            location_id=self.location_id,
+            work_area_id=self.work_area_id,
+        )
+        if self.pk:
+            duplicate_query = duplicate_query.exclude(pk=self.pk)
+        if duplicate_query.exists():
+            errors["non_field_errors"] = "This work type availability already exists."
+        if errors:
+            raise ValidationError(errors)
 
 
 class StaffLocation(ActiveOrderedModel):
@@ -142,25 +189,48 @@ class StaffLocation(ActiveOrderedModel):
             models.UniqueConstraint(
                 fields=["staff", "location", "valid_from", "valid_until"],
                 name="unique_staff_location_period",
+                nulls_distinct=False,
             )
         ]
 
     def clean(self):
+        errors = {}
+        if self.staff_id and not self.staff.is_login_allowed():
+            errors["staff"] = "Inactive staff cannot be assigned."
+        if self.location_id and not self.location.is_active:
+            errors["location"] = "Inactive locations cannot be assigned."
         if self.valid_until and self.valid_from > self.valid_until:
-            raise ValidationError({"valid_until": "valid_until must be on or after valid_from."})
-        if self.is_primary and self.is_active:
-            today = timezone.localdate()
-            if self.valid_from <= today and (self.valid_until is None or self.valid_until >= today):
-                conflict = StaffLocation.objects.filter(
-                    staff=self.staff,
-                    is_primary=True,
-                    is_active=True,
-                    valid_from__lte=today,
-                ).filter(models.Q(valid_until__isnull=True) | models.Q(valid_until__gte=today))
-                if self.pk:
-                    conflict = conflict.exclude(pk=self.pk)
-                if conflict.exists():
-                    raise ValidationError({"is_primary": "Only one active primary location is allowed at a time."})
+            errors["valid_until"] = "valid_until must be on or after valid_from."
+
+        overlapping_periods = StaffLocation.objects.filter(
+            staff_id=self.staff_id,
+            location_id=self.location_id,
+            valid_from__lte=self.valid_until or self.valid_from,
+        ).filter(models.Q(valid_until__isnull=True) | models.Q(valid_until__gte=self.valid_from))
+        if self.valid_until is None:
+            overlapping_periods = StaffLocation.objects.filter(
+                staff_id=self.staff_id,
+                location_id=self.location_id,
+            ).filter(models.Q(valid_until__isnull=True) | models.Q(valid_until__gte=self.valid_from))
+        if self.pk:
+            overlapping_periods = overlapping_periods.exclude(pk=self.pk)
+        if overlapping_periods.exists():
+            errors["non_field_errors"] = "This staff location period overlaps an existing record."
+
+        if self.is_primary:
+            primary_overlap = StaffLocation.objects.filter(
+                staff_id=self.staff_id,
+                is_primary=True,
+            ).filter(models.Q(valid_until__isnull=True) | models.Q(valid_until__gte=self.valid_from))
+            if self.valid_until is not None:
+                primary_overlap = primary_overlap.filter(valid_from__lte=self.valid_until)
+            if self.pk:
+                primary_overlap = primary_overlap.exclude(pk=self.pk)
+            if primary_overlap.exists():
+                errors["is_primary"] = "Primary location periods cannot overlap."
+
+        if errors:
+            raise ValidationError(errors)
 
 
 class StaffCapability(ActiveOrderedModel):
@@ -197,9 +267,31 @@ class StaffCapability(ActiveOrderedModel):
             models.UniqueConstraint(
                 fields=["staff", "work_type", "location", "valid_from", "valid_until"],
                 name="unique_staff_capability_period",
+                nulls_distinct=False,
             )
         ]
 
     def clean(self):
+        errors = {}
+        if self.staff_id and not self.staff.is_login_allowed():
+            errors["staff"] = "Inactive staff cannot be assigned."
+        if self.work_type_id and not self.work_type.is_active:
+            errors["work_type"] = "Inactive work types cannot be assigned."
+        if self.location_id and not self.location.is_active:
+            errors["location"] = "Inactive locations cannot be assigned."
         if self.valid_until and self.valid_from > self.valid_until:
-            raise ValidationError({"valid_until": "valid_until must be on or after valid_from."})
+            errors["valid_until"] = "valid_until must be on or after valid_from."
+
+        overlap_query = StaffCapability.objects.filter(
+            staff_id=self.staff_id,
+            work_type_id=self.work_type_id,
+            location_id=self.location_id,
+        ).filter(models.Q(valid_until__isnull=True) | models.Q(valid_until__gte=self.valid_from))
+        if self.valid_until is not None:
+            overlap_query = overlap_query.filter(valid_from__lte=self.valid_until)
+        if self.pk:
+            overlap_query = overlap_query.exclude(pk=self.pk)
+        if overlap_query.exists():
+            errors["non_field_errors"] = "This staff capability period overlaps an existing record."
+        if errors:
+            raise ValidationError(errors)

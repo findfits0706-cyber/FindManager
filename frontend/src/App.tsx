@@ -41,8 +41,10 @@ export function App() {
           <Route path="operations/work-areas" element={<OperationsMasterPage resource="work-areas" />} />
           <Route path="operations/work-categories" element={<OperationsMasterPage resource="work-categories" />} />
           <Route path="operations/work-types" element={<OperationsMasterPage resource="work-types" />} />
+          <Route path="operations/work-type-availabilities" element={<OperationsMasterPage resource="work-type-availabilities" />} />
           <Route path="operations/staff-locations" element={<StaffAssignmentsPage resource="staff-locations" />} />
           <Route path="operations/staff-capabilities" element={<StaffAssignmentsPage resource="staff-capabilities" />} />
+          <Route path="operations/my-staff-locations" element={<MyCapabilitiesPage section="locations" />} />
           <Route path="operations/my-capabilities" element={<MyCapabilitiesPage />} />
           <Route path="403" element={<ForbiddenPage />} />
         </Route>

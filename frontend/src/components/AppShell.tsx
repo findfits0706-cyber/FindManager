@@ -2,19 +2,16 @@ import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { api } from "../api/client";
 import { useAuth } from "../features/auth/AuthContext";
 
-const operationsLinks = [
-  { to: "/operations/locations", label: "Locations" },
-  { to: "/operations/work-areas", label: "Work Areas" },
-  { to: "/operations/work-categories", label: "Work Categories" },
-  { to: "/operations/work-types", label: "Work Types" },
-  { to: "/operations/staff-locations", label: "Staff Locations" },
-  { to: "/operations/staff-capabilities", label: "Staff Capabilities" },
-  { to: "/operations/my-capabilities", label: "My Capabilities" },
-];
-
 export function AppShell() {
   const { user, setUser } = useAuth();
   const navigate = useNavigate();
+
+  const isSystemAdmin = user?.roles.includes("system_admin") ?? false;
+  const isShiftManager = user?.roles.includes("shift_manager") ?? false;
+  const isSupervisor = user?.roles.includes("supervisor") ?? false;
+  const canViewOperations = isSystemAdmin || isShiftManager || isSupervisor;
+  const canManageAssignments = isSystemAdmin || isShiftManager;
+  const isSelfOnly = user?.roles.includes("staff") || user?.roles.includes("viewer");
 
   const logout = async () => {
     await api("/api/v1/auth/logout/", { method: "POST", body: JSON.stringify({}) });
@@ -30,12 +27,28 @@ export function AppShell() {
           <h1>FindManager</h1>
         </div>
         <nav className="side-nav">
-          <NavLink to="/staff">Staff</NavLink>
-          {operationsLinks.map((item) => (
-            <NavLink key={item.to} to={item.to}>
-              {item.label}
-            </NavLink>
-          ))}
+          {(isSystemAdmin || isShiftManager || isSupervisor) && <NavLink to="/staff">スタッフ管理</NavLink>}
+          {isSystemAdmin && (
+            <>
+              <NavLink to="/operations/locations">施設管理</NavLink>
+              <NavLink to="/operations/work-areas">作業エリア</NavLink>
+              <NavLink to="/operations/work-categories">作業カテゴリ</NavLink>
+              <NavLink to="/operations/work-types">作業種別</NavLink>
+            </>
+          )}
+          {canViewOperations && <NavLink to="/operations/work-type-availabilities">作業種別適用</NavLink>}
+          {canManageAssignments && (
+            <>
+              <NavLink to="/operations/staff-locations">スタッフ所属</NavLink>
+              <NavLink to="/operations/staff-capabilities">スタッフ対応可能業務</NavLink>
+            </>
+          )}
+          {(isSelfOnly || canViewOperations) && (
+            <>
+              <NavLink to="/operations/my-staff-locations">自分の所属</NavLink>
+              <NavLink to="/operations/my-capabilities">自分の対応可能業務</NavLink>
+            </>
+          )}
         </nav>
       </aside>
       <div className="content-area">
@@ -43,11 +56,11 @@ export function AppShell() {
           <div>
             <strong>{user?.display_name}</strong>
             <div className="subtle-text">
-              {user?.employee_code} · {user?.roles.join(", ")}
+              {user?.employee_code} / {user?.roles.join(", ")}
             </div>
           </div>
           <button type="button" onClick={() => void logout()}>
-            Logout
+            ログアウト
           </button>
         </header>
         <main className="main-content">

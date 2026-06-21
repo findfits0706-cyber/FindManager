@@ -24,32 +24,34 @@ export type Staff = {
   roles: string[];
 };
 
-export type Location = {
+export type BaseEntity = {
   id: string;
+  is_active: boolean;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type Location = BaseEntity & {
   code: string;
   name: string;
   short_name: string;
   timezone: string;
-  is_active: boolean;
 };
 
-export type WorkArea = {
-  id: string;
+export type WorkArea = BaseEntity & {
   location: string;
   code: string;
   name: string;
-  is_active: boolean;
+  description?: string;
 };
 
-export type WorkCategory = {
-  id: string;
+export type WorkCategory = BaseEntity & {
   code: string;
   name: string;
-  is_active: boolean;
+  description?: string;
 };
 
-export type WorkType = {
-  id: string;
+export type WorkType = BaseEntity & {
   category: string;
   code: string;
   name: string;
@@ -63,11 +65,15 @@ export type WorkType = {
   is_break: boolean;
   is_bookable: boolean;
   requires_customer: boolean;
-  is_active: boolean;
 };
 
-export type StaffLocation = {
-  id: string;
+export type WorkTypeAvailability = BaseEntity & {
+  work_type: string;
+  location: string;
+  work_area: string | null;
+};
+
+export type StaffLocation = BaseEntity & {
   staff: string;
   staff_display_name?: string;
   location: string;
@@ -75,11 +81,9 @@ export type StaffLocation = {
   is_primary: boolean;
   valid_from: string;
   valid_until: string | null;
-  is_active: boolean;
 };
 
-export type StaffCapability = {
-  id: string;
+export type StaffCapability = BaseEntity & {
   staff: string;
   staff_display_name?: string;
   work_type: string;
@@ -91,7 +95,16 @@ export type StaffCapability = {
   valid_until: string | null;
   approved_by: string | null;
   approved_by_display_name?: string;
+  approved_at?: string | null;
   notes: string;
+};
+
+export type MyStaffLocation = {
+  id: string;
+  location_name: string;
+  is_primary: boolean;
+  valid_from: string;
+  valid_until: string | null;
   is_active: boolean;
 };
 
@@ -103,6 +116,7 @@ export type MyCapability = {
   valid_from: string;
   valid_until: string | null;
   approved_by_display_name: string;
+  approved_at?: string | null;
   notes: string;
   is_active: boolean;
 };

@@ -94,15 +94,23 @@ EVENT_MAP = {
         "deactivate": "work_type_deactivated",
         "reactivate": "work_type_reactivated",
     },
+    "work_type_availability": {
+        "create": "work_type_availability_created",
+        "update": "work_type_availability_updated",
+        "deactivate": "work_type_availability_deactivated",
+        "reactivate": "work_type_availability_reactivated",
+    },
     "staff_location": {
         "create": "staff_location_created",
         "update": "staff_location_updated",
         "deactivate": "staff_location_deactivated",
+        "reactivate": "staff_location_reactivated",
     },
     "staff_capability": {
         "create": "staff_capability_created",
         "update": "staff_capability_updated",
         "deactivate": "staff_capability_deactivated",
+        "reactivate": "staff_capability_reactivated",
     },
 }
 
@@ -133,8 +141,8 @@ def seed_operations(dev_users: dict[str, User]) -> None:
         "main": Location.objects.update_or_create(
             code="main",
             defaults={
-                "name": "Main Club",
-                "short_name": "MAIN",
+                "name": "ファインドスポーツクラブ",
+                "short_name": "本部",
                 "timezone": "Asia/Tokyo",
                 "display_order": 10,
             },
@@ -152,7 +160,7 @@ def seed_operations(dev_users: dict[str, User]) -> None:
             code="findpilates",
             defaults={
                 "name": "Find Pilates",
-                "short_name": "PILATES",
+                "short_name": "ピラティス",
                 "timezone": "Asia/Tokyo",
                 "display_order": 30,
             },
@@ -162,22 +170,22 @@ def seed_operations(dev_users: dict[str, User]) -> None:
     work_areas = {}
     for location_code, items in {
         "main": [
-            ("gym", "Gym"),
-            ("front", "Front"),
-            ("pool", "Pool"),
-            ("studio", "Studio"),
-            ("office", "Office"),
-            ("all", "All Areas"),
+            ("gym", "ジム"),
+            ("front", "フロント"),
+            ("pool", "プール"),
+            ("studio", "スタジオ"),
+            ("office", "事務所"),
+            ("all", "全部署共通"),
         ],
         "findfits": [
-            ("training", "Training Area"),
-            ("cleaning", "Cleaning"),
-            ("tour", "Tour"),
+            ("training", "トレーニングエリア"),
+            ("cleaning", "清掃"),
+            ("tour", "見学対応"),
         ],
         "findpilates": [
-            ("pilates_studio", "Pilates Studio"),
-            ("self_esthe", "Self Esthe"),
-            ("front", "Front"),
+            ("pilates_studio", "ピラティススタジオ"),
+            ("self_esthe", "セルフエステ"),
+            ("front", "フロント"),
         ],
     }.items():
         for index, (code, name) in enumerate(items, start=1):
@@ -191,13 +199,13 @@ def seed_operations(dev_users: dict[str, User]) -> None:
     for index, (code, name) in enumerate(
         [
             ("general", "General"),
-            ("reception", "Reception"),
-            ("cleaning", "Cleaning"),
-            ("instruction", "Instruction"),
-            ("booking", "Booking"),
-            ("meeting", "Meeting"),
-            ("break", "Break"),
-            ("other", "Other"),
+            ("reception", "受付"),
+            ("cleaning", "清掃"),
+            ("instruction", "指導"),
+            ("booking", "予約・案内"),
+            ("meeting", "会議・研修"),
+            ("break", "休憩"),
+            ("other", "その他"),
         ],
         start=1,
     ):
@@ -208,26 +216,26 @@ def seed_operations(dev_users: dict[str, User]) -> None:
 
     work_types = {}
     work_type_seed = [
-        ("gym_duty", "Gym Duty", "general", 60, "blue", False, False, False, False),
-        ("front_duty", "Front Duty", "reception", 60, "green", False, False, False, False),
-        ("office_work", "Office Work", "general", 60, "slate", False, False, False, False),
-        ("open_tasks", "Open Tasks", "general", 30, "amber", False, False, False, False),
-        ("close_tasks", "Close Tasks", "general", 30, "amber", False, False, False, False),
-        ("gym_cleaning", "Gym Cleaning", "cleaning", 30, "cyan", False, False, False, False),
-        ("findfits_cleaning", "FindFits Cleaning", "cleaning", 30, "cyan", False, False, False, False),
-        ("facility_cleaning", "Facility Cleaning", "cleaning", 45, "cyan", False, False, False, False),
-        ("personal_training", "Personal Training", "instruction", 60, "violet", True, False, False, True),
-        ("semi_personal", "Semi Personal", "instruction", 60, "violet", True, False, False, True),
-        ("exercise_guidance", "Exercise Guidance", "instruction", 45, "violet", True, False, False, True),
-        ("first_guidance", "First Guidance", "booking", 60, "pink", True, False, True, True),
-        ("repeat_guidance", "Repeat Guidance", "booking", 45, "pink", True, False, True, True),
-        ("findfits_tour", "FindFits Tour", "booking", 30, "pink", True, False, True, True),
-        ("trial", "Trial", "booking", 60, "pink", True, False, True, True),
-        ("membership", "Membership", "booking", 45, "pink", False, False, True, True),
-        ("meeting", "Meeting", "meeting", 60, "slate", False, True, False, False),
-        ("training", "Training", "meeting", 60, "slate", True, True, False, False),
-        ("break", "Break", "break", 60, "green", False, True, False, False, True),
-        ("other", "Other", "other", 60, "red", False, True, False, False),
+        ("gym_duty", "ジムメニュー", "general", 60, "blue", False, False, False, False),
+        ("front_duty", "受付対応", "reception", 60, "green", False, False, False, False),
+        ("office_work", "バックオフィス", "general", 60, "slate", False, False, False, False),
+        ("open_tasks", "オープン作業", "general", 30, "amber", False, False, False, False),
+        ("close_tasks", "クローズ作業", "general", 30, "amber", False, False, False, False),
+        ("gym_cleaning", "ジム清掃", "cleaning", 30, "cyan", False, False, False, False),
+        ("findfits_cleaning", "FindFits清掃", "cleaning", 30, "cyan", False, False, False, False),
+        ("facility_cleaning", "館内清掃", "cleaning", 45, "cyan", False, False, False, False),
+        ("personal_training", "パーソナルトレーニング", "instruction", 60, "violet", True, False, False, True),
+        ("semi_personal", "セミパーソナル", "instruction", 60, "violet", True, False, False, True),
+        ("exercise_guidance", "運動指導", "instruction", 45, "violet", True, False, False, True),
+        ("first_guidance", "初回ガイダンス", "booking", 60, "pink", True, False, True, True),
+        ("repeat_guidance", "継続ガイダンス", "booking", 45, "pink", True, False, True, True),
+        ("findfits_tour", "FindFits見学", "booking", 30, "pink", True, False, True, True),
+        ("trial", "体験", "booking", 60, "pink", True, False, True, True),
+        ("membership", "入会案内", "booking", 45, "pink", False, False, True, True),
+        ("meeting", "会議", "meeting", 60, "slate", False, True, False, False),
+        ("training", "トレーニング", "meeting", 60, "slate", True, True, False, False),
+        ("break", "休憩", "break", 60, "green", False, True, False, False, True),
+        ("other", "その他", "other", 60, "red", False, True, False, False),
     ]
     for index, seed in enumerate(work_type_seed, start=1):
         if len(seed) == 10:

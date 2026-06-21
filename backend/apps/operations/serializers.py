@@ -1,6 +1,5 @@
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
-
-from apps.accounts.constants import ROLE_SHIFT_MANAGER, ROLE_SYSTEM_ADMIN
 
 from .models import (
     Location,
@@ -12,12 +11,14 @@ from .models import (
     WorkTypeAvailability,
 )
 
-FORBIDDEN_UPDATE_FIELDS = {
+FORBIDDEN_INPUT_FIELDS = {
     "is_active": "Use deactivate/reactivate actions instead of updating is_active directly.",
 }
 
 
 class ActiveGuardSerializer(serializers.ModelSerializer):
+    read_only_field_names: tuple[str, ...] = ()
+
     def _run_model_clean(self, attrs):
         model_class = self.Meta.model
         values = {}
@@ -30,12 +31,21 @@ class ActiveGuardSerializer(serializers.ModelSerializer):
         instance = model_class(**values)
         if self.instance:
             instance.pk = self.instance.pk
-        instance.clean()
+        try:
+            instance.clean()
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, "message_dict") else exc.messages
+            ) from exc
 
     def validate(self, attrs):
         errors = {}
-        if self.instance and "is_active" in self.initial_data:
-            errors["is_active"] = FORBIDDEN_UPDATE_FIELDS["is_active"]
+        for field in FORBIDDEN_INPUT_FIELDS:
+            if field in self.initial_data:
+                errors[field] = FORBIDDEN_INPUT_FIELDS[field]
+        for field in self.read_only_field_names:
+            if field in self.initial_data:
+                errors[field] = f"{field} is read-only."
         if errors:
             raise serializers.ValidationError(errors)
         self._run_model_clean(attrs)
@@ -80,16 +90,9 @@ class StaffLocationSerializer(ActiveGuardSerializer):
         model = StaffLocation
         fields = "__all__"
 
-    def validate(self, attrs):
-        attrs = super().validate(attrs)
-        instance = self.instance
-        staff = attrs.get("staff", instance.staff if instance else None)
-        if staff and not staff.is_login_allowed():
-            raise serializers.ValidationError({"staff": "Inactive staff cannot be assigned."})
-        return attrs
-
 
 class StaffCapabilitySerializer(ActiveGuardSerializer):
+    read_only_field_names = ("approved_by", "approved_at")
     staff_display_name = serializers.CharField(source="staff.display_name", read_only=True)
     work_type_name = serializers.CharField(source="work_type.name", read_only=True)
     location_name = serializers.CharField(source="location.name", read_only=True)
@@ -99,22 +102,6 @@ class StaffCapabilitySerializer(ActiveGuardSerializer):
         model = StaffCapability
         fields = "__all__"
 
-    def validate(self, attrs):
-        attrs = super().validate(attrs)
-        instance = self.instance
-        staff = attrs.get("staff", instance.staff if instance else None)
-        work_type = attrs.get("work_type", instance.work_type if instance else None)
-        approved_by = attrs.get("approved_by", instance.approved_by if instance else None)
-        if staff and not staff.is_login_allowed():
-            raise serializers.ValidationError({"staff": "Inactive staff cannot be assigned."})
-        if work_type and not work_type.is_active:
-            raise serializers.ValidationError({"work_type": "Inactive work types cannot be assigned."})
-        if approved_by and not approved_by.is_login_allowed():
-            raise serializers.ValidationError({"approved_by": "Approver must be able to log in."})
-        if approved_by and not (approved_by.has_role(ROLE_SYSTEM_ADMIN) or approved_by.has_role(ROLE_SHIFT_MANAGER)):
-            raise serializers.ValidationError({"approved_by": "Approver must be a system admin or shift manager."})
-        return attrs
-
 
 class DeactivateSerializer(serializers.Serializer):
     confirm = serializers.BooleanField(default=True)
@@ -122,6 +109,21 @@ class DeactivateSerializer(serializers.Serializer):
 
 class ReactivateSerializer(serializers.Serializer):
     confirm = serializers.BooleanField(default=True)
+
+
+class MyStaffLocationSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source="location.name", read_only=True)
+
+    class Meta:
+        model = StaffLocation
+        fields = [
+            "id",
+            "location_name",
+            "is_primary",
+            "valid_from",
+            "valid_until",
+            "is_active",
+        ]
 
 
 class MyStaffCapabilitySerializer(serializers.ModelSerializer):
@@ -139,6 +141,7 @@ class MyStaffCapabilitySerializer(serializers.ModelSerializer):
             "valid_from",
             "valid_until",
             "approved_by_display_name",
+            "approved_at",
             "notes",
             "is_active",
         ]

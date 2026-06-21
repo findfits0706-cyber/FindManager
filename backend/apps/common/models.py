@@ -32,12 +32,18 @@ class AuditEvent(models.Model):
         WORK_TYPE_UPDATED = "work_type_updated", "Work type updated"
         WORK_TYPE_DEACTIVATED = "work_type_deactivated", "Work type deactivated"
         WORK_TYPE_REACTIVATED = "work_type_reactivated", "Work type reactivated"
+        WORK_TYPE_AVAILABILITY_CREATED = "work_type_availability_created", "Work type availability created"
+        WORK_TYPE_AVAILABILITY_UPDATED = "work_type_availability_updated", "Work type availability updated"
+        WORK_TYPE_AVAILABILITY_DEACTIVATED = "work_type_availability_deactivated", "Work type availability deactivated"
+        WORK_TYPE_AVAILABILITY_REACTIVATED = "work_type_availability_reactivated", "Work type availability reactivated"
         STAFF_LOCATION_CREATED = "staff_location_created", "Staff location created"
         STAFF_LOCATION_UPDATED = "staff_location_updated", "Staff location updated"
         STAFF_LOCATION_DEACTIVATED = "staff_location_deactivated", "Staff location deactivated"
+        STAFF_LOCATION_REACTIVATED = "staff_location_reactivated", "Staff location reactivated"
         STAFF_CAPABILITY_CREATED = "staff_capability_created", "Staff capability created"
         STAFF_CAPABILITY_UPDATED = "staff_capability_updated", "Staff capability updated"
         STAFF_CAPABILITY_DEACTIVATED = "staff_capability_deactivated", "Staff capability deactivated"
+        STAFF_CAPABILITY_REACTIVATED = "staff_capability_reactivated", "Staff capability reactivated"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     event_type = models.CharField(max_length=64, choices=EventType.choices)

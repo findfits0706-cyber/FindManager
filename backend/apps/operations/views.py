@@ -1,4 +1,5 @@
 from django.db.models import Q
+from django.utils import timezone
 from rest_framework import permissions, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
@@ -16,6 +17,7 @@ from .models import (
 from .serializers import (
     LocationSerializer,
     MyStaffCapabilitySerializer,
+    MyStaffLocationSerializer,
     StaffCapabilitySerializer,
     StaffLocationSerializer,
     WorkAreaSerializer,
@@ -55,7 +57,7 @@ class MasterViewSet(OperationsBaseViewSet):
     def perform_create(self, serializer):
         if not can_manage_masters(self.request.user):
             raise PermissionDenied("Only system admins can perform this action.")
-        instance = serializer.save()
+        instance = serializer.save(is_active=True)
         record_operations_event(
             entity=self.entity_name,
             action="create",
@@ -71,7 +73,6 @@ class MasterViewSet(OperationsBaseViewSet):
     def perform_update(self, serializer):
         if not can_manage_masters(self.request.user):
             raise PermissionDenied("Only system admins can perform this action.")
-        before = {"name": getattr(serializer.instance, "name", ""), "is_active": serializer.instance.is_active}
         instance = serializer.save()
         record_operations_event(
             entity=self.entity_name,
@@ -80,8 +81,8 @@ class MasterViewSet(OperationsBaseViewSet):
             request=self.request,
             metadata={
                 "id": str(instance.id),
-                "before": before,
-                "after": {"name": getattr(instance, "name", ""), "is_active": instance.is_active},
+                "code": getattr(instance, "code", ""),
+                "name": getattr(instance, "name", ""),
             },
         )
 
@@ -107,6 +108,7 @@ class MasterViewSet(OperationsBaseViewSet):
         if not can_manage_masters(request.user):
             raise PermissionDenied("Only system admins can perform this action.")
         instance = self.get_object()
+        instance.full_clean()
         reactivate_instance(instance)
         record_operations_event(
             entity=self.entity_name,
@@ -136,7 +138,9 @@ class LocationViewSet(MasterViewSet):
 
 
 class WorkAreaViewSet(MasterViewSet):
-    queryset = WorkArea.objects.select_related("location").all().order_by("display_order", "code")
+    queryset = (
+        WorkArea.objects.select_related("location").all().order_by("location__display_order", "display_order", "code")
+    )
     serializer_class = WorkAreaSerializer
     entity_name = "work_area"
 
@@ -162,6 +166,10 @@ class WorkCategoryViewSet(MasterViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
         params = self.request.query_params
+        if params.get("name"):
+            queryset = queryset.filter(name__icontains=params["name"])
+        if params.get("code"):
+            queryset = queryset.filter(code__icontains=params["code"])
         if params.get("is_active") in {"true", "false"}:
             queryset = queryset.filter(is_active=params["is_active"] == "true")
         return queryset
@@ -195,7 +203,15 @@ class WorkTypeViewSet(MasterViewSet):
 
 
 class WorkTypeAvailabilityViewSet(OperationsBaseViewSet):
-    queryset = WorkTypeAvailability.objects.select_related("work_type", "location", "work_area").all()
+    queryset = (
+        WorkTypeAvailability.objects.select_related("work_type", "location", "work_area")
+        .all()
+        .order_by(
+            "location__display_order",
+            "work_type__display_order",
+            "created_at",
+        )
+    )
     serializer_class = WorkTypeAvailabilitySerializer
 
     def get_permissions(self):
@@ -219,12 +235,34 @@ class WorkTypeAvailabilityViewSet(OperationsBaseViewSet):
     def perform_create(self, serializer):
         if not can_manage_masters(self.request.user):
             raise PermissionDenied("Only system admins can perform this action.")
-        serializer.save()
+        instance = serializer.save(is_active=True)
+        record_operations_event(
+            entity="work_type_availability",
+            action="create",
+            actor=self.request.user,
+            request=self.request,
+            metadata={
+                "id": str(instance.id),
+                "work_type_id": str(instance.work_type_id),
+                "location_id": str(instance.location_id),
+            },
+        )
 
     def perform_update(self, serializer):
         if not can_manage_masters(self.request.user):
             raise PermissionDenied("Only system admins can perform this action.")
-        serializer.save()
+        instance = serializer.save()
+        record_operations_event(
+            entity="work_type_availability",
+            action="update",
+            actor=self.request.user,
+            request=self.request,
+            metadata={
+                "id": str(instance.id),
+                "work_type_id": str(instance.work_type_id),
+                "location_id": str(instance.location_id),
+            },
+        )
 
     @action(detail=True, methods=["post"])
     def deactivate(self, request, pk=None):
@@ -232,11 +270,44 @@ class WorkTypeAvailabilityViewSet(OperationsBaseViewSet):
             raise PermissionDenied("Only system admins can perform this action.")
         instance = self.get_object()
         deactivate_instance(instance)
+        record_operations_event(
+            entity="work_type_availability",
+            action="deactivate",
+            actor=request.user,
+            request=request,
+            metadata={
+                "id": str(instance.id),
+                "work_type_id": str(instance.work_type_id),
+                "location_id": str(instance.location_id),
+            },
+        )
+        return Response(self.get_serializer(instance).data)
+
+    @action(detail=True, methods=["post"])
+    def reactivate(self, request, pk=None):
+        if not can_manage_masters(request.user):
+            raise PermissionDenied("Only system admins can perform this action.")
+        instance = self.get_object()
+        instance.full_clean()
+        reactivate_instance(instance)
+        record_operations_event(
+            entity="work_type_availability",
+            action="reactivate",
+            actor=request.user,
+            request=request,
+            metadata={
+                "id": str(instance.id),
+                "work_type_id": str(instance.work_type_id),
+                "location_id": str(instance.location_id),
+            },
+        )
         return Response(self.get_serializer(instance).data)
 
 
 class StaffLocationViewSet(OperationsBaseViewSet):
-    queryset = StaffLocation.objects.select_related("staff", "location").all().order_by("display_order", "-valid_from")
+    queryset = (
+        StaffLocation.objects.select_related("staff", "location").all().order_by("staff__display_name", "-valid_from")
+    )
     serializer_class = StaffLocationSerializer
 
     def get_permissions(self):
@@ -262,7 +333,7 @@ class StaffLocationViewSet(OperationsBaseViewSet):
     def perform_create(self, serializer):
         if not can_manage_staff_relationships(self.request.user):
             raise PermissionDenied("You do not have permission to manage staff assignments.")
-        instance = serializer.save()
+        instance = serializer.save(is_active=True)
         record_operations_event(
             entity="staff_location",
             action="create",
@@ -313,12 +384,36 @@ class StaffLocationViewSet(OperationsBaseViewSet):
         )
         return Response(self.get_serializer(instance).data)
 
+    @action(detail=True, methods=["post"])
+    def reactivate(self, request, pk=None):
+        if not can_manage_staff_relationships(request.user):
+            raise PermissionDenied("You do not have permission to manage staff assignments.")
+        instance = self.get_object()
+        instance.full_clean()
+        reactivate_instance(instance)
+        record_operations_event(
+            entity="staff_location",
+            action="reactivate",
+            actor=request.user,
+            request=request,
+            target_user=instance.staff,
+            metadata={
+                "id": str(instance.id),
+                "staff_id": str(instance.staff_id),
+                "location_id": str(instance.location_id),
+            },
+        )
+        return Response(self.get_serializer(instance).data)
+
 
 class StaffCapabilityViewSet(OperationsBaseViewSet):
     queryset = (
         StaffCapability.objects.select_related("staff", "work_type", "location", "approved_by")
         .all()
-        .order_by("display_order", "-valid_from")
+        .order_by(
+            "staff__display_name",
+            "-valid_from",
+        )
     )
     serializer_class = StaffCapabilitySerializer
 
@@ -347,7 +442,11 @@ class StaffCapabilityViewSet(OperationsBaseViewSet):
     def perform_create(self, serializer):
         if not can_manage_staff_relationships(self.request.user):
             raise PermissionDenied("You do not have permission to manage staff capabilities.")
-        instance = serializer.save()
+        instance = serializer.save(
+            is_active=True,
+            approved_by=self.request.user,
+            approved_at=timezone.now(),
+        )
         record_operations_event(
             entity="staff_capability",
             action="create",
@@ -364,7 +463,7 @@ class StaffCapabilityViewSet(OperationsBaseViewSet):
     def perform_update(self, serializer):
         if not can_manage_staff_relationships(self.request.user):
             raise PermissionDenied("You do not have permission to manage staff capabilities.")
-        instance = serializer.save()
+        instance = serializer.save(approved_by=self.request.user, approved_at=timezone.now())
         record_operations_event(
             entity="staff_capability",
             action="update",
@@ -398,12 +497,46 @@ class StaffCapabilityViewSet(OperationsBaseViewSet):
         )
         return Response(self.get_serializer(instance).data)
 
+    @action(detail=True, methods=["post"])
+    def reactivate(self, request, pk=None):
+        if not can_manage_staff_relationships(request.user):
+            raise PermissionDenied("You do not have permission to manage staff capabilities.")
+        instance = self.get_object()
+        instance.approved_by = request.user
+        instance.approved_at = timezone.now()
+        instance.full_clean()
+        reactivate_instance(instance)
+        instance.save(update_fields=["approved_by", "approved_at", "updated_at"])
+        record_operations_event(
+            entity="staff_capability",
+            action="reactivate",
+            actor=request.user,
+            request=request,
+            target_user=instance.staff,
+            metadata={
+                "id": str(instance.id),
+                "staff_id": str(instance.staff_id),
+                "work_type_id": str(instance.work_type_id),
+            },
+        )
+        return Response(self.get_serializer(instance).data)
+
+
+class MyStaffLocationViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = MyStaffLocationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return StaffLocation.objects.select_related("location").filter(staff=self.request.user).order_by("-valid_from")
+
 
 class MyStaffCapabilityViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = MyStaffCapabilitySerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return StaffCapability.objects.select_related("work_type", "location", "approved_by").filter(
-            staff=self.request.user
+        return (
+            StaffCapability.objects.select_related("work_type", "location", "approved_by")
+            .filter(staff=self.request.user)
+            .order_by("-valid_from")
         )

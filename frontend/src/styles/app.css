@@ -175,6 +175,13 @@ button:disabled {
   justify-content: space-between;
 }
 
+.toolbar {
+  display: flex;
+  gap: 12px;
+  margin: 16px 0;
+  align-items: end;
+}
+
 .form-grid {
   display: grid;
   gap: 16px;

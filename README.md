@@ -56,3 +56,14 @@ Phase 2 adds the `operations` app with these resources:
 - My capabilities
 
 All APIs are exposed under `/api/v1/`.
+
+## Phase 3 Scope
+
+Phase 3 adds the `shifts` app with reusable shift settings:
+
+- Shift patterns with ordered work segments
+- Weekly shift templates with staff and weekday assignments
+- Nested create/update APIs with soft deactivation of removed child rows
+- Shift setting screens at `/shifts/patterns` and `/shifts/templates`
+
+Shift segment times are stored as minutes from local midnight in 15-minute increments. Values may extend into the next day up to 2880 minutes, for example `1470` means `翌00:30`.

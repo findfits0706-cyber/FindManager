@@ -31,6 +31,11 @@
   - Staff locations
   - Staff capabilities
   - My capabilities
+- `apps.shifts`
+  - Shift patterns
+  - Shift pattern segments
+  - Weekly shift templates
+  - Weekly template entries
 
 ## Phase 2 Domain Rules
 
@@ -47,6 +52,16 @@
 - Operational master pages
 - Staff assignment pages
 - Self-service capability page
+- Shift pattern and weekly template pages
+
+## Phase 3 Domain Rules
+
+- Shift patterns define a reusable one-day work sequence for one staff member.
+- Weekly shift templates assign active shift patterns to staff by weekday, Monday through Sunday.
+- Segment times are stored as offset minutes from midnight, not as `time` fields, so next-day work can be represented without introducing dated monthly shifts.
+- Segment offsets must be in 15-minute increments and each active pattern must have at least one active segment.
+- Removed segments and weekly entries are soft-deactivated rather than physically deleted.
+- StaffCapability is not required when saving weekly templates because templates do not have concrete dates. Phase 4 validates dated StaffLocation and StaffCapability records when templates are expanded into monthly shifts.
 
 ## Quality Gates
 

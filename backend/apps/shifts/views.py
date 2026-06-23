@@ -1,15 +1,17 @@
+from django.db import transaction
 from django.db.models import Q
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
-from rest_framework.serializers import ValidationError as DRFValidationError
 
 from .models import ShiftPattern, WeeklyShiftTemplate
 from .serializers import (
     ShiftPatternDuplicateSerializer,
+    ShiftPatternListSerializer,
     ShiftPatternSerializer,
     WeeklyShiftTemplateDuplicateSerializer,
+    WeeklyShiftTemplateListSerializer,
     WeeklyShiftTemplateSerializer,
 )
 from .services import (
@@ -26,9 +28,21 @@ from .services import (
 )
 
 
+class ShiftSettingsPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if request.method in permissions.SAFE_METHODS:
+            return can_view_shifts(request.user)
+        return can_manage_shifts(request.user)
+
+    def has_object_permission(self, request, view, obj):
+        return self.has_permission(request, view)
+
+
 class ShiftManagementBaseViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "patch", "head", "options"]
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [ShiftSettingsPermission]
 
     def _require_manage(self):
         if not can_manage_shifts(self.request.user):
@@ -43,9 +57,12 @@ class ShiftPatternViewSet(ShiftManagementBaseViewSet):
         .order_by("location__display_order", "display_order", "code")
     )
 
+    def get_serializer_class(self):
+        if self.action == "list":
+            return ShiftPatternListSerializer
+        return ShiftPatternSerializer
+
     def get_queryset(self):
-        if not can_view_shifts(self.request.user):
-            return self.queryset.none()
         queryset = self.queryset
         params = self.request.query_params
         if params.get("location"):
@@ -64,55 +81,56 @@ class ShiftPatternViewSet(ShiftManagementBaseViewSet):
 
     def perform_create(self, serializer):
         self._require_manage()
-        instance = serializer.save()
-        record_shift_event(
-            entity="shift_pattern",
-            action="create",
-            actor=self.request.user,
-            request=self.request,
-            metadata=shift_pattern_metadata(instance),
-        )
+        with transaction.atomic():
+            instance = serializer.save()
+            record_shift_event(
+                entity="shift_pattern",
+                action="create",
+                actor=self.request.user,
+                request=self.request,
+                metadata=shift_pattern_metadata(instance),
+            )
 
     def perform_update(self, serializer):
         self._require_manage()
-        instance = serializer.save()
-        record_shift_event(
-            entity="shift_pattern",
-            action="update",
-            actor=self.request.user,
-            request=self.request,
-            metadata=shift_pattern_metadata(instance),
-        )
+        with transaction.atomic():
+            instance = serializer.save()
+            record_shift_event(
+                entity="shift_pattern",
+                action="update",
+                actor=self.request.user,
+                request=self.request,
+                metadata=shift_pattern_metadata(instance),
+            )
 
     @action(detail=True, methods=["post"])
     def deactivate(self, request, pk=None):
         self._require_manage()
         instance = self.get_object()
-        deactivate_instance(instance)
-        record_shift_event(
-            entity="shift_pattern",
-            action="deactivate",
-            actor=request.user,
-            request=request,
-            metadata=shift_pattern_metadata(instance),
-        )
+        with transaction.atomic():
+            deactivate_instance(instance)
+            record_shift_event(
+                entity="shift_pattern",
+                action="deactivate",
+                actor=request.user,
+                request=request,
+                metadata=shift_pattern_metadata(instance),
+            )
         return Response(self.get_serializer(instance).data)
 
     @action(detail=True, methods=["post"])
     def reactivate(self, request, pk=None):
         self._require_manage()
         instance = self.get_object()
-        try:
+        with transaction.atomic():
             validate_and_reactivate_pattern(instance)
-        except DRFValidationError:
-            raise
-        record_shift_event(
-            entity="shift_pattern",
-            action="reactivate",
-            actor=request.user,
-            request=request,
-            metadata=shift_pattern_metadata(instance),
-        )
+            record_shift_event(
+                entity="shift_pattern",
+                action="reactivate",
+                actor=request.user,
+                request=request,
+                metadata=shift_pattern_metadata(instance),
+            )
         return Response(self.get_serializer(instance).data)
 
     @action(detail=True, methods=["post"])
@@ -121,14 +139,15 @@ class ShiftPatternViewSet(ShiftManagementBaseViewSet):
         source = self.get_object()
         serializer = ShiftPatternDuplicateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        instance = duplicate_shift_pattern(source, **serializer.validated_data)
-        record_shift_event(
-            entity="shift_pattern",
-            action="duplicate",
-            actor=request.user,
-            request=request,
-            metadata=shift_pattern_metadata(instance, source_id=source.id),
-        )
+        with transaction.atomic():
+            instance = duplicate_shift_pattern(source, **serializer.validated_data)
+            record_shift_event(
+                entity="shift_pattern",
+                action="duplicate",
+                actor=request.user,
+                request=request,
+                metadata=shift_pattern_metadata(instance, source_id=source.id),
+            )
         return Response(self.get_serializer(instance).data, status=status.HTTP_201_CREATED)
 
 
@@ -140,9 +159,12 @@ class WeeklyShiftTemplateViewSet(ShiftManagementBaseViewSet):
         .order_by("location__display_order", "display_order", "code")
     )
 
+    def get_serializer_class(self):
+        if self.action == "list":
+            return WeeklyShiftTemplateListSerializer
+        return WeeklyShiftTemplateSerializer
+
     def get_queryset(self):
-        if not can_view_shifts(self.request.user):
-            return self.queryset.none()
         queryset = self.queryset
         params = self.request.query_params
         if params.get("location"):
@@ -160,52 +182,56 @@ class WeeklyShiftTemplateViewSet(ShiftManagementBaseViewSet):
 
     def perform_create(self, serializer):
         self._require_manage()
-        instance = serializer.save()
-        record_shift_event(
-            entity="weekly_shift_template",
-            action="create",
-            actor=self.request.user,
-            request=self.request,
-            metadata=weekly_template_metadata(instance),
-        )
+        with transaction.atomic():
+            instance = serializer.save()
+            record_shift_event(
+                entity="weekly_shift_template",
+                action="create",
+                actor=self.request.user,
+                request=self.request,
+                metadata=weekly_template_metadata(instance),
+            )
 
     def perform_update(self, serializer):
         self._require_manage()
-        instance = serializer.save()
-        record_shift_event(
-            entity="weekly_shift_template",
-            action="update",
-            actor=self.request.user,
-            request=self.request,
-            metadata=weekly_template_metadata(instance),
-        )
+        with transaction.atomic():
+            instance = serializer.save()
+            record_shift_event(
+                entity="weekly_shift_template",
+                action="update",
+                actor=self.request.user,
+                request=self.request,
+                metadata=weekly_template_metadata(instance),
+            )
 
     @action(detail=True, methods=["post"])
     def deactivate(self, request, pk=None):
         self._require_manage()
         instance = self.get_object()
-        deactivate_instance(instance)
-        record_shift_event(
-            entity="weekly_shift_template",
-            action="deactivate",
-            actor=request.user,
-            request=request,
-            metadata=weekly_template_metadata(instance),
-        )
+        with transaction.atomic():
+            deactivate_instance(instance)
+            record_shift_event(
+                entity="weekly_shift_template",
+                action="deactivate",
+                actor=request.user,
+                request=request,
+                metadata=weekly_template_metadata(instance),
+            )
         return Response(self.get_serializer(instance).data)
 
     @action(detail=True, methods=["post"])
     def reactivate(self, request, pk=None):
         self._require_manage()
         instance = self.get_object()
-        validate_and_reactivate_template(instance)
-        record_shift_event(
-            entity="weekly_shift_template",
-            action="reactivate",
-            actor=request.user,
-            request=request,
-            metadata=weekly_template_metadata(instance),
-        )
+        with transaction.atomic():
+            validate_and_reactivate_template(instance)
+            record_shift_event(
+                entity="weekly_shift_template",
+                action="reactivate",
+                actor=request.user,
+                request=request,
+                metadata=weekly_template_metadata(instance),
+            )
         return Response(self.get_serializer(instance).data)
 
     @action(detail=True, methods=["post"])
@@ -214,12 +240,13 @@ class WeeklyShiftTemplateViewSet(ShiftManagementBaseViewSet):
         source = self.get_object()
         serializer = WeeklyShiftTemplateDuplicateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        instance = duplicate_weekly_template(source, **serializer.validated_data)
-        record_shift_event(
-            entity="weekly_shift_template",
-            action="duplicate",
-            actor=request.user,
-            request=request,
-            metadata=weekly_template_metadata(instance, source_id=source.id),
-        )
+        with transaction.atomic():
+            instance = duplicate_weekly_template(source, **serializer.validated_data)
+            record_shift_event(
+                entity="weekly_shift_template",
+                action="duplicate",
+                actor=request.user,
+                request=request,
+                metadata=weekly_template_metadata(instance, source_id=source.id),
+            )
         return Response(self.get_serializer(instance).data, status=status.HTTP_201_CREATED)

@@ -4,6 +4,7 @@ from .models import ShiftPattern, ShiftPatternSegment, WeeklyShiftTemplate, Week
 from .services import save_shift_pattern, save_weekly_template
 
 FORBIDDEN_CHILD_FIELDS = {"is_active", "created_at", "updated_at"}
+IMMUTABLE_LOCATION_MESSAGE = "拠点は作成後変更できません。別拠点用に複製してください。"
 
 
 class ShiftPatternSegmentSerializer(serializers.ModelSerializer):
@@ -111,6 +112,8 @@ class ShiftPatternSerializer(serializers.ModelSerializer):
         forbidden = {"is_active", "created_at", "updated_at"}.intersection(self.initial_data)
         if forbidden:
             raise serializers.ValidationError({field: "This field is read-only." for field in forbidden})
+        if self.instance is not None and "location" in attrs and attrs["location"].id != self.instance.location_id:
+            raise serializers.ValidationError({"location": IMMUTABLE_LOCATION_MESSAGE})
         return attrs
 
     def create(self, validated_data):
@@ -126,6 +129,11 @@ class ShiftPatternDuplicateSerializer(serializers.Serializer):
     code = serializers.CharField(max_length=50)
     name = serializers.CharField(max_length=150)
     short_name = serializers.CharField(max_length=100)
+
+
+class ShiftPatternListSerializer(ShiftPatternSerializer):
+    class Meta(ShiftPatternSerializer.Meta):
+        fields = [field for field in ShiftPatternSerializer.Meta.fields if field != "segments"]
 
 
 class WeeklyShiftTemplateEntrySerializer(serializers.ModelSerializer):
@@ -197,6 +205,8 @@ class WeeklyShiftTemplateSerializer(serializers.ModelSerializer):
         forbidden = {"is_active", "created_at", "updated_at"}.intersection(self.initial_data)
         if forbidden:
             raise serializers.ValidationError({field: "This field is read-only." for field in forbidden})
+        if self.instance is not None and "location" in attrs and attrs["location"].id != self.instance.location_id:
+            raise serializers.ValidationError({"location": IMMUTABLE_LOCATION_MESSAGE})
         return attrs
 
     def create(self, validated_data):
@@ -211,3 +221,8 @@ class WeeklyShiftTemplateSerializer(serializers.ModelSerializer):
 class WeeklyShiftTemplateDuplicateSerializer(serializers.Serializer):
     code = serializers.CharField(max_length=50)
     name = serializers.CharField(max_length=150)
+
+
+class WeeklyShiftTemplateListSerializer(WeeklyShiftTemplateSerializer):
+    class Meta(WeeklyShiftTemplateSerializer.Meta):
+        fields = [field for field in WeeklyShiftTemplateSerializer.Meta.fields if field != "entries"]

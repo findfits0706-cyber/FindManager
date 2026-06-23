@@ -38,10 +38,6 @@ const emptyPattern: PatternForm = {
 
 const timeOptions = buildOffsetOptions();
 
-function colorClass(colorKey = "slate") {
-  return `timeline-chip color-${colorKey}`;
-}
-
 export function ShiftPatternsPage() {
   const { user } = useAuth();
   const roles = user?.roles ?? [];
@@ -50,6 +46,7 @@ export function ShiftPatternsPage() {
   const [filters, setFilters] = useState({ location: "", is_active: "", search: "" });
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<PatternForm>(emptyPattern);
+  const [isDirty, setIsDirty] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -74,9 +71,9 @@ export function ShiftPatternsPage() {
     queryFn: () => api<Paginated<Location>>("/api/v1/locations/?page_size=100&is_active=true"),
   });
   const workTypeQuery = useQuery({
-    enabled: canView,
-    queryKey: ["work-types", "shift-options"],
-    queryFn: () => api<Paginated<WorkType>>("/api/v1/work-types/?page_size=100&is_active=true"),
+    enabled: canView && Boolean(form.location),
+    queryKey: ["work-types", "shift-options", form.location],
+    queryFn: () => api<Paginated<WorkType>>(`/api/v1/work-types/?page_size=100&is_active=true&location=${form.location}`),
   });
   const workAreaQuery = useQuery({
     enabled: canView,
@@ -84,43 +81,70 @@ export function ShiftPatternsPage() {
     queryFn: () => api<Paginated<WorkArea>>(`/api/v1/work-areas/?page_size=100&is_active=true${form.location ? `&location=${form.location}` : ""}`),
   });
 
-  if (!canView) {
-    return <Navigate to="/403" replace />;
-  }
+  if (!canView) return <Navigate to="/403" replace />;
 
-  const reset = () => {
-    setEditingId(null);
-    setForm(emptyPattern);
-    setError("");
+  const markForm = (patch: Partial<PatternForm>) => {
+    setForm((current) => ({ ...current, ...patch }));
+    setIsDirty(true);
   };
 
-  const editPattern = (pattern: ShiftPattern) => {
-    if (editingId && window.confirm("未保存の変更を破棄して別の勤務パターンを開きますか？") === false) {
-      return;
-    }
-    setEditingId(pattern.id);
+  const confirmDiscard = () => !isDirty || window.confirm("未保存の変更を破棄しますか？");
+
+  const reset = () => {
+    if (!confirmDiscard()) return;
+    setEditingId(null);
+    setForm(emptyPattern);
+    setIsDirty(false);
     setError("");
     setMessage("");
-    setForm({
-      location: pattern.location,
-      code: pattern.code,
-      name: pattern.name,
-      short_name: pattern.short_name,
-      description: pattern.description,
-      display_order: pattern.display_order,
-      segments:
-        pattern.segments
-          ?.filter((segment) => segment.is_active)
-          .map((segment) => ({
-            id: segment.id,
-            work_type: segment.work_type,
-            work_area: segment.work_area ?? "",
-            start_offset_minutes: segment.start_offset_minutes,
-            end_offset_minutes: segment.end_offset_minutes,
-            display_order: segment.display_order,
-            notes: segment.notes,
-          })) ?? [],
+  };
+
+  const loadPattern = async (pattern: ShiftPattern) => {
+    if (!confirmDiscard()) return;
+    setError("");
+    setMessage("");
+    try {
+      const detail = await api<ShiftPattern>(`/api/v1/shift-patterns/${pattern.id}/`);
+      setEditingId(detail.id);
+      setForm({
+        location: detail.location,
+        code: detail.code,
+        name: detail.name,
+        short_name: detail.short_name,
+        description: detail.description,
+        display_order: detail.display_order,
+        segments:
+          detail.segments
+            ?.filter((segment) => segment.is_active)
+            .map((segment) => ({
+              id: segment.id,
+              work_type: segment.work_type,
+              work_area: segment.work_area ?? "",
+              start_offset_minutes: segment.start_offset_minutes,
+              end_offset_minutes: segment.end_offset_minutes,
+              display_order: segment.display_order,
+              notes: segment.notes,
+            })) ?? [],
+      });
+      setIsDirty(false);
+    } catch (detailError) {
+      setError(detailError instanceof Error ? detailError.message : "詳細の取得に失敗しました。");
+    }
+  };
+
+  const changeLocation = (location: string) => {
+    markForm({
+      location,
+      segments: form.segments.map((segment) => ({ ...segment, work_type: "", work_area: "" })),
     });
+  };
+
+  const updateSegment = (index: number, patch: Partial<SegmentForm>) => {
+    setForm((current) => ({
+      ...current,
+      segments: current.segments.map((segment, segmentIndex) => (segmentIndex === index ? { ...segment, ...patch } : segment)),
+    }));
+    setIsDirty(true);
   };
 
   const addSegment = () => {
@@ -138,49 +162,32 @@ export function ShiftPatternsPage() {
         },
       ],
     }));
-  };
-
-  const updateSegment = (index: number, patch: Partial<SegmentForm>) => {
-    setForm((current) => ({
-      ...current,
-      segments: current.segments.map((segment, segmentIndex) => (segmentIndex === index ? { ...segment, ...patch } : segment)),
-    }));
+    setIsDirty(true);
   };
 
   const removeSegment = (index: number) => {
     setForm((current) => ({ ...current, segments: current.segments.filter((_, segmentIndex) => segmentIndex !== index) }));
-  };
-
-  const moveSegment = (index: number, direction: -1 | 1) => {
-    setForm((current) => {
-      const nextIndex = index + direction;
-      if (nextIndex < 0 || nextIndex >= current.segments.length) return current;
-      const segments = [...current.segments];
-      [segments[index], segments[nextIndex]] = [segments[nextIndex], segments[index]];
-      return { ...current, segments: segments.map((segment, order) => ({ ...segment, display_order: (order + 1) * 10 })) };
-    });
+    setIsDirty(true);
   };
 
   const save = async (event: React.FormEvent) => {
     event.preventDefault();
     if (isSubmitting) return;
+    setIsSubmitting(true);
     setError("");
     setMessage("");
-    setIsSubmitting(true);
     try {
-      const payload = {
-        ...form,
-        segments: form.segments.map((segment) => ({
-          ...segment,
-          work_area: segment.work_area || null,
-        })),
-      };
       await api(editingId ? `/api/v1/shift-patterns/${editingId}/` : "/api/v1/shift-patterns/", {
         method: editingId ? "PATCH" : "POST",
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          ...form,
+          segments: form.segments.map((segment) => ({ ...segment, work_area: segment.work_area || null })),
+        }),
       });
       setMessage("保存しました。");
-      reset();
+      setEditingId(null);
+      setForm(emptyPattern);
+      setIsDirty(false);
       await patternQuery.refetch();
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "保存に失敗しました。");
@@ -241,34 +248,17 @@ export function ShiftPatternsPage() {
         {canManage ? <button type="button" onClick={reset}>新規作成</button> : null}
       </div>
       <div className="toolbar field-grid">
-        <label>
-          拠点
-          <select value={filters.location} onChange={(event) => setFilters((current) => ({ ...current, location: event.target.value }))}>
-            <option value="">すべて</option>
-            {locationQuery.data?.results.map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}
-          </select>
-        </label>
-        <label>
-          状態
-          <select value={filters.is_active} onChange={(event) => setFilters((current) => ({ ...current, is_active: event.target.value }))}>
-            <option value="">すべて</option>
-            <option value="true">有効</option>
-            <option value="false">無効</option>
-          </select>
-        </label>
-        <label>
-          検索
-          <input value={filters.search} onChange={(event) => setFilters((current) => ({ ...current, search: event.target.value }))} placeholder="名称・コード" />
-        </label>
+        <label>拠点<select value={filters.location} onChange={(e) => setFilters((c) => ({ ...c, location: e.target.value }))}><option value="">すべて</option>{locationQuery.data?.results.map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label>
+        <label>状態<select value={filters.is_active} onChange={(e) => setFilters((c) => ({ ...c, is_active: e.target.value }))}><option value="">すべて</option><option value="true">有効</option><option value="false">無効</option></select></label>
+        <label>検索<input value={filters.search} onChange={(e) => setFilters((c) => ({ ...c, search: e.target.value }))} placeholder="名称・コード" /></label>
       </div>
+      {patternQuery.isError ? <p className="error">一覧の取得に失敗しました。</p> : null}
       {error ? <p className="error">{error}</p> : null}
       {message ? <p className="success">{message}</p> : null}
       {patternQuery.isLoading ? <p>読み込み中...</p> : null}
       {!patternQuery.isLoading && patternQuery.data?.results.length === 0 ? <p className="subtle-text">勤務パターンはまだありません。</p> : null}
       <table className="table">
-        <thead>
-          <tr><th>名称</th><th>拠点</th><th>時間</th><th>内訳</th><th>状態</th><th>操作</th></tr>
-        </thead>
+        <thead><tr><th>名称</th><th>拠点</th><th>時間</th><th>内訳</th><th>状態</th><th>操作</th></tr></thead>
         <tbody>
           {patternQuery.data?.results.map((pattern) => (
             <tr key={pattern.id}>
@@ -278,7 +268,7 @@ export function ShiftPatternsPage() {
               <td>{pattern.segment_count}件 / 勤務{pattern.work_minutes}分 / 休憩{pattern.break_minutes}分</td>
               <td>{pattern.is_active ? "有効" : "無効"}</td>
               <td className="actions">
-                <button type="button" onClick={() => editPattern(pattern)}>詳細</button>
+                <button type="button" onClick={() => void loadPattern(pattern)}>{canManage ? "編集" : "詳細"}</button>
                 {canManage ? <button type="button" disabled={actionId === pattern.id} onClick={() => void duplicate(pattern)}>複製</button> : null}
                 {canManage ? <button type="button" disabled={actionId === pattern.id} onClick={() => void toggleActive(pattern)}>{pattern.is_active ? "無効化" : "再有効化"}</button> : null}
               </td>
@@ -287,30 +277,33 @@ export function ShiftPatternsPage() {
         </tbody>
       </table>
       <form className="form-grid compact-form" onSubmit={(event) => void save(event)}>
-        <div className="section-header"><h3>{editingId ? "勤務パターン編集" : "勤務パターン新規作成"}</h3>{!canManage ? <span className="subtle-text">閲覧のみ</span> : null}</div>
+        <div className="section-header">
+          <h3>{editingId ? "勤務パターン編集" : "勤務パターン新規作成"}</h3>
+          {editingId ? <span className="subtle-text">拠点は作成後変更できません。別拠点用に複製してください。</span> : null}
+        </div>
         <div className="field-grid">
-          <label>拠点<select disabled={!canManage} value={form.location} onChange={(event) => setForm((current) => ({ ...current, location: event.target.value }))}><option value="">選択してください</option>{locationQuery.data?.results.map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label>
-          <label>コード<input readOnly={!canManage} value={form.code} onChange={(event) => setForm((current) => ({ ...current, code: event.target.value }))} /></label>
-          <label>名称<input readOnly={!canManage} value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} /></label>
-          <label>省略名<input readOnly={!canManage} value={form.short_name} onChange={(event) => setForm((current) => ({ ...current, short_name: event.target.value }))} /></label>
-          <label>表示順<input readOnly={!canManage} type="number" value={form.display_order} onChange={(event) => setForm((current) => ({ ...current, display_order: Number(event.target.value) }))} /></label>
-          <label className="full-width">説明<input readOnly={!canManage} value={form.description} onChange={(event) => setForm((current) => ({ ...current, description: event.target.value }))} /></label>
+          <label>拠点<select disabled={!canManage || Boolean(editingId)} value={form.location} onChange={(e) => changeLocation(e.target.value)}><option value="">選択してください</option>{locationQuery.data?.results.map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label>
+          <label>コード<input readOnly={!canManage} value={form.code} onChange={(e) => markForm({ code: e.target.value })} /></label>
+          <label>名称<input readOnly={!canManage} value={form.name} onChange={(e) => markForm({ name: e.target.value })} /></label>
+          <label>省略名<input readOnly={!canManage} value={form.short_name} onChange={(e) => markForm({ short_name: e.target.value })} /></label>
+          <label>表示順<input readOnly={!canManage} type="number" value={form.display_order} onChange={(e) => markForm({ display_order: Number(e.target.value) })} /></label>
+          <label className="full-width">説明<input readOnly={!canManage} value={form.description} onChange={(e) => markForm({ description: e.target.value })} /></label>
         </div>
         <div className="section-header"><h3>セグメント</h3>{canManage ? <button type="button" onClick={addSegment}>追加</button> : null}</div>
         {form.segments.map((segment, index) => (
           <div className="field-grid segment-row" key={`${segment.id ?? "new"}-${index}`}>
-            <label>開始<select disabled={!canManage} value={segment.start_offset_minutes} onChange={(event) => updateSegment(index, { start_offset_minutes: Number(event.target.value) })}>{timeOptions.filter((option) => option.value < 2880).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
-            <label>終了<select disabled={!canManage} value={segment.end_offset_minutes} onChange={(event) => updateSegment(index, { end_offset_minutes: Number(event.target.value) })}>{timeOptions.filter((option) => option.value > 0).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
-            <label>業務種別<select disabled={!canManage} value={segment.work_type} onChange={(event) => updateSegment(index, { work_type: event.target.value })}><option value="">選択してください</option>{workTypeQuery.data?.results.map((workType) => <option key={workType.id} value={workType.id}>{workType.name}</option>)}</select></label>
-            <label>業務エリア<select disabled={!canManage} value={segment.work_area} onChange={(event) => updateSegment(index, { work_area: event.target.value })}><option value="">全体</option>{workAreaQuery.data?.results.map((area) => <option key={area.id} value={area.id}>{area.name}</option>)}</select></label>
-            <label>備考<input readOnly={!canManage} value={segment.notes} onChange={(event) => updateSegment(index, { notes: event.target.value })} /></label>
-            {canManage ? <div className="actions"><button type="button" onClick={() => moveSegment(index, -1)}>上へ</button><button type="button" onClick={() => moveSegment(index, 1)}>下へ</button><button type="button" onClick={() => removeSegment(index)}>削除</button></div> : null}
+            <label>開始<select disabled={!canManage} value={segment.start_offset_minutes} onChange={(e) => updateSegment(index, { start_offset_minutes: Number(e.target.value) })}>{timeOptions.filter((option) => option.value < 2880).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+            <label>終了<select disabled={!canManage} value={segment.end_offset_minutes} onChange={(e) => updateSegment(index, { end_offset_minutes: Number(e.target.value) })}>{timeOptions.filter((option) => option.value > 0).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+            <label>業務種別<select disabled={!canManage} value={segment.work_type} onChange={(e) => updateSegment(index, { work_type: e.target.value })}><option value="">選択してください</option>{workTypeQuery.data?.results.map((workType) => <option key={workType.id} value={workType.id}>{workType.name}</option>)}</select></label>
+            <label>業務エリア<select disabled={!canManage} value={segment.work_area} onChange={(e) => updateSegment(index, { work_area: e.target.value })}><option value="">全体</option>{workAreaQuery.data?.results.map((area) => <option key={area.id} value={area.id}>{area.name}</option>)}</select></label>
+            <label>備考<input readOnly={!canManage} value={segment.notes} onChange={(e) => updateSegment(index, { notes: e.target.value })} /></label>
+            {canManage ? <div className="actions"><button type="button" onClick={() => removeSegment(index)}>削除</button></div> : null}
           </div>
         ))}
         <div className="timeline-preview">
           {previewSegments.map((segment, index) => {
             const workType = workTypeMap.get(segment.work_type);
-            return <span key={`${segment.id ?? index}-preview`} className={colorClass(workType?.color_key)}>{offsetToLabel(segment.start_offset_minutes)}-{offsetToLabel(segment.end_offset_minutes)} {workType?.short_name ?? "未選択"}</span>;
+            return <span key={`${segment.id ?? index}-preview`} className={`timeline-chip color-${workType?.color_key ?? "slate"}`}>{offsetToLabel(segment.start_offset_minutes)}-{offsetToLabel(segment.end_offset_minutes)} {workType?.short_name ?? "未選択"}</span>;
           })}
         </div>
         {canManage ? <button type="submit" disabled={isSubmitting}>{isSubmitting ? "保存中..." : "保存"}</button> : null}

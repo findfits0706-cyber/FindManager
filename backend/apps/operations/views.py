@@ -313,6 +313,12 @@ class StaffLocationViewSet(OperationsBaseViewSet):
         params = self.request.query_params
         if params.get("staff"):
             queryset = queryset.filter(staff_id=params["staff"])
+        if params.get("staff_search"):
+            queryset = queryset.filter(
+                Q(staff__display_name__icontains=params["staff_search"])
+                | Q(staff__username__icontains=params["staff_search"])
+                | Q(staff__employee_code__icontains=params["staff_search"])
+            )
         if params.get("location"):
             queryset = queryset.filter(location_id=params["location"])
         if params.get("is_primary") in {"true", "false"}:

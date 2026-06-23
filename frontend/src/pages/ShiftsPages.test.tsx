@@ -1,6 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -15,10 +15,10 @@ const fetchMock = vi.fn();
 vi.stubGlobal("fetch", fetchMock);
 const confirmMock = vi.spyOn(window, "confirm");
 
-function renderWithAuth(element: ReactNode, path = "/") {
+function renderWithAuth(element: ReactNode) {
   render(
     <QueryClientProvider client={new QueryClient()}>
-      <MemoryRouter initialEntries={[path]}>
+      <MemoryRouter>
         <AuthProvider>{element}</AuthProvider>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -26,7 +26,7 @@ function renderWithAuth(element: ReactNode, path = "/") {
 }
 
 function mockAuthAndApi(roles: string[], handlers: Record<string, unknown>) {
-  fetchMock.mockImplementation(async (input) => {
+  fetchMock.mockImplementation(async (input, init) => {
     const url = String(input);
     if (url.endsWith("/api/v1/auth/me/")) {
       return {
@@ -49,7 +49,7 @@ function mockAuthAndApi(roles: string[], handlers: Record<string, unknown>) {
     }
     for (const [fragment, payload] of Object.entries(handlers)) {
       if (url.includes(fragment)) {
-        return { ok: true, json: async () => payload } as Response;
+        return { ok: true, json: async () => (typeof payload === "function" ? payload(input, init) : payload) } as Response;
       }
     }
     return { ok: true, json: async () => ({ count: 0, next: null, previous: null, results: [] }) } as Response;
@@ -122,10 +122,14 @@ describe("shift settings pages", () => {
     expect(screen.getByRole("link", { name: "週間テンプレート" })).toBeInTheDocument();
   });
 
-  it("converts offsets and labels including next day values", () => {
+  it("converts all 15 minute offsets including 2880", () => {
     expect(offsetToLabel(510)).toBe("08:30");
     expect(offsetToLabel(1470)).toBe("翌00:30");
-    expect(labelToOffset("翌02:00")).toBe(1560);
+    expect(offsetToLabel(2880)).toBe("翌24:00");
+    expect(labelToOffset("翌24:00")).toBe(2880);
+    for (let value = 0; value <= 2880; value += 15) {
+      expect(labelToOffset(offsetToLabel(value))).toBe(value);
+    }
   });
 
   it("adds and removes segments and uses 15 minute options", async () => {
@@ -136,6 +140,8 @@ describe("shift settings pages", () => {
       "/api/v1/work-areas/": workAreas,
     });
     renderWithAuth(<ShiftPatternsPage />);
+    await screen.findAllByRole("option", { name: "本館" });
+    await userEvent.selectOptions((await screen.findAllByLabelText("拠点"))[1], "l1");
     await userEvent.click(await screen.findByRole("button", { name: "追加" }));
     expect(screen.getAllByRole("option", { name: "08:30" }).length).toBeGreaterThan(0);
     expect(screen.getAllByRole("option", { name: "翌02:00" }).length).toBeGreaterThan(0);
@@ -144,18 +150,59 @@ describe("shift settings pages", () => {
     expect(screen.queryByText(/未選択/)).not.toBeInTheDocument();
   });
 
-  it("cancels deactivate without calling the API", async () => {
-    confirmMock.mockReturnValueOnce(false);
+  it("cancels deactivate and confirms reactivate", async () => {
+    confirmMock.mockReturnValueOnce(false).mockReturnValueOnce(true);
     mockAuthAndApi(["system_admin"], {
+      "/api/v1/shift-patterns/": { ...patterns, results: [{ ...patterns.results[0], is_active: false }] },
+      "/api/v1/locations/": locations,
+      "/api/v1/work-types/": workTypes,
+      "/api/v1/work-areas/": workAreas,
+    });
+    renderWithAuth(<ShiftPatternsPage />);
+    await userEvent.click(await screen.findByRole("button", { name: "再有効化" }));
+    expect(confirmMock).toHaveBeenCalled();
+  });
+
+  it("prevents duplicate save submissions while saving", async () => {
+    let postCount = 0;
+    mockAuthAndApi(["system_admin"], {
+      "/api/v1/shift-patterns/": (_input: unknown, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          postCount += 1;
+          return new Promise(() => undefined);
+        }
+        return { ...patterns, results: [] };
+      },
+      "/api/v1/locations/": locations,
+      "/api/v1/work-types/": workTypes,
+      "/api/v1/work-areas/": workAreas,
+    });
+    renderWithAuth(<ShiftPatternsPage />);
+    await userEvent.click(await screen.findByRole("button", { name: "保存" }));
+    await userEvent.click(await screen.findByRole("button", { name: "保存中..." }));
+    expect(postCount).toBe(1);
+  });
+
+  it("hides edit controls for supervisors and redirects staff", async () => {
+    mockAuthAndApi(["supervisor"], {
       "/api/v1/shift-patterns/": patterns,
       "/api/v1/locations/": locations,
       "/api/v1/work-types/": workTypes,
       "/api/v1/work-areas/": workAreas,
     });
     renderWithAuth(<ShiftPatternsPage />);
-    await userEvent.click(await screen.findByRole("button", { name: "無効化" }));
-    await waitFor(() => expect(confirmMock).toHaveBeenCalled());
-    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/deactivate/"))).toBe(false);
+    expect(await screen.findByRole("button", { name: "詳細" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "保存" })).not.toBeInTheDocument();
+
+    fetchMock.mockReset();
+    mockAuthAndApi(["staff"], {});
+    renderWithAuth(
+      <Routes>
+        <Route path="/" element={<ShiftPatternsPage />} />
+        <Route path="/403" element={<div>Forbidden</div>} />
+      </Routes>,
+    );
+    expect(await screen.findByText("Forbidden")).toBeInTheDocument();
   });
 
   it("shows only selected location patterns in weekly grid and prevents duplicate staff rows", async () => {
@@ -177,8 +224,7 @@ describe("shift settings pages", () => {
     });
     renderWithAuth(<WeeklyTemplatesPage />);
     await screen.findAllByRole("option", { name: "本館" });
-    const locationSelects = await screen.findAllByLabelText("拠点");
-    await userEvent.selectOptions(locationSelects[1], "l1");
+    await userEvent.selectOptions((await screen.findAllByLabelText("拠点"))[1], "l1");
     await screen.findByRole("option", { name: "スタッフA" });
     await userEvent.selectOptions(await screen.findByLabelText("スタッフ追加"), "staff1");
     expect(screen.getByText("スタッフA")).toBeInTheDocument();

@@ -12,6 +12,8 @@ from .models import ShiftPattern, ShiftPatternSegment, WeeklyShiftTemplate, Week
 
 MANAGE_ROLES = {ROLE_SYSTEM_ADMIN, ROLE_SHIFT_MANAGER}
 VIEW_ROLES = MANAGE_ROLES | {ROLE_SUPERVISOR}
+IMMUTABLE_LOCATION_MESSAGE = "拠点は作成後変更できません。別拠点用に複製してください。"
+DUPLICATE_CHILD_ID_MESSAGE = "同じ子要素IDが複数回指定されています。"
 
 
 def user_has_any_role(user: User, roles: set[str]) -> bool:
@@ -146,9 +148,19 @@ def _segment_from_payload(pattern: ShiftPattern, payload: dict, existing: ShiftP
     return segment
 
 
+def _validate_immutable_location(instance, validated_data: dict):
+    if instance is None or "location" not in validated_data:
+        return
+    incoming = validated_data["location"]
+    incoming_id = getattr(incoming, "id", incoming)
+    if str(incoming_id) != str(instance.location_id):
+        raise DRFValidationError({"location": IMMUTABLE_LOCATION_MESSAGE})
+
+
 def save_shift_pattern(*, instance: ShiftPattern | None, validated_data: dict, segments_data: list[dict] | None):
     try:
         with transaction.atomic():
+            _validate_immutable_location(instance, validated_data)
             pattern = instance or ShiftPattern()
             for field, value in validated_data.items():
                 setattr(pattern, field, value)
@@ -164,6 +176,8 @@ def save_shift_pattern(*, instance: ShiftPattern | None, validated_data: dict, s
                 for payload in segments_data:
                     child_id = str(payload.get("id")) if payload.get("id") else None
                     if child_id:
+                        if child_id in seen_ids:
+                            raise DRFValidationError({"segments": DUPLICATE_CHILD_ID_MESSAGE})
                         if child_id not in existing:
                             raise DRFValidationError({"segments": "Segment ID does not belong to this shift pattern."})
                         segment = _segment_from_payload(pattern, payload, existing[child_id])
@@ -180,13 +194,11 @@ def save_shift_pattern(*, instance: ShiftPattern | None, validated_data: dict, s
                     final_segments.append(segment)
                 _validate_pattern_segments(pattern, final_segments)
                 for segment in final_segments:
-                    segment.full_clean()
+                    if segment.is_active:
+                        segment.full_clean()
                     segment.save()
             else:
-                _validate_pattern_segments(
-                    pattern,
-                    list(pattern.segments.select_related("work_type", "work_area").all()),
-                )
+                _validate_pattern_segments(pattern, list(pattern.segments.select_related("work_type", "work_area")))
     except (DjangoValidationError, IntegrityError) as exc:
         raise _drf_validation(exc) from exc
     return pattern
@@ -268,6 +280,7 @@ def save_weekly_template(
 ):
     try:
         with transaction.atomic():
+            _validate_immutable_location(instance, validated_data)
             template = instance or WeeklyShiftTemplate()
             for field, value in validated_data.items():
                 setattr(template, field, value)
@@ -283,6 +296,8 @@ def save_weekly_template(
                 for payload in entries_data:
                     child_id = str(payload.get("id")) if payload.get("id") else None
                     if child_id:
+                        if child_id in seen_ids:
+                            raise DRFValidationError({"entries": DUPLICATE_CHILD_ID_MESSAGE})
                         if child_id not in existing:
                             raise DRFValidationError({"entries": "Entry ID does not belong to this weekly template."})
                         entry = _entry_from_payload(template, payload, existing[child_id])
@@ -299,7 +314,8 @@ def save_weekly_template(
                     final_entries.append(entry)
                 _validate_weekly_entries(template, final_entries)
                 for entry in final_entries:
-                    entry.full_clean()
+                    if entry.is_active:
+                        entry.full_clean()
                     entry.save()
             else:
                 _validate_weekly_entries(template, list(template.entries.select_related("staff", "shift_pattern")))
@@ -337,24 +353,50 @@ def duplicate_weekly_template(source: WeeklyShiftTemplate, *, code: str, name: s
 
 
 def validate_and_reactivate_pattern(pattern: ShiftPattern):
-    with transaction.atomic():
-        pattern.is_active = True
-        _validate_pattern_segments(pattern, list(pattern.segments.select_related("work_type", "work_area").all()))
-        pattern.full_clean()
-        pattern.save(update_fields=["is_active", "updated_at"])
+    original_is_active = pattern.is_active
+    try:
+        with transaction.atomic():
+            pattern.is_active = True
+            _validate_pattern_segments(pattern, list(pattern.segments.select_related("work_type", "work_area")))
+            pattern.full_clean()
+            pattern.save(update_fields=["is_active", "updated_at"])
+    except (DjangoValidationError, IntegrityError) as exc:
+        pattern.is_active = original_is_active
+        raise _drf_validation(exc) from exc
+    except DRFValidationError:
+        pattern.is_active = original_is_active
+        raise
     return pattern
 
 
 def validate_and_reactivate_template(template: WeeklyShiftTemplate):
-    with transaction.atomic():
-        template.is_active = True
-        _validate_weekly_entries(template, list(template.entries.select_related("staff", "shift_pattern").all()))
-        template.full_clean()
-        template.save(update_fields=["is_active", "updated_at"])
+    original_is_active = template.is_active
+    try:
+        with transaction.atomic():
+            template.is_active = True
+            _validate_weekly_entries(template, list(template.entries.select_related("staff", "shift_pattern")))
+            template.full_clean()
+            template.save(update_fields=["is_active", "updated_at"])
+    except (DjangoValidationError, IntegrityError) as exc:
+        template.is_active = original_is_active
+        raise _drf_validation(exc) from exc
+    except DRFValidationError:
+        template.is_active = original_is_active
+        raise
     return template
 
 
 def deactivate_instance(instance):
+    if isinstance(instance, ShiftPattern):
+        reference_count = WeeklyShiftTemplateEntry.objects.filter(
+            shift_pattern=instance,
+            is_active=True,
+            weekly_shift_template__is_active=True,
+        ).count()
+        if reference_count:
+            raise DRFValidationError(
+                {"shift_pattern": f"有効な週間テンプレートから参照されています（{reference_count}件）。"}
+            )
     instance.is_active = False
     instance.save(update_fields=["is_active", "updated_at"])
 
@@ -366,12 +408,15 @@ def seed_shifts(dev_users: dict[str, User]) -> None:
     gym_work = WorkType.objects.get(code="gym_duty")
     front_work = WorkType.objects.get(code="front_duty")
     break_work = WorkType.objects.get(code="break")
-    WorkTypeAvailability.objects.update_or_create(
+
+    availability, created = WorkTypeAvailability.objects.get_or_create(
         work_type=break_work,
         location=location,
         work_area=None,
-        defaults={"is_active": True},
     )
+    if created:
+        availability.is_active = True
+        availability.save(update_fields=["is_active", "updated_at"])
 
     seeds = [
         (
@@ -408,7 +453,7 @@ def seed_shifts(dev_users: dict[str, User]) -> None:
     ]
     patterns = {}
     for index, (code, name, short_name, segments) in enumerate(seeds, start=1):
-        pattern, _ = ShiftPattern.objects.update_or_create(
+        pattern, created = ShiftPattern.objects.get_or_create(
             location=location,
             code=code,
             defaults={
@@ -419,29 +464,43 @@ def seed_shifts(dev_users: dict[str, User]) -> None:
                 "is_active": True,
             },
         )
+        if not created:
+            pattern.name = name
+            pattern.short_name = short_name
+            pattern.description = "開発用サンプル"
+            pattern.display_order = index * 10
+            pattern.save(update_fields=["name", "short_name", "description", "display_order", "updated_at"])
         patterns[code] = pattern
-        existing = list(pattern.segments.all())
-        for work_type, work_area, start, end, order in segments:
-            ShiftPatternSegment.objects.update_or_create(
-                shift_pattern=pattern,
-                work_type=work_type,
-                work_area=work_area,
-                start_offset_minutes=start,
-                end_offset_minutes=end,
-                defaults={"display_order": order, "notes": "", "is_active": True},
-            )
-        for segment in existing:
-            if not any(
-                segment.work_type_id == work_type.id
-                and segment.work_area_id == (work_area.id if work_area else None)
-                and segment.start_offset_minutes == start
-                and segment.end_offset_minutes == end
-                for work_type, work_area, start, end, _ in segments
-            ):
-                segment.is_active = False
-                segment.save(update_fields=["is_active", "updated_at"])
 
-    template, _ = WeeklyShiftTemplate.objects.update_or_create(
+        for work_type, work_area, start, end, order in segments:
+            segment = (
+                ShiftPatternSegment.objects.filter(
+                    shift_pattern=pattern,
+                    work_type=work_type,
+                    work_area=work_area,
+                    start_offset_minutes=start,
+                    end_offset_minutes=end,
+                )
+                .order_by("-is_active", "created_at")
+                .first()
+            )
+            if segment is None:
+                ShiftPatternSegment.objects.create(
+                    shift_pattern=pattern,
+                    work_type=work_type,
+                    work_area=work_area,
+                    start_offset_minutes=start,
+                    end_offset_minutes=end,
+                    display_order=order,
+                    notes="",
+                    is_active=True,
+                )
+            else:
+                segment.display_order = order
+                segment.notes = ""
+                segment.save(update_fields=["display_order", "notes", "updated_at"])
+
+    template, created = WeeklyShiftTemplate.objects.get_or_create(
         location=location,
         code="standard_week",
         defaults={
@@ -451,6 +510,12 @@ def seed_shifts(dev_users: dict[str, User]) -> None:
             "is_active": True,
         },
     )
+    if not created:
+        template.name = "標準週間テンプレート"
+        template.description = "開発用サンプル"
+        template.display_order = 10
+        template.save(update_fields=["name", "description", "display_order", "updated_at"])
+
     assignment_seed = {
         "system_admin": [
             patterns["gym_early"],
@@ -458,42 +523,36 @@ def seed_shifts(dev_users: dict[str, User]) -> None:
             None,
             patterns["gym_late"],
             patterns["gym_late"],
-            None,
-            None,
         ],
-        "shift_manager": [
-            patterns["gym_late"],
-            None,
-            patterns["front_early"],
-            patterns["front_early"],
-            None,
-            patterns["gym_late"],
-            None,
-        ],
-        "staff": [
-            patterns["front_early"],
-            patterns["gym_early"],
-            patterns["gym_early"],
-            None,
-            patterns["gym_late"],
-            None,
-            None,
-        ],
+        "shift_manager": [patterns["gym_late"], None, patterns["front_early"], patterns["front_early"], None],
+        "staff": [patterns["front_early"], patterns["gym_early"], patterns["gym_early"], None, patterns["gym_late"]],
     }
     for role, weekly_patterns in assignment_seed.items():
         staff = dev_users[role]
         for weekday, pattern in enumerate(weekly_patterns):
             if pattern is None:
+                continue
+            entry = (
                 WeeklyShiftTemplateEntry.objects.filter(
                     weekly_shift_template=template,
                     staff=staff,
                     weekday=weekday,
-                    is_active=True,
-                ).update(is_active=False)
-                continue
-            WeeklyShiftTemplateEntry.objects.update_or_create(
-                weekly_shift_template=template,
-                staff=staff,
-                weekday=weekday,
-                defaults={"shift_pattern": pattern, "notes": "", "display_order": weekday * 10, "is_active": True},
+                )
+                .order_by("-is_active", "created_at")
+                .first()
             )
+            if entry is None:
+                WeeklyShiftTemplateEntry.objects.create(
+                    weekly_shift_template=template,
+                    staff=staff,
+                    weekday=weekday,
+                    shift_pattern=pattern,
+                    notes="",
+                    display_order=weekday * 10,
+                    is_active=True,
+                )
+            else:
+                entry.shift_pattern = pattern
+                entry.notes = ""
+                entry.display_order = weekday * 10
+                entry.save(update_fields=["shift_pattern", "notes", "display_order", "updated_at"])

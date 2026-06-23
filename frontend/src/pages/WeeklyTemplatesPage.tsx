@@ -35,6 +35,7 @@ export function WeeklyTemplatesPage() {
   const [filters, setFilters] = useState({ location: "", is_active: "", search: "" });
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<TemplateForm>(emptyTemplate);
+  const [isDirty, setIsDirty] = useState(false);
   const [staffSearch, setStaffSearch] = useState("");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -60,72 +61,97 @@ export function WeeklyTemplatesPage() {
     queryFn: () => api<Paginated<Location>>("/api/v1/locations/?page_size=100&is_active=true"),
   });
   const patternQuery = useQuery({
-    enabled: canView,
+    enabled: canView && Boolean(form.location),
     queryKey: ["shift-patterns", "weekly-options", form.location],
-    queryFn: () => api<Paginated<ShiftPattern>>(`/api/v1/shift-patterns/?page_size=100&is_active=true${form.location ? `&location=${form.location}` : ""}`),
+    queryFn: () => api<Paginated<ShiftPattern>>(`/api/v1/shift-patterns/?page_size=100&is_active=true&location=${form.location}`),
   });
   const staffLocationQuery = useQuery({
     enabled: canView && Boolean(form.location),
-    queryKey: ["staff-locations", "weekly-options", form.location],
-    queryFn: () => api<Paginated<StaffLocation>>(`/api/v1/staff-locations/?page_size=100&is_active=true&location=${form.location}`),
+    queryKey: ["staff-locations", "weekly-options", form.location, staffSearch],
+    queryFn: () =>
+      api<Paginated<StaffLocation>>(
+        `/api/v1/staff-locations/?page_size=100&is_active=true&location=${form.location}${
+          staffSearch ? `&staff_search=${encodeURIComponent(staffSearch)}` : ""
+        }`,
+      ),
   });
 
-  if (!canView) {
-    return <Navigate to="/403" replace />;
-  }
+  if (!canView) return <Navigate to="/403" replace />;
 
   const staffOptions = Array.from(
     new Map((staffLocationQuery.data?.results ?? []).map((item) => [item.staff, item.staff_display_name ?? item.staff])).entries(),
-  )
-    .map(([id, name]) => ({ id, name }))
-    .filter((staff) => staff.name.toLowerCase().includes(staffSearch.toLowerCase()));
+  ).map(([id, name]) => ({ id, name }));
+
+  const staffName = (staffId: string) =>
+    staffOptions.find((staff) => staff.id === staffId)?.name
+    ?? staffLocationQuery.data?.results.find((item) => item.staff === staffId)?.staff_display_name
+    ?? staffId;
+
+  const markForm = (patch: Partial<TemplateForm>) => {
+    setForm((current) => ({ ...current, ...patch }));
+    setIsDirty(true);
+  };
+
+  const confirmDiscard = () => !isDirty || window.confirm("未保存の変更を破棄しますか？");
 
   const reset = () => {
+    if (!confirmDiscard()) return;
     setEditingId(null);
     setForm(emptyTemplate);
     setStaffSearch("");
-    setError("");
-  };
-
-  const editTemplate = (template: WeeklyShiftTemplate) => {
-    if (editingId && window.confirm("未保存の変更を破棄して別の週間テンプレートを開きますか？") === false) return;
-    const assignments: Record<string, Record<number, string>> = {};
-    const staffIds: string[] = [];
-    for (const entry of template.entries?.filter((item) => item.is_active) ?? []) {
-      if (!staffIds.includes(entry.staff)) staffIds.push(entry.staff);
-      assignments[entry.staff] = { ...(assignments[entry.staff] ?? {}), [entry.weekday]: entry.shift_pattern };
-    }
-    setEditingId(template.id);
-    setForm({
-      location: template.location,
-      code: template.code,
-      name: template.name,
-      description: template.description,
-      display_order: template.display_order,
-      staffIds,
-      assignments,
-    });
+    setIsDirty(false);
     setError("");
     setMessage("");
   };
 
+  const loadTemplate = async (template: WeeklyShiftTemplate) => {
+    if (!confirmDiscard()) return;
+    setError("");
+    setMessage("");
+    try {
+      const detail = await api<WeeklyShiftTemplate>(`/api/v1/weekly-shift-templates/${template.id}/`);
+      const assignments: Record<string, Record<number, string>> = {};
+      const staffIds: string[] = [];
+      for (const entry of detail.entries?.filter((item) => item.is_active) ?? []) {
+        if (!staffIds.includes(entry.staff)) staffIds.push(entry.staff);
+        assignments[entry.staff] = { ...(assignments[entry.staff] ?? {}), [entry.weekday]: entry.shift_pattern };
+      }
+      setEditingId(detail.id);
+      setForm({
+        location: detail.location,
+        code: detail.code,
+        name: detail.name,
+        description: detail.description,
+        display_order: detail.display_order,
+        staffIds,
+        assignments,
+      });
+      setIsDirty(false);
+    } catch (detailError) {
+      setError(detailError instanceof Error ? detailError.message : "詳細の取得に失敗しました。");
+    }
+  };
+
+  const changeLocation = (location: string) => {
+    markForm({ location, staffIds: [], assignments: {} });
+  };
+
   const addStaff = (staffId: string) => {
     if (!staffId || form.staffIds.includes(staffId)) return;
-    setForm((current) => ({ ...current, staffIds: [...current.staffIds, staffId], assignments: { ...current.assignments, [staffId]: {} } }));
+    markForm({ staffIds: [...form.staffIds, staffId], assignments: { ...form.assignments, [staffId]: {} } });
   };
 
   const removeStaff = (staffId: string) => {
-    setForm((current) => ({ ...current, staffIds: current.staffIds.filter((id) => id !== staffId) }));
+    markForm({ staffIds: form.staffIds.filter((id) => id !== staffId) });
   };
 
   const setAssignment = (staffId: string, weekday: number, patternId: string) => {
-    setForm((current) => ({
-      ...current,
+    markForm({
       assignments: {
-        ...current.assignments,
-        [staffId]: { ...(current.assignments[staffId] ?? {}), [weekday]: patternId },
+        ...form.assignments,
+        [staffId]: { ...(form.assignments[staffId] ?? {}), [weekday]: patternId },
       },
-    }));
+    });
   };
 
   const save = async (event: React.FormEvent) => {
@@ -135,8 +161,8 @@ export function WeeklyTemplatesPage() {
     setError("");
     setMessage("");
     try {
-      const existing = templateQuery.data?.results.find((item) => item.id === editingId);
-      const entryIdMap = new Map((existing?.entries ?? []).map((entry) => [`${entry.staff}:${entry.weekday}`, entry.id]));
+      const detail = editingId ? await api<WeeklyShiftTemplate>(`/api/v1/weekly-shift-templates/${editingId}/`) : null;
+      const entryIdMap = new Map((detail?.entries ?? []).map((entry) => [`${entry.staff}:${entry.weekday}`, entry.id]));
       const entries = form.staffIds.flatMap((staffId) =>
         weekdays
           .map((_, weekday) => {
@@ -159,7 +185,9 @@ export function WeeklyTemplatesPage() {
         }),
       });
       setMessage("保存しました。");
-      reset();
+      setEditingId(null);
+      setForm(emptyTemplate);
+      setIsDirty(false);
       await templateQuery.refetch();
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "保存に失敗しました。");
@@ -173,6 +201,7 @@ export function WeeklyTemplatesPage() {
     const label = template.is_active ? "無効化" : "再有効化";
     if (!window.confirm(`${template.name}を${label}しますか？`)) return;
     setActionId(template.id);
+    setError("");
     try {
       await api(`/api/v1/weekly-shift-templates/${template.id}/${action}/`, { method: "POST", body: JSON.stringify({ confirm: true }) });
       setMessage(`${label}しました。`);
@@ -201,8 +230,6 @@ export function WeeklyTemplatesPage() {
     }
   };
 
-  const staffName = (staffId: string) => staffOptions.find((staff) => staff.id === staffId)?.name ?? staffLocationQuery.data?.results.find((item) => item.staff === staffId)?.staff_display_name ?? staffId;
-
   return (
     <section className="card">
       <div className="section-header">
@@ -210,10 +237,11 @@ export function WeeklyTemplatesPage() {
         {canManage ? <button type="button" onClick={reset}>新規作成</button> : null}
       </div>
       <div className="toolbar field-grid">
-        <label>拠点<select value={filters.location} onChange={(event) => setFilters((current) => ({ ...current, location: event.target.value }))}><option value="">すべて</option>{locationQuery.data?.results.map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label>
-        <label>状態<select value={filters.is_active} onChange={(event) => setFilters((current) => ({ ...current, is_active: event.target.value }))}><option value="">すべて</option><option value="true">有効</option><option value="false">無効</option></select></label>
-        <label>検索<input value={filters.search} onChange={(event) => setFilters((current) => ({ ...current, search: event.target.value }))} placeholder="名称・コード" /></label>
+        <label>拠点<select value={filters.location} onChange={(e) => setFilters((c) => ({ ...c, location: e.target.value }))}><option value="">すべて</option>{locationQuery.data?.results.map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label>
+        <label>状態<select value={filters.is_active} onChange={(e) => setFilters((c) => ({ ...c, is_active: e.target.value }))}><option value="">すべて</option><option value="true">有効</option><option value="false">無効</option></select></label>
+        <label>検索<input value={filters.search} onChange={(e) => setFilters((c) => ({ ...c, search: e.target.value }))} placeholder="名称・コード" /></label>
       </div>
+      {templateQuery.isError ? <p className="error">一覧の取得に失敗しました。</p> : null}
       {error ? <p className="error">{error}</p> : null}
       {message ? <p className="success">{message}</p> : null}
       {templateQuery.isLoading ? <p>読み込み中...</p> : null}
@@ -227,21 +255,28 @@ export function WeeklyTemplatesPage() {
               <td>{template.location_name}</td>
               <td>{template.staff_count}名 / {template.entry_count}件</td>
               <td>{template.is_active ? "有効" : "無効"}</td>
-              <td className="actions"><button type="button" onClick={() => editTemplate(template)}>詳細</button>{canManage ? <button type="button" disabled={actionId === template.id} onClick={() => void duplicate(template)}>複製</button> : null}{canManage ? <button type="button" disabled={actionId === template.id} onClick={() => void toggleActive(template)}>{template.is_active ? "無効化" : "再有効化"}</button> : null}</td>
+              <td className="actions">
+                <button type="button" onClick={() => void loadTemplate(template)}>{canManage ? "編集" : "詳細"}</button>
+                {canManage ? <button type="button" disabled={actionId === template.id} onClick={() => void duplicate(template)}>複製</button> : null}
+                {canManage ? <button type="button" disabled={actionId === template.id} onClick={() => void toggleActive(template)}>{template.is_active ? "無効化" : "再有効化"}</button> : null}
+              </td>
             </tr>
           ))}
         </tbody>
       </table>
       <form className="form-grid compact-form" onSubmit={(event) => void save(event)}>
-        <div className="section-header"><h3>{editingId ? "週間テンプレート編集" : "週間テンプレート新規作成"}</h3>{!canManage ? <span className="subtle-text">閲覧のみ</span> : null}</div>
-        <div className="field-grid">
-          <label>拠点<select disabled={!canManage} value={form.location} onChange={(event) => setForm((current) => ({ ...current, location: event.target.value, staffIds: [], assignments: {} }))}><option value="">選択してください</option>{locationQuery.data?.results.map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label>
-          <label>コード<input readOnly={!canManage} value={form.code} onChange={(event) => setForm((current) => ({ ...current, code: event.target.value }))} /></label>
-          <label>名称<input readOnly={!canManage} value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} /></label>
-          <label>表示順<input readOnly={!canManage} type="number" value={form.display_order} onChange={(event) => setForm((current) => ({ ...current, display_order: Number(event.target.value) }))} /></label>
-          <label className="full-width">説明<input readOnly={!canManage} value={form.description} onChange={(event) => setForm((current) => ({ ...current, description: event.target.value }))} /></label>
+        <div className="section-header">
+          <h3>{editingId ? "週間テンプレート編集" : "週間テンプレート新規作成"}</h3>
+          {editingId ? <span className="subtle-text">拠点は作成後変更できません。別拠点用に複製してください。</span> : null}
         </div>
-        {canManage ? <div className="field-grid"><label>スタッフ検索<input value={staffSearch} onChange={(event) => setStaffSearch(event.target.value)} placeholder="スタッフ名で絞り込み" /></label><label>スタッフ追加<select value="" onChange={(event) => addStaff(event.target.value)}><option value="">選択してください</option>{staffOptions.filter((staff) => !form.staffIds.includes(staff.id)).map((staff) => <option key={staff.id} value={staff.id}>{staff.name}</option>)}</select></label></div> : null}
+        <div className="field-grid">
+          <label>拠点<select disabled={!canManage || Boolean(editingId)} value={form.location} onChange={(e) => changeLocation(e.target.value)}><option value="">選択してください</option>{locationQuery.data?.results.map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label>
+          <label>コード<input readOnly={!canManage} value={form.code} onChange={(e) => markForm({ code: e.target.value })} /></label>
+          <label>名称<input readOnly={!canManage} value={form.name} onChange={(e) => markForm({ name: e.target.value })} /></label>
+          <label>表示順<input readOnly={!canManage} type="number" value={form.display_order} onChange={(e) => markForm({ display_order: Number(e.target.value) })} /></label>
+          <label className="full-width">説明<input readOnly={!canManage} value={form.description} onChange={(e) => markForm({ description: e.target.value })} /></label>
+        </div>
+        {canManage ? <div className="field-grid"><label>スタッフ検索<input value={staffSearch} onChange={(e) => setStaffSearch(e.target.value)} placeholder="スタッフ名で検索" /></label><label>スタッフ追加<select value="" onChange={(e) => addStaff(e.target.value)}><option value="">選択してください</option>{staffOptions.filter((staff) => !form.staffIds.includes(staff.id)).map((staff) => <option key={staff.id} value={staff.id}>{staff.name}</option>)}</select></label></div> : null}
         <div className="weekly-grid-wrap">
           <table className="table weekly-grid">
             <thead><tr><th>スタッフ</th>{weekdays.map((day) => <th key={day}>{day}</th>)}{canManage ? <th>操作</th> : null}</tr></thead>
@@ -251,9 +286,11 @@ export function WeeklyTemplatesPage() {
                   <td>{staffName(staffId)}</td>
                   {weekdays.map((day, weekday) => (
                     <td key={`${staffId}-${day}`}>
-                      <select disabled={!canManage} value={form.assignments[staffId]?.[weekday] ?? ""} onChange={(event) => setAssignment(staffId, weekday, event.target.value)}>
+                      <select disabled={!canManage} value={form.assignments[staffId]?.[weekday] ?? ""} onChange={(e) => setAssignment(staffId, weekday, e.target.value)}>
                         <option value="">勤務なし</option>
-                        {patternQuery.data?.results.filter((pattern) => pattern.location === form.location).map((pattern) => <option key={pattern.id} value={pattern.id}>{pattern.short_name}</option>)}
+                        {patternQuery.data?.results
+                          .filter((pattern) => pattern.location === form.location)
+                          .map((pattern) => <option key={pattern.id} value={pattern.id}>{pattern.short_name}</option>)}
                       </select>
                     </td>
                   ))}

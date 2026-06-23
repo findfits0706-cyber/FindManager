@@ -2,10 +2,17 @@
   box-sizing: border-box;
 }
 
+:root {
+  color: #17324d;
+  background: #f5f8fb;
+  font-family: "Yu Gothic UI", "Hiragino Kaku Gothic ProN", sans-serif;
+}
+
 body {
   margin: 0;
-  font-family: "Yu Gothic UI", "Hiragino Kaku Gothic ProN", sans-serif;
-  background: linear-gradient(180deg, #eef4f8 0%, #f7f9fb 100%);
+  background:
+    radial-gradient(circle at top right, rgba(19, 111, 99, 0.14), transparent 30%),
+    linear-gradient(180deg, #eef4f8 0%, #f7f9fb 100%);
   color: #17324d;
 }
 
@@ -15,20 +22,55 @@ select {
   font: inherit;
 }
 
+a {
+  color: inherit;
+}
+
 .layout {
   min-height: 100vh;
   display: grid;
-  grid-template-columns: 240px 1fr;
+  grid-template-columns: 260px 1fr;
 }
 
 .sidebar {
   background: #12314f;
   color: white;
   padding: 24px;
+  display: grid;
+  align-content: start;
+  gap: 24px;
 }
 
-.sidebar a {
+.brand-block h1,
+.section-header h2,
+.auth-card h1 {
+  margin: 0;
+}
+
+.eyebrow {
+  margin: 0 0 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.75rem;
+  color: #7dd3c7;
+}
+
+.side-nav {
+  display: grid;
+  gap: 8px;
+}
+
+.side-nav a {
   color: white;
+  text-decoration: none;
+  padding: 10px 12px;
+  border-radius: 10px;
+  transition: background-color 0.18s ease;
+}
+
+.side-nav a.active,
+.side-nav a:hover {
+  background: rgba(255, 255, 255, 0.12);
 }
 
 .content-area {
@@ -40,9 +82,15 @@ select {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 16px;
   padding: 16px 24px;
-  background: white;
+  background: rgba(255, 255, 255, 0.86);
+  backdrop-filter: blur(12px);
   border-bottom: 1px solid #dbe4ec;
+}
+
+.subtle-text {
+  color: #5f7488;
 }
 
 .main-content,
@@ -57,14 +105,14 @@ select {
 }
 
 .card {
-  background: white;
-  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.92);
+  border-radius: 18px;
   padding: 24px;
-  box-shadow: 0 12px 36px rgba(18, 49, 79, 0.08);
+  box-shadow: 0 16px 40px rgba(18, 49, 79, 0.08);
 }
 
-.auth-page .card {
-  width: min(420px, 100%);
+.auth-card {
+  width: min(440px, 100%);
   display: grid;
   gap: 16px;
 }
@@ -81,6 +129,7 @@ select {
   padding: 10px 12px;
   border: 1px solid #aac0d3;
   border-radius: 10px;
+  background: white;
 }
 
 button {
@@ -115,6 +164,7 @@ button:disabled {
   padding: 12px;
   border-bottom: 1px solid #dde5eb;
   text-align: left;
+  vertical-align: top;
 }
 
 .section-header,
@@ -125,9 +175,30 @@ button:disabled {
   justify-content: space-between;
 }
 
+.toolbar {
+  display: flex;
+  gap: 12px;
+  margin: 16px 0;
+  align-items: end;
+}
+
 .form-grid {
   display: grid;
   gap: 16px;
+}
+
+.compact-form {
+  margin: 20px 0 28px;
+  padding: 18px;
+  border: 1px solid #dbe4ec;
+  border-radius: 14px;
+  background: #f8fbfd;
+}
+
+.field-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
 }
 
 .checkbox {
@@ -136,10 +207,39 @@ button:disabled {
   gap: 8px;
 }
 
+.checkbox input {
+  width: auto;
+}
+
+.checkbox-list {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+}
+
+.full-width {
+  grid-column: 1 / -1;
+}
+
 .centered {
   min-height: 100vh;
   display: grid;
   place-items: center;
+}
+
+.capability-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.capability-card {
+  display: grid;
+  gap: 6px;
+  padding: 18px;
+  border-radius: 14px;
+  background: linear-gradient(180deg, #f9fcff 0%, #eef7f5 100%);
+  border: 1px solid #d7e7e4;
 }
 
 @media (max-width: 768px) {
@@ -149,5 +249,17 @@ button:disabled {
 
   .sidebar {
     padding: 16px;
+  }
+
+  .main-content,
+  .auth-page {
+    padding: 16px;
+  }
+
+  .header,
+  .section-header,
+  .actions {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }

@@ -7,6 +7,7 @@ from django.core.management.base import BaseCommand, CommandError
 from apps.accounts.constants import ROLE_CHOICES
 from apps.accounts.models import User
 from apps.accounts.services import ensure_roles
+from apps.operations.services import seed_operations
 
 DEFAULT_PASSWORD = "DevPassword123!"
 
@@ -16,16 +17,18 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         if not settings.DEBUG:
-            raise CommandError("本番環境では seed_dev を実行できません。")
+            raise CommandError("seed_dev can only be used when DEBUG is enabled.")
 
         seed_password = os.getenv("DEV_SEED_PASSWORD")
         if not seed_password:
             seed_password = DEFAULT_PASSWORD
             self.stdout.write(
-                self.style.WARNING("DEV_SEED_PASSWORD が未設定のため、既定の開発用パスワードを使用します。")
+                self.style.WARNING("DEV_SEED_PASSWORD is not set. The default development password will be used.")
             )
 
         ensure_roles()
+        reset_passwords = os.getenv("DEV_SEED_RESET_PASSWORDS", "0") == "1"
+        seeded_users = {}
         for role in ROLE_CHOICES:
             username = role
             user, created = User.objects.get_or_create(
@@ -45,9 +48,13 @@ class Command(BaseCommand):
             if role == "system_admin":
                 user.is_staff = True
                 user.is_superuser = True
-            user.set_password(seed_password)
+            if created or reset_passwords:
+                user.set_password(seed_password)
             user.save()
             user.groups.set(Group.objects.filter(name=role))
+            seeded_users[role] = user
             label = "created" if created else "updated"
             self.stdout.write(f"{label}: {username}")
-        self.stdout.write(self.style.SUCCESS("開発用ユーザーの投入が完了しました。"))
+
+        seed_operations(seeded_users)
+        self.stdout.write(self.style.SUCCESS("Development seed data has been created."))

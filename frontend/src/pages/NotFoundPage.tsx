@@ -1,3 +1,3 @@
 export function NotFoundPage() {
-  return <div className="card">404 ページが見つかりません。</div>;
+  return <div className="card">404 Not Found</div>;
 }

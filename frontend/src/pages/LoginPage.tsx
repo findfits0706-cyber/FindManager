@@ -24,7 +24,7 @@ export function LoginPage() {
       setUser(response.user);
       navigate(response.user.must_change_password ? "/change-password" : "/staff");
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "ログインに失敗しました。");
+      setError(submitError instanceof Error ? submitError.message : "Login failed.");
     } finally {
       setSubmitting(false);
     }
@@ -32,23 +32,20 @@ export function LoginPage() {
 
   return (
     <div className="auth-page">
-      <form className="card" onSubmit={onSubmit}>
-        <h1>ログイン</h1>
+      <form className="card auth-card" onSubmit={onSubmit}>
+        <p className="eyebrow">Find Sports Club</p>
+        <h1>Sign In</h1>
         <label>
-          ユーザー名
+          Username
           <input value={username} onChange={(event) => setUsername(event.target.value)} />
         </label>
         <label>
-          パスワード
-          <input
-            type="password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-          />
+          Password
+          <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
         </label>
         {error ? <p className="error">{error}</p> : null}
         <button type="submit" disabled={submitting}>
-          {submitting ? "ログイン中..." : "ログイン"}
+          {submitting ? "Signing in..." : "Sign In"}
         </button>
       </form>
     </div>

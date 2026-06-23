@@ -26,33 +26,33 @@ export function ChangePasswordPage() {
         }),
       });
       await refresh();
-      setMessage("変更しました。");
+      setMessage("Password updated.");
       navigate("/staff");
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "変更に失敗しました。");
+      setError(submitError instanceof Error ? submitError.message : "Password update failed.");
     }
   };
 
   return (
     <div className="auth-page">
-      <form className="card" onSubmit={submit}>
-        <h1>初回パスワード変更</h1>
-        <p>8文字以上で、英字と数字を含むパスワードを設定してください。</p>
+      <form className="card auth-card" onSubmit={submit}>
+        <h1>Change Password</h1>
+        <p className="subtle-text">Use a strong password with at least 8 characters.</p>
         <label>
-          現在のパスワード
+          Current password
           <input type="password" value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} />
         </label>
         <label>
-          新しいパスワード
+          New password
           <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} />
         </label>
         <label>
-          新しいパスワード確認
+          Confirm new password
           <input type="password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} />
         </label>
         {message ? <p className="success">{message}</p> : null}
         {error ? <p className="error">{error}</p> : null}
-        <button type="submit">変更する</button>
+        <button type="submit">Save Password</button>
       </form>
     </div>
   );

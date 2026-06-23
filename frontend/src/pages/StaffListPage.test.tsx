@@ -26,6 +26,7 @@ function renderPage() {
 describe("StaffListPage", () => {
   beforeEach(() => {
     fetchMock.mockReset();
+    confirmMock.mockReset();
   });
 
   it("renders staff list", async () => {
@@ -73,7 +74,8 @@ describe("StaffListPage", () => {
     });
 
     renderPage();
-    expect(await screen.findByText("Staff")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Staff" })).toBeInTheDocument();
+    expect(await screen.findByText("EMP-2")).toBeInTheDocument();
   });
 
   it("shows confirm dialog before deactivation", async () => {
@@ -128,7 +130,7 @@ describe("StaffListPage", () => {
     });
 
     renderPage();
-    await userEvent.click(await screen.findByRole("button", { name: "利用停止" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Deactivate" }));
     await waitFor(() => {
       expect(confirmMock).toHaveBeenCalled();
     });

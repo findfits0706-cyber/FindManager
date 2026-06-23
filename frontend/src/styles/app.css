@@ -242,6 +242,53 @@ button:disabled {
   border: 1px solid #d7e7e4;
 }
 
+.segment-row {
+  align-items: end;
+  padding: 12px;
+  border: 1px solid #dbe4ec;
+  border-radius: 8px;
+  background: white;
+}
+
+.timeline-preview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 40px;
+  padding: 12px;
+  border: 1px solid #dbe4ec;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.timeline-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  color: #102a43;
+  background: #e8eef4;
+}
+
+.color-blue { background: #d9e8ff; }
+.color-green { background: #d9f2e5; }
+.color-amber { background: #fff0c2; }
+.color-red { background: #ffd9d7; }
+.color-violet { background: #eadfff; }
+.color-cyan { background: #d5f5fb; }
+.color-pink { background: #ffe0ef; }
+.color-slate { background: #e8eef4; }
+
+.weekly-grid-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.weekly-grid select {
+  min-width: 120px;
+}
+
 @media (max-width: 768px) {
   .layout {
     grid-template-columns: 1fr;

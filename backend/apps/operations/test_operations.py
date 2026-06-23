@@ -284,6 +284,47 @@ class TestOperationApi(OperationsBaseTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertGreaterEqual(response.data["count"], 1)
 
+    def test_work_type_location_filter_uses_only_active_availability(self):
+        client = self.force_client(self.system_admin)
+        category = WorkCategory.objects.get(code="general")
+        main = Location.objects.get(code="main")
+        other = Location.objects.get(code="findfits")
+        active_work = WorkType.objects.create(
+            category=category,
+            code="location_active",
+            name="Location Active",
+            short_name="Active",
+        )
+        inactive_availability_work = WorkType.objects.create(
+            category=category,
+            code="location_inactive_availability",
+            name="Location Inactive Availability",
+            short_name="Inactive",
+        )
+        other_location_work = WorkType.objects.create(
+            category=category,
+            code="location_other_only",
+            name="Location Other Only",
+            short_name="Other",
+        )
+        WorkTypeAvailability.objects.create(work_type=active_work, location=main, work_area=None, is_active=True)
+        WorkTypeAvailability.objects.create(
+            work_type=inactive_availability_work,
+            location=main,
+            work_area=None,
+            is_active=False,
+        )
+        WorkTypeAvailability.objects.create(
+            work_type=other_location_work, location=other, work_area=None, is_active=True
+        )
+
+        response = client.get(f"/api/v1/work-types/?location={main.id}")
+        self.assertEqual(response.status_code, 200)
+        ids = {item["id"] for item in response.data["results"]}
+        self.assertIn(str(active_work.id), ids)
+        self.assertNotIn(str(inactive_availability_work.id), ids)
+        self.assertNotIn(str(other_location_work.id), ids)
+
     def test_staff_capability_reference_date_filter(self):
         client = self.force_client(self.system_admin)
         response = client.get(f"/api/v1/staff-capabilities/?reference_date={timezone.localdate()}")

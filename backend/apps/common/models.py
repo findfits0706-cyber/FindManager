@@ -44,6 +44,16 @@ class AuditEvent(models.Model):
         STAFF_CAPABILITY_UPDATED = "staff_capability_updated", "Staff capability updated"
         STAFF_CAPABILITY_DEACTIVATED = "staff_capability_deactivated", "Staff capability deactivated"
         STAFF_CAPABILITY_REACTIVATED = "staff_capability_reactivated", "Staff capability reactivated"
+        SHIFT_PATTERN_CREATED = "shift_pattern_created", "Shift pattern created"
+        SHIFT_PATTERN_UPDATED = "shift_pattern_updated", "Shift pattern updated"
+        SHIFT_PATTERN_DEACTIVATED = "shift_pattern_deactivated", "Shift pattern deactivated"
+        SHIFT_PATTERN_REACTIVATED = "shift_pattern_reactivated", "Shift pattern reactivated"
+        SHIFT_PATTERN_DUPLICATED = "shift_pattern_duplicated", "Shift pattern duplicated"
+        WEEKLY_SHIFT_TEMPLATE_CREATED = "weekly_shift_template_created", "Weekly shift template created"
+        WEEKLY_SHIFT_TEMPLATE_UPDATED = "weekly_shift_template_updated", "Weekly shift template updated"
+        WEEKLY_SHIFT_TEMPLATE_DEACTIVATED = "weekly_shift_template_deactivated", "Weekly shift template deactivated"
+        WEEKLY_SHIFT_TEMPLATE_REACTIVATED = "weekly_shift_template_reactivated", "Weekly shift template reactivated"
+        WEEKLY_SHIFT_TEMPLATE_DUPLICATED = "weekly_shift_template_duplicated", "Weekly shift template duplicated"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     event_type = models.CharField(max_length=64, choices=EventType.choices)

@@ -8,6 +8,7 @@ from apps.accounts.constants import ROLE_CHOICES
 from apps.accounts.models import User
 from apps.accounts.services import ensure_roles
 from apps.operations.services import seed_operations
+from apps.shifts.services import seed_shifts
 
 DEFAULT_PASSWORD = "DevPassword123!"
 
@@ -57,4 +58,5 @@ class Command(BaseCommand):
             self.stdout.write(f"{label}: {username}")
 
         seed_operations(seeded_users)
+        seed_shifts(seeded_users)
         self.stdout.write(self.style.SUCCESS("Development seed data has been created."))

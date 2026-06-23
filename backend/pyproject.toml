@@ -23,7 +23,7 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["config", "apps", "apps.accounts", "apps.common", "apps.operations"]
+packages = ["config", "apps", "apps.accounts", "apps.common", "apps.operations", "apps.shifts"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "config.settings"

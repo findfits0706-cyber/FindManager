@@ -73,6 +73,60 @@ export type WorkTypeAvailability = BaseEntity & {
   work_area: string | null;
 };
 
+export type ShiftPatternSegment = BaseEntity & {
+  work_type: string;
+  work_type_name?: string;
+  work_type_color_key?: string;
+  work_area: string | null;
+  work_area_name?: string;
+  start_offset_minutes: number;
+  end_offset_minutes: number;
+  duration_minutes?: number;
+  display_order: number;
+  notes: string;
+};
+
+export type ShiftPattern = BaseEntity & {
+  location: string;
+  location_name?: string;
+  code: string;
+  name: string;
+  short_name: string;
+  description: string;
+  display_order: number;
+  start_offset_minutes: number | null;
+  end_offset_minutes: number | null;
+  total_minutes: number | null;
+  work_minutes: number;
+  break_minutes: number;
+  segment_count: number;
+  segments?: ShiftPatternSegment[];
+};
+
+export type WeeklyShiftTemplateEntry = BaseEntity & {
+  weekday: number;
+  weekday_label?: string;
+  staff: string;
+  staff_display_name?: string;
+  shift_pattern: string;
+  shift_pattern_name?: string;
+  shift_pattern_short_name?: string;
+  notes: string;
+  display_order: number;
+};
+
+export type WeeklyShiftTemplate = BaseEntity & {
+  location: string;
+  location_name?: string;
+  code: string;
+  name: string;
+  description: string;
+  display_order: number;
+  staff_count: number;
+  entry_count: number;
+  entries?: WeeklyShiftTemplateEntry[];
+};
+
 export type StaffLocation = BaseEntity & {
   staff: string;
   staff_display_name?: string;

@@ -189,7 +189,12 @@ class WorkTypeViewSet(MasterViewSet):
         if params.get("category"):
             queryset = queryset.filter(category_id=params["category"])
         if params.get("location"):
-            queryset = queryset.filter(availabilities__location_id=params["location"])
+            queryset = queryset.filter(
+                availabilities__location_id=params["location"],
+                availabilities__is_active=True,
+                availabilities__location__is_active=True,
+                availabilities__work_type__is_active=True,
+            )
         if params.get("work_area"):
             queryset = queryset.filter(availabilities__work_area_id=params["work_area"])
         for field in ["is_bookable", "requires_capability", "is_break", "is_active"]:
@@ -313,6 +318,12 @@ class StaffLocationViewSet(OperationsBaseViewSet):
         params = self.request.query_params
         if params.get("staff"):
             queryset = queryset.filter(staff_id=params["staff"])
+        if params.get("staff_search"):
+            queryset = queryset.filter(
+                Q(staff__display_name__icontains=params["staff_search"])
+                | Q(staff__username__icontains=params["staff_search"])
+                | Q(staff__employee_code__icontains=params["staff_search"])
+            )
         if params.get("location"):
             queryset = queryset.filter(location_id=params["location"])
         if params.get("is_primary") in {"true", "false"}:

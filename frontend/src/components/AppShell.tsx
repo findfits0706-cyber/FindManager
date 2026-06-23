@@ -21,6 +21,7 @@ export function AppShell() {
   const canViewStaff = isSystemAdmin || isShiftManager || isSupervisor;
   const canViewOperations = isSystemAdmin || isShiftManager || isSupervisor;
   const canViewAssignments = isSystemAdmin || isShiftManager || isSupervisor;
+  const canViewShiftSettings = isSystemAdmin || isShiftManager || isSupervisor;
   const canViewSelfPages = canViewOperations || isStaff || isViewer;
 
   const navItems: NavItem[] = [
@@ -38,6 +39,12 @@ export function AppShell() {
       ? [
           { to: "/operations/staff-locations", label: "スタッフ所属" },
           { to: "/operations/staff-capabilities", label: "スタッフ対応可能業務" },
+        ]
+      : []),
+    ...(canViewShiftSettings
+      ? [
+          { to: "/shifts/patterns", label: "勤務パターン" },
+          { to: "/shifts/templates", label: "週間テンプレート" },
         ]
       : []),
     ...(canViewSelfPages

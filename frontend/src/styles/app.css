@@ -289,6 +289,94 @@ button:disabled {
   min-width: 120px;
 }
 
+.monthly-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 380px);
+  gap: 16px;
+  align-items: start;
+}
+
+.monthly-grid-wrap {
+  max-height: 68vh;
+  overflow: auto;
+  border: 1px solid #dbe4ec;
+  border-radius: 8px;
+}
+
+.monthly-grid {
+  min-width: 980px;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.monthly-grid th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #f8fbfd;
+}
+
+.monthly-grid .sticky-col {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  min-width: 160px;
+  background: #f8fbfd;
+}
+
+.monthly-grid td {
+  min-width: 84px;
+  height: 68px;
+  padding: 4px;
+}
+
+.monthly-grid .saturday {
+  background: #eef6ff;
+}
+
+.monthly-grid .sunday {
+  background: #fff1f2;
+}
+
+.shift-cell {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  min-height: 54px;
+  padding: 6px;
+  border: 1px solid #dbe4ec;
+  border-radius: 6px;
+  background: #ffffff;
+  color: inherit;
+  text-align: left;
+}
+
+.shift-cell em {
+  font-size: 12px;
+  font-style: normal;
+  color: #0f766e;
+}
+
+.edit-panel,
+.preview-panel {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid #dbe4ec;
+  border-radius: 8px;
+  background: #f8fbfd;
+}
+
+.segment-editor {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid #dbe4ec;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
 @media (max-width: 768px) {
   .layout {
     grid-template-columns: 1fr;
@@ -308,5 +396,9 @@ button:disabled {
   .actions {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .monthly-layout {
+    grid-template-columns: 1fr;
   }
 }

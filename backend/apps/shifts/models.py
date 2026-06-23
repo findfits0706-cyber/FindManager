@@ -209,3 +209,239 @@ class WeeklyShiftTemplateEntry(models.Model):
         # Phase 4 will validate dated StaffLocation and StaffCapability records when expanding monthly shifts.
         if errors:
             raise ValidationError(errors)
+
+
+class MonthlyShiftPlan(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="monthly_shift_plans")
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField()
+    name = models.CharField(max_length=150)
+    notes = models.TextField(blank=True)
+    source_weekly_template = models.ForeignKey(
+        WeeklyShiftTemplate,
+        on_delete=models.PROTECT,
+        related_name="generated_monthly_shift_plans",
+        null=True,
+        blank=True,
+    )
+    last_generated_at = models.DateTimeField(null=True, blank=True)
+    last_generated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="monthly_shift_plans_generated",
+        null=True,
+        blank=True,
+    )
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="monthly_shift_plans_created",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="monthly_shift_plans_updated",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-year", "-month", "location__display_order", "created_at"]
+        constraints = [
+            models.CheckConstraint(condition=Q(year__gte=2000) & Q(year__lte=2100), name="monthly_plan_year_range"),
+            models.CheckConstraint(condition=Q(month__gte=1) & Q(month__lte=12), name="monthly_plan_month_range"),
+            models.UniqueConstraint(
+                fields=["location", "year", "month"],
+                condition=Q(is_active=True),
+                name="unique_active_monthly_plan_location_month",
+            ),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.location_id and not self.location.is_active:
+            errors["location"] = "Inactive locations cannot be assigned."
+        if self.year < 2000 or self.year > 2100:
+            errors["year"] = "year must be between 2000 and 2100."
+        if self.month < 1 or self.month > 12:
+            errors["month"] = "month must be between 1 and 12."
+        if self.source_weekly_template_id and self.source_weekly_template.location_id != self.location_id:
+            errors["source_weekly_template"] = "Template location must match plan location."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.location.short_name} / {self.year}-{self.month:02d}"
+
+
+class MonthlyShiftAssignment(models.Model):
+    class SourceType(models.TextChoices):
+        TEMPLATE = "template", "template"
+        MANUAL = "manual", "manual"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    monthly_shift_plan = models.ForeignKey(MonthlyShiftPlan, on_delete=models.PROTECT, related_name="assignments")
+    work_date = models.DateField()
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="monthly_shift_assignments"
+    )
+    source_type = models.CharField(max_length=20, choices=SourceType.choices, default=SourceType.MANUAL)
+    source_weekly_template_entry = models.ForeignKey(
+        WeeklyShiftTemplateEntry,
+        on_delete=models.PROTECT,
+        related_name="monthly_shift_assignments",
+        null=True,
+        blank=True,
+    )
+    source_shift_pattern = models.ForeignKey(
+        ShiftPattern,
+        on_delete=models.PROTECT,
+        related_name="monthly_shift_assignments",
+        null=True,
+        blank=True,
+    )
+    pattern_code_snapshot = models.CharField(max_length=50, blank=True)
+    pattern_name_snapshot = models.CharField(max_length=150, blank=True)
+    pattern_short_name_snapshot = models.CharField(max_length=100, blank=True)
+    notes = models.TextField(blank=True)
+    is_customized = models.BooleanField(default=False)
+    display_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="monthly_shift_assignments_created",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="monthly_shift_assignments_updated",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["work_date", "display_order", "staff__display_name", "created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["monthly_shift_plan", "work_date", "staff"],
+                condition=Q(is_active=True),
+                name="unique_active_monthly_assignment_cell",
+            ),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.monthly_shift_plan_id and self.work_date:
+            if (
+                self.work_date.year != self.monthly_shift_plan.year
+                or self.work_date.month != self.monthly_shift_plan.month
+            ):
+                errors["work_date"] = "work_date must be within the monthly shift plan."
+        if self.staff_id and not self.staff.is_login_allowed():
+            errors["staff"] = "Inactive staff cannot be assigned."
+        if (
+            self.monthly_shift_plan_id
+            and self.source_shift_pattern_id
+            and self.source_shift_pattern.location_id != self.monthly_shift_plan.location_id
+        ):
+            errors["source_shift_pattern"] = "Shift pattern location must match plan location."
+        if self.is_active and self.monthly_shift_plan_id and self.work_date and self.staff_id:
+            duplicate = MonthlyShiftAssignment.objects.filter(
+                monthly_shift_plan_id=self.monthly_shift_plan_id,
+                work_date=self.work_date,
+                staff_id=self.staff_id,
+                is_active=True,
+            )
+            if self.pk:
+                duplicate = duplicate.exclude(pk=self.pk)
+            if duplicate.exists():
+                errors["non_field_errors"] = "This staff already has an active assignment on this date."
+        if errors:
+            raise ValidationError(errors)
+
+
+class MonthlyShiftSegment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    monthly_shift_assignment = models.ForeignKey(
+        MonthlyShiftAssignment,
+        on_delete=models.PROTECT,
+        related_name="segments",
+    )
+    source_pattern_segment = models.ForeignKey(
+        ShiftPatternSegment,
+        on_delete=models.PROTECT,
+        related_name="monthly_shift_segments",
+        null=True,
+        blank=True,
+    )
+    work_type = models.ForeignKey(WorkType, on_delete=models.PROTECT, related_name="monthly_shift_segments")
+    work_area = models.ForeignKey(
+        WorkArea,
+        on_delete=models.PROTECT,
+        related_name="monthly_shift_segments",
+        null=True,
+        blank=True,
+    )
+    work_type_name_snapshot = models.CharField(max_length=150)
+    work_type_short_name_snapshot = models.CharField(max_length=100)
+    work_type_color_key_snapshot = models.CharField(max_length=20)
+    work_type_is_break_snapshot = models.BooleanField(default=False)
+    work_area_name_snapshot = models.CharField(max_length=150, blank=True)
+    start_offset_minutes = models.IntegerField()
+    end_offset_minutes = models.IntegerField()
+    display_order = models.PositiveIntegerField(default=0)
+    notes = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["start_offset_minutes", "display_order", "created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(start_offset_minutes__gte=0) & Q(start_offset_minutes__lt=2880),
+                name="monthly_segment_start_offset_range",
+            ),
+            models.CheckConstraint(
+                condition=Q(end_offset_minutes__gt=0) & Q(end_offset_minutes__lte=2880),
+                name="monthly_segment_end_offset_range",
+            ),
+            models.CheckConstraint(
+                condition=Q(end_offset_minutes__gt=models.F("start_offset_minutes")),
+                name="monthly_segment_end_after_start",
+            ),
+        ]
+
+    @property
+    def duration_minutes(self):
+        return self.end_offset_minutes - self.start_offset_minutes
+
+    def clean(self):
+        errors = {}
+        if self.work_type_id and not self.work_type.is_active:
+            errors["work_type"] = "Inactive work types cannot be assigned."
+        if self.work_area_id:
+            if not self.work_area.is_active:
+                errors["work_area"] = "Inactive work areas cannot be assigned."
+            elif (
+                self.monthly_shift_assignment_id
+                and self.work_area.location_id != self.monthly_shift_assignment.monthly_shift_plan.location_id
+            ):
+                errors["work_area"] = "work_area must belong to the monthly shift plan location."
+        if self.start_offset_minutes < 0 or self.start_offset_minutes >= 2880:
+            errors["start_offset_minutes"] = "start_offset_minutes must be between 0 and 2879."
+        if self.end_offset_minutes <= 0 or self.end_offset_minutes > 2880:
+            errors["end_offset_minutes"] = "end_offset_minutes must be between 1 and 2880."
+        if self.end_offset_minutes <= self.start_offset_minutes:
+            errors["end_offset_minutes"] = "end_offset_minutes must be after start_offset_minutes."
+        if self.start_offset_minutes % 15 != 0:
+            errors["start_offset_minutes"] = "start_offset_minutes must be in 15-minute increments."
+        if self.end_offset_minutes % 15 != 0:
+            errors["end_offset_minutes"] = "end_offset_minutes must be in 15-minute increments."
+        if self.end_offset_minutes - self.start_offset_minutes > 1440:
+            errors["end_offset_minutes"] = "A segment cannot exceed 24 hours."
+        if errors:
+            raise ValidationError(errors)

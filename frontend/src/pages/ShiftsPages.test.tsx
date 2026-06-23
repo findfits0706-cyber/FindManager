@@ -8,6 +8,7 @@ import { vi } from "vitest";
 import { AppShell } from "../components/AppShell";
 import { AuthProvider } from "../features/auth/AuthContext";
 import { labelToOffset, offsetToLabel } from "../lib/timeOffsets";
+import { MonthlyShiftsPage } from "./MonthlyShiftsPage";
 import { ShiftPatternsPage } from "./ShiftPatternsPage";
 import { WeeklyTemplatesPage } from "./WeeklyTemplatesPage";
 
@@ -64,6 +65,52 @@ const workTypes = {
   results: [{ id: "w1", name: "ジム業務", short_name: "ジム", color_key: "blue", is_active: true }],
 };
 const workAreas = { count: 1, next: null, previous: null, results: [{ id: "a1", location: "l1", name: "ジム", is_active: true }] };
+const monthlyPlan = {
+  id: "m1",
+  location: "l1",
+  location_name: "本館",
+  year: 2028,
+  month: 2,
+  name: "2028年2月 本館シフト",
+  assignment_count: 1,
+  staff_count: 1,
+  source_weekly_template: null,
+  last_generated_at: null,
+  is_active: true,
+};
+const monthlyMatrix = {
+  plan: { id: "m1", location: "l1", location_name: "本館", year: 2028, month: 2, name: "2028年2月 本館シフト" },
+  dates: Array.from({ length: 29 }, (_, index) => {
+    const date = new Date(2028, 1, index + 1);
+    const weekday = (date.getDay() + 6) % 7;
+    return {
+      date: `2028-02-${String(index + 1).padStart(2, "0")}`,
+      day: index + 1,
+      weekday,
+      weekday_label: ["月", "火", "水", "木", "金", "土", "日"][weekday],
+      is_saturday: weekday === 5,
+      is_sunday: weekday === 6,
+    };
+  }),
+  rows: [
+    {
+      staff: "staff1",
+      staff_display_name: "スタッフA",
+      employee_code: "EMP-A",
+      assignments: {
+        "2028-02-01": {
+          id: "ma1",
+          pattern_short_name: "早",
+          start_offset_minutes: 510,
+          end_offset_minutes: 1020,
+          source_type: "template",
+          is_customized: false,
+          warning_count: 0,
+        },
+      },
+    },
+  ],
+};
 const patterns = {
   count: 1,
   next: null,
@@ -119,6 +166,7 @@ describe("shift settings pages", () => {
       </Routes>,
     );
     expect(await screen.findByRole("link", { name: "勤務パターン" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "月間シフト" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "週間テンプレート" })).toBeInTheDocument();
   });
 
@@ -292,5 +340,92 @@ describe("shift settings pages", () => {
     expect(await screen.findByText("既存スタッフ")).toBeInTheDocument();
     await userEvent.type(screen.getByLabelText("スタッフ検索"), "別");
     expect(screen.getByText("既存スタッフ")).toBeInTheDocument();
+  });
+
+  it("shows monthly matrix, opens cells, and blocks strict preview errors", async () => {
+    mockAuthAndApi(["system_admin"], {
+      "/api/v1/monthly-shift-plans/m1/matrix/": monthlyMatrix,
+      "/api/v1/monthly-shift-plans/m1/preview-template-generation/": {
+        summary: {
+          candidate_count: 1,
+          create_count: 1,
+          replace_count: 0,
+          skip_existing_count: 0,
+          skip_manual_count: 0,
+          error_count: 1,
+          warning_count: 0,
+        },
+        items: [
+          {
+            work_date: "2028-02-01",
+            staff: "staff1",
+            staff_display_name: "スタッフA",
+            shift_pattern: "p1",
+            shift_pattern_short_name: "早",
+            action: "create",
+            issues: [{ severity: "error", code: "missing_capability", message: "能力がありません。" }],
+          },
+        ],
+      },
+      "/api/v1/monthly-shift-assignments/ma1/": {
+        id: "ma1",
+        monthly_shift_plan: "m1",
+        work_date: "2028-02-01",
+        staff: "staff1",
+        staff_display_name: "スタッフA",
+        source_type: "template",
+        source_shift_pattern: "p1",
+        pattern_name_snapshot: "早番",
+        pattern_short_name_snapshot: "早",
+        notes: "",
+        is_customized: false,
+        is_active: true,
+        start_offset_minutes: 510,
+        end_offset_minutes: 1020,
+        work_minutes: 450,
+        break_minutes: 60,
+        segment_count: 1,
+        warnings: [],
+        segments: [],
+      },
+      "/api/v1/monthly-shift-plans/": { count: 1, next: null, previous: null, results: [monthlyPlan] },
+      "/api/v1/locations/": locations,
+      "/api/v1/shift-patterns/": patterns,
+      "/api/v1/weekly-shift-templates/": {
+        count: 1,
+        next: null,
+        previous: null,
+        results: [{ id: "t1", location: "l1", name: "標準週", is_active: true }],
+      },
+      "/api/v1/work-types/": workTypes,
+      "/api/v1/work-areas/": workAreas,
+    });
+    renderWithAuth(<MonthlyShiftsPage />);
+    await screen.findByRole("option", { name: "本館" });
+    await userEvent.selectOptions(await screen.findByLabelText("拠点"), "l1");
+    await userEvent.clear(screen.getByLabelText("年"));
+    await userEvent.type(screen.getByLabelText("年"), "2028");
+    await userEvent.clear(screen.getByLabelText("月"));
+    await userEvent.type(screen.getByLabelText("月"), "2");
+    await userEvent.click(await screen.findByRole("button", { name: "月間表を開く" }));
+    expect(await screen.findByText("スタッフA")).toBeInTheDocument();
+    expect(document.body.textContent).toContain("29");
+    await userEvent.click(screen.getByText("早"));
+    expect(await screen.findByText("2028-02-01")).toBeInTheDocument();
+    await userEvent.selectOptions(screen.getByLabelText("週間テンプレート"), "t1");
+    await userEvent.click(screen.getByRole("button", { name: "生成プレビュー" }));
+    expect(await screen.findByText(/エラー 1/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "テンプレート適用" })).toBeDisabled();
+  });
+
+  it("redirects staff away from monthly shifts", async () => {
+    mockAuthAndApi(["staff"], {});
+    renderWithAuth(
+      <Routes>
+        <Route path="/" element={<MonthlyShiftsPage />} />
+        <Route path="/403" element={<div>Forbidden</div>} />
+      </Routes>,
+    );
+    expect(await screen.findByText("Forbidden")).toBeInTheDocument();
   });
 });

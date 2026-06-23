@@ -127,6 +127,108 @@ export type WeeklyShiftTemplate = BaseEntity & {
   entries?: WeeklyShiftTemplateEntry[];
 };
 
+export type MonthlyShiftSegment = BaseEntity & {
+  source_pattern_segment?: string | null;
+  work_type: string;
+  work_area: string | null;
+  work_type_name_snapshot: string;
+  work_type_short_name_snapshot: string;
+  work_type_color_key_snapshot: string;
+  work_type_is_break_snapshot: boolean;
+  work_area_name_snapshot: string;
+  start_offset_minutes: number;
+  end_offset_minutes: number;
+  duration_minutes?: number;
+  display_order: number;
+  notes: string;
+};
+
+export type MonthlyShiftAssignment = BaseEntity & {
+  monthly_shift_plan: string;
+  work_date: string;
+  staff: string;
+  staff_display_name?: string;
+  source_type: "template" | "manual";
+  source_shift_pattern: string | null;
+  pattern_name_snapshot: string;
+  pattern_short_name_snapshot: string;
+  notes: string;
+  is_customized: boolean;
+  start_offset_minutes: number | null;
+  end_offset_minutes: number | null;
+  work_minutes: number;
+  break_minutes: number;
+  segment_count: number;
+  warnings?: Array<{ severity: string; code: string; message: string }>;
+  segments?: MonthlyShiftSegment[];
+};
+
+export type MonthlyShiftPlan = BaseEntity & {
+  location: string;
+  location_name?: string;
+  year: number;
+  month: number;
+  name: string;
+  notes?: string;
+  assignment_count: number;
+  staff_count: number;
+  source_weekly_template: string | null;
+  source_weekly_template_name?: string;
+  last_generated_at: string | null;
+};
+
+export type MonthlyMatrixAssignment = {
+  id: string;
+  pattern_short_name: string;
+  start_offset_minutes: number | null;
+  end_offset_minutes: number | null;
+  source_type: "template" | "manual";
+  is_customized: boolean;
+  warning_count: number;
+};
+
+export type MonthlyShiftMatrix = {
+  plan: Pick<MonthlyShiftPlan, "id" | "location" | "year" | "month" | "name"> & { location_name: string };
+  dates: Array<{
+    date: string;
+    day: number;
+    weekday: number;
+    weekday_label: string;
+    is_saturday: boolean;
+    is_sunday: boolean;
+  }>;
+  rows: Array<{
+    staff: string;
+    staff_display_name: string;
+    employee_code: string;
+    assignments: Record<string, MonthlyMatrixAssignment>;
+  }>;
+};
+
+export type TemplateGenerationResult = {
+  summary: {
+    candidate_count: number;
+    create_count: number;
+    replace_count: number;
+    skip_existing_count: number;
+    skip_manual_count: number;
+    error_count: number;
+    warning_count: number;
+    created_count?: number;
+    replaced_count?: number;
+    skipped_count?: number;
+  };
+  items: Array<{
+    work_date: string;
+    staff: string;
+    staff_display_name: string;
+    shift_pattern: string;
+    shift_pattern_short_name: string;
+    action: string;
+    issues: Array<{ severity: "error" | "warning"; code: string; message: string }>;
+  }>;
+};
+
 export type StaffLocation = BaseEntity & {
   staff: string;
   staff_display_name?: string;

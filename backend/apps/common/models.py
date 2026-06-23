@@ -54,6 +54,21 @@ class AuditEvent(models.Model):
         WEEKLY_SHIFT_TEMPLATE_DEACTIVATED = "weekly_shift_template_deactivated", "Weekly shift template deactivated"
         WEEKLY_SHIFT_TEMPLATE_REACTIVATED = "weekly_shift_template_reactivated", "Weekly shift template reactivated"
         WEEKLY_SHIFT_TEMPLATE_DUPLICATED = "weekly_shift_template_duplicated", "Weekly shift template duplicated"
+        MONTHLY_SHIFT_PLAN_CREATED = "monthly_shift_plan_created", "Monthly shift plan created"
+        MONTHLY_SHIFT_PLAN_UPDATED = "monthly_shift_plan_updated", "Monthly shift plan updated"
+        MONTHLY_SHIFT_PLAN_DEACTIVATED = "monthly_shift_plan_deactivated", "Monthly shift plan deactivated"
+        MONTHLY_SHIFT_PLAN_REACTIVATED = "monthly_shift_plan_reactivated", "Monthly shift plan reactivated"
+        MONTHLY_SHIFT_ASSIGNMENT_CREATED = "monthly_shift_assignment_created", "Monthly shift assignment created"
+        MONTHLY_SHIFT_ASSIGNMENT_UPDATED = "monthly_shift_assignment_updated", "Monthly shift assignment updated"
+        MONTHLY_SHIFT_ASSIGNMENT_DEACTIVATED = (
+            "monthly_shift_assignment_deactivated",
+            "Monthly shift assignment deactivated",
+        )
+        MONTHLY_SHIFT_ASSIGNMENT_REACTIVATED = (
+            "monthly_shift_assignment_reactivated",
+            "Monthly shift assignment reactivated",
+        )
+        MONTHLY_SHIFT_TEMPLATE_APPLIED = "monthly_shift_template_applied", "Monthly shift template applied"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     event_type = models.CharField(max_length=64, choices=EventType.choices)

@@ -172,7 +172,8 @@ def save_shift_pattern(*, instance: ShiftPattern | None, validated_data: dict, s
             if segments_data is not None:
                 existing = {str(item.id): item for item in pattern.segments.select_related("work_type", "work_area")}
                 seen_ids = set()
-                final_segments = []
+                validation_segments = []
+                save_segments = []
                 for payload in segments_data:
                     child_id = str(payload.get("id")) if payload.get("id") else None
                     if child_id:
@@ -185,15 +186,17 @@ def save_shift_pattern(*, instance: ShiftPattern | None, validated_data: dict, s
                     else:
                         segment = _segment_from_payload(pattern, payload)
                     segment.is_active = True
-                    final_segments.append(segment)
+                    validation_segments.append(segment)
+                    save_segments.append(segment)
                 for child_id, segment in existing.items():
                     if child_id in seen_ids:
                         continue
                     if segment.is_active:
                         segment.is_active = False
-                    final_segments.append(segment)
-                _validate_pattern_segments(pattern, final_segments)
-                for segment in final_segments:
+                        validation_segments.append(segment)
+                        save_segments.append(segment)
+                _validate_pattern_segments(pattern, validation_segments)
+                for segment in save_segments:
                     if segment.is_active:
                         segment.full_clean()
                     segment.save()
@@ -292,7 +295,8 @@ def save_weekly_template(
             if entries_data is not None:
                 existing = {str(item.id): item for item in template.entries.select_related("staff", "shift_pattern")}
                 seen_ids = set()
-                final_entries = []
+                validation_entries = []
+                save_entries = []
                 for payload in entries_data:
                     child_id = str(payload.get("id")) if payload.get("id") else None
                     if child_id:
@@ -305,15 +309,17 @@ def save_weekly_template(
                     else:
                         entry = _entry_from_payload(template, payload)
                     entry.is_active = True
-                    final_entries.append(entry)
+                    validation_entries.append(entry)
+                    save_entries.append(entry)
                 for child_id, entry in existing.items():
                     if child_id in seen_ids:
                         continue
                     if entry.is_active:
                         entry.is_active = False
-                    final_entries.append(entry)
-                _validate_weekly_entries(template, final_entries)
-                for entry in final_entries:
+                        validation_entries.append(entry)
+                        save_entries.append(entry)
+                _validate_weekly_entries(template, validation_entries)
+                for entry in save_entries:
                     if entry.is_active:
                         entry.full_clean()
                     entry.save()

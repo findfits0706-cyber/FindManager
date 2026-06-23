@@ -247,6 +247,37 @@ class TestShiftPatternApi(ShiftsBaseTestCase):
         response = client.patch(f"/api/v1/shift-patterns/{pattern.id}/", payload, format="json")
         self.assertEqual(response.status_code, 400)
 
+    def test_omitted_inactive_segment_history_is_not_resaved(self):
+        client = self.force_client(self.system_admin)
+        pattern = ShiftPattern.objects.get(code="gym_early")
+        stale = ShiftPatternSegment.objects.create(
+            shift_pattern=pattern,
+            work_type=self.gym_work,
+            work_area=self.gym_area,
+            start_offset_minutes=1200,
+            end_offset_minutes=1260,
+            is_active=False,
+        )
+        stale_updated_at = stale.updated_at
+        segments = []
+        active_segments = list(pattern.segments.filter(is_active=True).order_by("start_offset_minutes"))
+        for index, segment in enumerate(active_segments):
+            segments.append(
+                {
+                    "id": str(segment.id),
+                    "work_type": str(segment.work_type_id),
+                    "work_area": str(segment.work_area_id) if segment.work_area_id else None,
+                    "start_offset_minutes": segment.start_offset_minutes,
+                    "end_offset_minutes": segment.end_offset_minutes,
+                    "display_order": segment.display_order,
+                    "notes": "updated" if index == 0 else segment.notes,
+                }
+            )
+        response = client.patch(f"/api/v1/shift-patterns/{pattern.id}/", {"segments": segments}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        stale.refresh_from_db()
+        self.assertEqual(stale.updated_at, stale_updated_at)
+
     def test_reactivate_invalid_pattern_returns_400_and_keeps_inactive(self):
         client = self.force_client(self.system_admin)
         pattern = ShiftPattern.objects.get(code="gym_late")
@@ -424,6 +455,36 @@ class TestWeeklyTemplateApi(ShiftsBaseTestCase):
         payload["entries"][0]["staff"] = str(stale.staff_id)
         response = client.patch(f"/api/v1/weekly-shift-templates/{template.id}/", payload, format="json")
         self.assertEqual(response.status_code, 400)
+
+    def test_omitted_inactive_entry_history_is_not_resaved(self):
+        client = self.force_client(self.system_admin)
+        template = WeeklyShiftTemplate.objects.get(code="standard_week")
+        pattern = ShiftPattern.objects.get(code="gym_early")
+        stale = WeeklyShiftTemplateEntry.objects.create(
+            weekly_shift_template=template,
+            weekday=6,
+            staff=self.supervisor,
+            shift_pattern=pattern,
+            is_active=False,
+        )
+        stale_updated_at = stale.updated_at
+        entries = []
+        active_entries = list(template.entries.filter(is_active=True).order_by("staff_id", "weekday"))
+        for index, entry in enumerate(active_entries):
+            entries.append(
+                {
+                    "id": str(entry.id),
+                    "weekday": entry.weekday,
+                    "staff": str(entry.staff_id),
+                    "shift_pattern": str(entry.shift_pattern_id),
+                    "notes": "updated" if index == 0 else entry.notes,
+                    "display_order": entry.display_order,
+                }
+            )
+        response = client.patch(f"/api/v1/weekly-shift-templates/{template.id}/", {"entries": entries}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        stale.refresh_from_db()
+        self.assertEqual(stale.updated_at, stale_updated_at)
 
     def test_duplicate_code_and_audit_failure_rollback(self):
         client = self.force_client(self.system_admin)

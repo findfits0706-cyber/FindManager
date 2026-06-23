@@ -189,7 +189,12 @@ class WorkTypeViewSet(MasterViewSet):
         if params.get("category"):
             queryset = queryset.filter(category_id=params["category"])
         if params.get("location"):
-            queryset = queryset.filter(availabilities__location_id=params["location"])
+            queryset = queryset.filter(
+                availabilities__location_id=params["location"],
+                availabilities__is_active=True,
+                availabilities__location__is_active=True,
+                availabilities__work_type__is_active=True,
+            )
         if params.get("work_area"):
             queryset = queryset.filter(availabilities__work_area_id=params["work_area"])
         for field in ["is_bookable", "requires_capability", "is_break", "is_active"]:

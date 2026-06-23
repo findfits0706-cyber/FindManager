@@ -228,8 +228,69 @@ describe("shift settings pages", () => {
     await screen.findByRole("option", { name: "スタッフA" });
     await userEvent.selectOptions(await screen.findByLabelText("スタッフ追加"), "staff1");
     expect(screen.getByText("スタッフA")).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("スタッフ検索"), "zz");
+    expect(screen.getByText("スタッフA")).toBeInTheDocument();
     expect(screen.getAllByRole("option", { name: "早" }).length).toBeGreaterThan(0);
     expect(screen.queryByRole("option", { name: "他" })).not.toBeInTheDocument();
     expect(screen.queryByRole("option", { name: "スタッフA" })).not.toBeInTheDocument();
+  });
+
+  it("keeps existing weekly staff names when search results exclude them", async () => {
+    mockAuthAndApi(["shift_manager"], {
+      "/api/v1/weekly-shift-templates/": (input: unknown) => {
+        const url = String(input);
+        if (url.includes("/api/v1/weekly-shift-templates/t1/")) {
+          return {
+            id: "t1",
+            location: "l1",
+            location_name: "本館",
+            code: "week",
+            name: "標準週",
+            description: "",
+            display_order: 10,
+            is_active: true,
+            staff_count: 1,
+            entry_count: 1,
+            entries: [
+              {
+                id: "e1",
+                weekday: 0,
+                staff: "staff2",
+                staff_display_name: "既存スタッフ",
+                shift_pattern: "p1",
+                notes: "",
+                display_order: 10,
+                is_active: true,
+              },
+            ],
+          };
+        }
+        return {
+          count: 1,
+          next: null,
+          previous: null,
+          results: [
+            {
+              id: "t1",
+              location: "l1",
+              location_name: "本館",
+              code: "week",
+              name: "標準週",
+              staff_count: 1,
+              entry_count: 1,
+              is_active: true,
+            },
+          ],
+        };
+      },
+      "/api/v1/locations/": locations,
+      "/api/v1/shift-patterns/": patterns,
+      "/api/v1/staff-locations/": { count: 0, next: null, previous: null, results: [] },
+    });
+    renderWithAuth(<WeeklyTemplatesPage />);
+    await userEvent.click(await screen.findByRole("button", { name: "編集" }));
+    expect(await screen.findByText("既存スタッフ")).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("スタッフ検索"), "別");
+    expect(screen.getByText("既存スタッフ")).toBeInTheDocument();
   });
 });

@@ -41,6 +41,7 @@ export function WeeklyTemplatesPage() {
   const [message, setMessage] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [actionId, setActionId] = useState<string | null>(null);
+  const [staffNames, setStaffNames] = useState<Record<string, string>>({});
 
   const querySuffix = useMemo(
     () =>
@@ -85,7 +86,18 @@ export function WeeklyTemplatesPage() {
   const staffName = (staffId: string) =>
     staffOptions.find((staff) => staff.id === staffId)?.name
     ?? staffLocationQuery.data?.results.find((item) => item.staff === staffId)?.staff_display_name
+    ?? staffNames[staffId]
     ?? staffId;
+
+  const rememberStaffNames = (entries: Array<{ staff: string; staff_display_name?: string }>) => {
+    setStaffNames((current) => {
+      const next = { ...current };
+      for (const entry of entries) {
+        next[entry.staff] = entry.staff_display_name ?? next[entry.staff] ?? entry.staff;
+      }
+      return next;
+    });
+  };
 
   const markForm = (patch: Partial<TemplateForm>) => {
     setForm((current) => ({ ...current, ...patch }));
@@ -112,7 +124,9 @@ export function WeeklyTemplatesPage() {
       const detail = await api<WeeklyShiftTemplate>(`/api/v1/weekly-shift-templates/${template.id}/`);
       const assignments: Record<string, Record<number, string>> = {};
       const staffIds: string[] = [];
-      for (const entry of detail.entries?.filter((item) => item.is_active) ?? []) {
+      const activeEntries = detail.entries?.filter((item) => item.is_active) ?? [];
+      rememberStaffNames(activeEntries);
+      for (const entry of activeEntries) {
         if (!staffIds.includes(entry.staff)) staffIds.push(entry.staff);
         assignments[entry.staff] = { ...(assignments[entry.staff] ?? {}), [entry.weekday]: entry.shift_pattern };
       }
@@ -138,6 +152,8 @@ export function WeeklyTemplatesPage() {
 
   const addStaff = (staffId: string) => {
     if (!staffId || form.staffIds.includes(staffId)) return;
+    const option = staffOptions.find((staff) => staff.id === staffId);
+    if (option) setStaffNames((current) => ({ ...current, [staffId]: option.name }));
     markForm({ staffIds: [...form.staffIds, staffId], assignments: { ...form.assignments, [staffId]: {} } });
   };
 

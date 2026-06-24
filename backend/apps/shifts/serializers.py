@@ -322,12 +322,14 @@ class MonthlyShiftPlanSerializer(serializers.ModelSerializer):
         validators = []
 
     def get_assignment_count(self, obj):
-        return getattr(obj, "active_assignment_count", obj.assignments.filter(is_active=True).count())
+        if hasattr(obj, "active_assignment_count"):
+            return obj.active_assignment_count
+        return obj.assignments.filter(is_active=True).count()
 
     def get_staff_count(self, obj):
-        return getattr(
-            obj, "active_staff_count", obj.assignments.filter(is_active=True).values("staff_id").distinct().count()
-        )
+        if hasattr(obj, "active_staff_count"):
+            return obj.active_staff_count
+        return obj.assignments.filter(is_active=True).values("staff_id").distinct().count()
 
     def validate(self, attrs):
         forbidden = {"is_active", "created_at", "updated_at", "last_generated_at", "last_generated_by"}.intersection(

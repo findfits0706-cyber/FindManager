@@ -33,6 +33,10 @@ IMMUTABLE_ASSIGNMENT_CELL_MESSAGE = (
     "月間表・日付・スタッフは作成後変更できません。勤務を解除して新しく作成してください。"
 )
 INACTIVE_MONTHLY_PLAN_MESSAGE = "無効な月間表には書き込みできません。"
+DEFAULT_INTEGRITY_MESSAGE = "重複または不正なデータです。"
+SHIFT_PATTERN_DUPLICATE_MESSAGE = "同じ拠点・コードの勤務パターンが既に存在します。"
+WEEKLY_TEMPLATE_DUPLICATE_MESSAGE = "同じ拠点・コードの週間テンプレートが既に存在します。"
+MONTHLY_PLAN_DUPLICATE_MESSAGE = "同じ拠点・年月の月間表が既に存在します。"
 MONTHLY_ASSIGNMENT_DUPLICATE_MESSAGE = "同じスタッフ・日付の勤務が既に登録されています。"
 
 
@@ -81,12 +85,16 @@ EVENT_MAP = {
 }
 
 
-def _drf_validation(exc: DjangoValidationError | IntegrityError):
+def _drf_validation(
+    exc: DjangoValidationError | IntegrityError,
+    *,
+    integrity_message: str = DEFAULT_INTEGRITY_MESSAGE,
+):
     if isinstance(exc, DjangoValidationError):
         return DRFValidationError(
             exc.message_dict if hasattr(exc, "message_dict") else {"non_field_errors": exc.messages}
         )
-    return DRFValidationError({"non_field_errors": [MONTHLY_ASSIGNMENT_DUPLICATE_MESSAGE]})
+    return DRFValidationError({"non_field_errors": [integrity_message]})
 
 
 def record_shift_event(*, entity: str, action: str, actor: User, request, metadata: dict):
@@ -238,7 +246,7 @@ def save_shift_pattern(*, instance: ShiftPattern | None, validated_data: dict, s
             else:
                 _validate_pattern_segments(pattern, list(pattern.segments.select_related("work_type", "work_area")))
     except (DjangoValidationError, IntegrityError) as exc:
-        raise _drf_validation(exc) from exc
+        raise _drf_validation(exc, integrity_message=SHIFT_PATTERN_DUPLICATE_MESSAGE) from exc
     return pattern
 
 
@@ -266,7 +274,7 @@ def duplicate_shift_pattern(source: ShiftPattern, *, code: str, name: str, short
                 )
             _validate_pattern_segments(pattern, list(pattern.segments.select_related("work_type", "work_area")))
     except (DjangoValidationError, IntegrityError) as exc:
-        raise _drf_validation(exc) from exc
+        raise _drf_validation(exc, integrity_message=SHIFT_PATTERN_DUPLICATE_MESSAGE) from exc
     return pattern
 
 
@@ -278,7 +286,7 @@ def _validate_weekly_entries(template: WeeklyShiftTemplate, entries: list[Weekly
         try:
             entry.full_clean(exclude=["weekly_shift_template"] if not entry.weekly_shift_template_id else None)
         except DjangoValidationError as exc:
-            raise _drf_validation(exc) from exc
+            raise _drf_validation(exc, integrity_message=WEEKLY_TEMPLATE_DUPLICATE_MESSAGE) from exc
         key = (entry.weekday, entry.staff_id)
         if key in seen:
             raise DRFValidationError({"entries": "A staff member cannot have multiple active patterns on one weekday."})
@@ -362,7 +370,7 @@ def save_weekly_template(
                 _validate_weekly_entries(template, list(template.entries.select_related("staff", "shift_pattern")))
     except (DjangoValidationError, IntegrityError, User.DoesNotExist, ShiftPattern.DoesNotExist) as exc:
         if isinstance(exc, (DjangoValidationError, IntegrityError)):
-            raise _drf_validation(exc) from exc
+            raise _drf_validation(exc, integrity_message=WEEKLY_TEMPLATE_DUPLICATE_MESSAGE) from exc
         raise DRFValidationError({"entries": "Invalid entry reference."}) from exc
     return template
 
@@ -389,7 +397,7 @@ def duplicate_weekly_template(source: WeeklyShiftTemplate, *, code: str, name: s
                 )
             _validate_weekly_entries(template, list(template.entries.select_related("staff", "shift_pattern")))
     except (DjangoValidationError, IntegrityError) as exc:
-        raise _drf_validation(exc) from exc
+        raise _drf_validation(exc, integrity_message=WEEKLY_TEMPLATE_DUPLICATE_MESSAGE) from exc
     return template
 
 
@@ -403,7 +411,7 @@ def validate_and_reactivate_pattern(pattern: ShiftPattern):
             pattern.save(update_fields=["is_active", "updated_at"])
     except (DjangoValidationError, IntegrityError) as exc:
         pattern.is_active = original_is_active
-        raise _drf_validation(exc) from exc
+        raise _drf_validation(exc, integrity_message=SHIFT_PATTERN_DUPLICATE_MESSAGE) from exc
     except DRFValidationError:
         pattern.is_active = original_is_active
         raise
@@ -420,7 +428,7 @@ def validate_and_reactivate_template(template: WeeklyShiftTemplate):
             template.save(update_fields=["is_active", "updated_at"])
     except (DjangoValidationError, IntegrityError) as exc:
         template.is_active = original_is_active
-        raise _drf_validation(exc) from exc
+        raise _drf_validation(exc, integrity_message=WEEKLY_TEMPLATE_DUPLICATE_MESSAGE) from exc
     except DRFValidationError:
         template.is_active = original_is_active
         raise
@@ -688,6 +696,36 @@ def _validate_plan_immutable(instance: MonthlyShiftPlan | None, validated_data: 
         raise DRFValidationError(errors)
 
 
+def _validate_active_monthly_plan_unique(plan: MonthlyShiftPlan):
+    if not plan.is_active:
+        return
+    duplicate = MonthlyShiftPlan.objects.filter(
+        location_id=plan.location_id,
+        year=plan.year,
+        month=plan.month,
+        is_active=True,
+    )
+    if plan.pk:
+        duplicate = duplicate.exclude(pk=plan.pk)
+    if duplicate.exists():
+        raise DRFValidationError({"non_field_errors": [MONTHLY_PLAN_DUPLICATE_MESSAGE]})
+
+
+def _validate_active_monthly_assignment_unique(assignment: MonthlyShiftAssignment):
+    if not assignment.is_active:
+        return
+    duplicate = MonthlyShiftAssignment.objects.filter(
+        monthly_shift_plan_id=assignment.monthly_shift_plan_id,
+        work_date=assignment.work_date,
+        staff_id=assignment.staff_id,
+        is_active=True,
+    )
+    if assignment.pk:
+        duplicate = duplicate.exclude(pk=assignment.pk)
+    if duplicate.exists():
+        raise DRFValidationError({"non_field_errors": [MONTHLY_ASSIGNMENT_DUPLICATE_MESSAGE]})
+
+
 def save_monthly_plan(*, instance: MonthlyShiftPlan | None, validated_data: dict, actor: User):
     try:
         _validate_plan_immutable(instance, validated_data)
@@ -699,10 +737,11 @@ def save_monthly_plan(*, instance: MonthlyShiftPlan | None, validated_data: dict
             plan.is_active = True
             if not plan.name:
                 plan.name = f"{plan.year}年{plan.month}月 {plan.location.name}シフト"
+        _validate_active_monthly_plan_unique(plan)
         plan.full_clean()
         plan.save()
     except (DjangoValidationError, IntegrityError) as exc:
-        raise _drf_validation(exc) from exc
+        raise _drf_validation(exc, integrity_message=MONTHLY_PLAN_DUPLICATE_MESSAGE) from exc
     return plan
 
 
@@ -851,6 +890,7 @@ def validate_monthly_assignment(
     issues: list[dict] = []
     plan = assignment.monthly_shift_plan
     if validate_current_masters:
+        _validate_active_monthly_assignment_unique(assignment)
         try:
             assignment.full_clean()
         except DjangoValidationError as exc:
@@ -1031,7 +1071,7 @@ def save_monthly_assignment(
         WorkArea.DoesNotExist,
     ) as exc:
         if isinstance(exc, (DjangoValidationError, IntegrityError)):
-            raise _drf_validation(exc) from exc
+            raise _drf_validation(exc, integrity_message=MONTHLY_ASSIGNMENT_DUPLICATE_MESSAGE) from exc
         raise DRFValidationError({"non_field_errors": "Invalid assignment reference."}) from exc
     return assignment
 
@@ -1041,11 +1081,12 @@ def validate_and_reactivate_monthly_plan(plan: MonthlyShiftPlan):
     try:
         with transaction.atomic():
             plan.is_active = True
+            _validate_active_monthly_plan_unique(plan)
             plan.full_clean()
             plan.save(update_fields=["is_active", "updated_at"])
     except (DjangoValidationError, IntegrityError) as exc:
         plan.is_active = original_is_active
-        raise _drf_validation(exc) from exc
+        raise _drf_validation(exc, integrity_message=MONTHLY_PLAN_DUPLICATE_MESSAGE) from exc
     return plan
 
 
@@ -1063,7 +1104,7 @@ def validate_and_reactivate_monthly_assignment(assignment: MonthlyShiftAssignmen
             assignment.validation_warnings = warnings
     except (DjangoValidationError, IntegrityError) as exc:
         assignment.is_active = original_is_active
-        raise _drf_validation(exc) from exc
+        raise _drf_validation(exc, integrity_message=MONTHLY_ASSIGNMENT_DUPLICATE_MESSAGE) from exc
     except DRFValidationError:
         assignment.is_active = original_is_active
         raise

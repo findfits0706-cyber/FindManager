@@ -2,8 +2,9 @@ from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
-from django.db import IntegrityError
+from django.db import IntegrityError, connection
 from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
@@ -546,6 +547,44 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
             "notes": "",
         }
 
+    def create_assignment_record(
+        self,
+        plan,
+        *,
+        staff=None,
+        work_date="2026-07-01",
+        work_type=None,
+        work_area=None,
+        pattern_code="gym_early",
+    ):
+        pattern = ShiftPattern.objects.get(code=pattern_code)
+        work_type = work_type or self.gym_work
+        work_area = work_area or self.gym_area
+        assignment = MonthlyShiftAssignment.objects.create(
+            monthly_shift_plan=plan,
+            work_date=work_date,
+            staff=staff or self.staff,
+            source_shift_pattern=pattern,
+            pattern_code_snapshot=pattern.code,
+            pattern_name_snapshot=pattern.name,
+            pattern_short_name_snapshot=pattern.short_name,
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=work_type,
+            work_area=work_area,
+            work_type_name_snapshot=work_type.name,
+            work_type_short_name_snapshot=work_type.short_name,
+            work_type_color_key_snapshot=work_type.color_key,
+            work_type_is_break_snapshot=work_type.is_break,
+            work_area_name_snapshot=work_area.name if work_area else "",
+            start_offset_minutes=540,
+            end_offset_minutes=600,
+        )
+        return assignment
+
     def test_plan_permissions_immutability_deactivate_and_reactivate_conflict(self):
         admin = self.force_client(self.system_admin)
         response = admin.post("/api/v1/monthly-shift-plans/", self.plan_payload(), format="json")
@@ -583,6 +622,111 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
             admin.post(f"/api/v1/monthly-shift-plans/{plan.id}/reactivate/", {}, format="json").status_code, 400
         )
         self.assertTrue(AuditEvent.objects.filter(event_type="monthly_shift_plan_created").exists())
+
+    def test_plan_list_counts_do_not_add_queries_per_plan(self):
+        client = self.force_client(self.system_admin)
+        first_plan = self.create_plan()
+        self.create_assignment_record(first_plan, staff=self.staff, work_date="2026-07-01")
+        self.create_assignment_record(first_plan, staff=self.shift_manager, work_date="2026-07-02")
+        inactive = self.create_assignment_record(first_plan, staff=self.staff, work_date="2026-07-03")
+        inactive.is_active = False
+        inactive.save(update_fields=["is_active", "updated_at"])
+
+        with CaptureQueriesContext(connection) as single_plan_queries:
+            response = client.get("/api/v1/monthly-shift-plans/?page_size=100")
+        self.assertEqual(response.status_code, 200, response.data)
+        first_result = next(item for item in response.data["results"] if item["id"] == str(first_plan.id))
+        self.assertEqual(first_result["assignment_count"], 2)
+        self.assertEqual(first_result["staff_count"], 2)
+
+        for month in range(8, 13):
+            plan = self.create_plan(month=month)
+            self.create_assignment_record(plan, staff=self.staff, work_date=f"2026-{month:02d}-01")
+        with CaptureQueriesContext(connection) as many_plan_queries:
+            many_response = client.get("/api/v1/monthly-shift-plans/?page_size=100")
+        self.assertEqual(many_response.status_code, 200, many_response.data)
+        self.assertLessEqual(len(many_plan_queries) - len(single_plan_queries), 2)
+        first_result = next(item for item in many_response.data["results"] if item["id"] == str(first_plan.id))
+        self.assertEqual(first_result["assignment_count"], 2)
+        self.assertEqual(first_result["staff_count"], 2)
+
+    def test_matrix_capability_query_count_does_not_grow_per_assignment(self):
+        client = self.force_client(self.system_admin)
+        self.gym_work.requires_capability = True
+        self.gym_work.save(update_fields=["requires_capability", "updated_at"])
+        StaffCapability.objects.update_or_create(
+            staff=self.staff,
+            work_type=self.gym_work,
+            location=self.location,
+            valid_from="2026-01-01",
+            valid_until=None,
+            defaults={
+                "level": StaffCapability.Level.ASSISTED,
+                "approved_by": self.system_admin,
+                "approved_at": timezone.now(),
+            },
+        )
+        small_plan = self.create_plan(month=7)
+        self.create_assignment_record(small_plan, work_date="2026-07-01", work_type=self.gym_work)
+        large_plan = self.create_plan(month=8)
+        for day in range(1, 16):
+            self.create_assignment_record(
+                large_plan,
+                work_date=f"2026-08-{day:02d}",
+                work_type=self.gym_work,
+            )
+
+        with CaptureQueriesContext(connection) as small_queries:
+            small_response = client.get(f"/api/v1/monthly-shift-plans/{small_plan.id}/matrix/?assigned_only=true")
+        self.assertEqual(small_response.status_code, 200, small_response.data)
+        with CaptureQueriesContext(connection) as large_queries:
+            large_response = client.get(f"/api/v1/monthly-shift-plans/{large_plan.id}/matrix/?assigned_only=true")
+        self.assertEqual(large_response.status_code, 200, large_response.data)
+        self.assertLessEqual(len(large_queries) - len(small_queries), 2)
+        warning_counts = [
+            assignment["warning_count"]
+            for row in large_response.data["rows"]
+            for assignment in row["assignments"].values()
+        ]
+        self.assertTrue(warning_counts)
+        self.assertTrue(all(count == 1 for count in warning_counts))
+
+    def test_duplicate_error_messages_are_scoped_by_resource(self):
+        client = self.force_client(self.system_admin)
+        plan = self.create_plan()
+        created = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan),
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        duplicate_assignment = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan),
+            format="json",
+        )
+        self.assertEqual(duplicate_assignment.status_code, 400)
+        self.assertIn("同じスタッフ・日付", str(duplicate_assignment.data))
+
+        duplicate_plan = client.post("/api/v1/monthly-shift-plans/", self.plan_payload(), format="json")
+        self.assertEqual(duplicate_plan.status_code, 400)
+        self.assertIn("同じ拠点・年月", str(duplicate_plan.data))
+
+        duplicate_pattern = client.post(
+            "/api/v1/shift-patterns/",
+            self.pattern_payload(code="gym_early"),
+            format="json",
+        )
+        self.assertEqual(duplicate_pattern.status_code, 400)
+        self.assertNotIn("同じスタッフ・日付", str(duplicate_pattern.data))
+
+        duplicate_template = client.post(
+            "/api/v1/weekly-shift-templates/",
+            {"location": str(self.location.id), "code": "standard_week", "name": "Dup", "entries": []},
+            format="json",
+        )
+        self.assertEqual(duplicate_template.status_code, 400)
+        self.assertNotIn("同じスタッフ・日付", str(duplicate_template.data))
 
     def test_assignment_pattern_copy_snapshots_validation_warnings_and_segment_history(self):
         client = self.force_client(self.system_admin)

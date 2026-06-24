@@ -721,6 +721,37 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         self.assertEqual(len(matrix.data["dates"]), 31)
         self.assertTrue(any(item["is_saturday"] for item in matrix.data["dates"]))
         self.assertTrue(any(item["is_sunday"] for item in matrix.data["dates"]))
+
+        staff_assignment = MonthlyShiftAssignment.objects.filter(
+            monthly_shift_plan=plan,
+            staff=self.staff,
+            is_active=True,
+        ).first()
+        required_work_type = staff_assignment.segments.filter(is_active=True).first().work_type
+        required_work_type.requires_capability = True
+        required_work_type.save(update_fields=["requires_capability", "updated_at"])
+        StaffCapability.objects.update_or_create(
+            staff=self.staff,
+            work_type=required_work_type,
+            location=self.location,
+            valid_from=timezone.localdate(),
+            valid_until=None,
+            defaults={
+                "level": StaffCapability.Level.ASSISTED,
+                "approved_by": self.system_admin,
+                "approved_at": timezone.now(),
+            },
+        )
+        warning_matrix = client.get(f"/api/v1/monthly-shift-plans/{plan.id}/matrix/")
+        self.assertEqual(warning_matrix.status_code, 200)
+        warning_counts = [
+            assignment["warning_count"]
+            for row in warning_matrix.data["rows"]
+            for assignment in row["assignments"].values()
+            if row["staff"] == str(self.staff.id)
+        ]
+        self.assertTrue(any(count > 0 for count in warning_counts))
+
         assignment = MonthlyShiftAssignment.objects.filter(monthly_shift_plan=plan, is_active=True).first()
         deactivate = client.post(f"/api/v1/monthly-shift-assignments/{assignment.id}/deactivate/", {}, format="json")
         self.assertEqual(deactivate.status_code, 200)

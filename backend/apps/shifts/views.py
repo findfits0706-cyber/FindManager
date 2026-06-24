@@ -6,9 +6,9 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
 from apps.accounts.models import User
-from apps.operations.models import StaffLocation
+from apps.operations.models import StaffCapability, StaffLocation
 
-from .models import MonthlyShiftAssignment, MonthlyShiftPlan, ShiftPattern, WeeklyShiftTemplate
+from .models import MonthlyShiftAssignment, MonthlyShiftPlan, MonthlyShiftSegment, ShiftPattern, WeeklyShiftTemplate
 from .serializers import (
     MonthlyShiftAssignmentListSerializer,
     MonthlyShiftAssignmentSerializer,
@@ -361,15 +361,66 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
         assignment_queryset = (
             MonthlyShiftAssignment.objects.filter(monthly_shift_plan=plan, is_active=True)
             .select_related("staff")
-            .prefetch_related("segments")
+            .prefetch_related(
+                Prefetch(
+                    "segments",
+                    queryset=MonthlyShiftSegment.objects.filter(is_active=True).select_related("work_type"),
+                )
+            )
         )
-        assignment_staff_ids = set(assignment_queryset.values_list("staff_id", flat=True))
+        assignment_list = list(assignment_queryset)
+        assignment_staff_ids = {item.staff_id for item in assignment_list}
         staff_location_ids = set(
             StaffLocation.objects.filter(location=plan.location, is_active=True, valid_from__lte=end_date)
             .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=start_date))
             .values_list("staff_id", flat=True)
         )
         staff_ids = assignment_staff_ids if assigned_only else assignment_staff_ids | staff_location_ids
+        required_work_type_ids = {
+            segment.work_type_id
+            for assignment in assignment_list
+            for segment in assignment.segments.all()
+            if segment.work_type.requires_capability
+        }
+        capabilities_by_staff_work_type: dict[tuple[str, str], list[StaffCapability]] = {}
+        if required_work_type_ids:
+            capabilities = (
+                StaffCapability.objects.filter(
+                    staff_id__in=assignment_staff_ids,
+                    work_type_id__in=required_work_type_ids,
+                    is_active=True,
+                    valid_from__lte=end_date,
+                )
+                .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=start_date))
+                .filter(Q(location=plan.location) | Q(location__isnull=True))
+                .order_by("-location_id", "display_order")
+            )
+            for capability in capabilities:
+                key = (str(capability.staff_id), str(capability.work_type_id))
+                capabilities_by_staff_work_type.setdefault(key, []).append(capability)
+
+        def warning_count_for(assignment):
+            warning_levels = {StaffCapability.Level.ASSISTED, StaffCapability.Level.TRAINEE}
+            warning_count = 0
+            for segment in assignment.segments.all():
+                if not segment.work_type.requires_capability:
+                    continue
+                capabilities = capabilities_by_staff_work_type.get(
+                    (str(assignment.staff_id), str(segment.work_type_id)), []
+                )
+                capability = next(
+                    (
+                        item
+                        for item in capabilities
+                        if item.valid_from <= assignment.work_date
+                        and (item.valid_until is None or item.valid_until >= assignment.work_date)
+                    ),
+                    None,
+                )
+                if capability is not None and capability.level in warning_levels:
+                    warning_count += 1
+            return warning_count
+
         staff_queryset = User.objects.filter(id__in=staff_ids)
         if staff_search:
             staff_queryset = staff_queryset.filter(
@@ -380,7 +431,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
         staff_list = list(staff_queryset.order_by("employee_code", "display_name"))
         assignments_by_staff_date = {
             (str(item.staff_id), item.work_date.isoformat()): item
-            for item in assignment_queryset
+            for item in assignment_list
             if item.staff_id in staff_ids
         }
         rows = []
@@ -390,7 +441,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                 assignment = assignments_by_staff_date.get((str(staff.id), work_date.isoformat()))
                 if assignment is None:
                     continue
-                active_segments = [segment for segment in assignment.segments.all() if segment.is_active]
+                active_segments = list(assignment.segments.all())
                 assignments[work_date.isoformat()] = {
                     "id": str(assignment.id),
                     "pattern_short_name": assignment.pattern_short_name_snapshot,
@@ -402,7 +453,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                     ),
                     "source_type": assignment.source_type,
                     "is_customized": assignment.is_customized,
-                    "warning_count": 0,
+                    "warning_count": warning_count_for(assignment),
                 }
             rows.append(
                 {

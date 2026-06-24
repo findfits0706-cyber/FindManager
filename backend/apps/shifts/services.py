@@ -4,7 +4,7 @@ from datetime import date
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import Case, IntegerField, Q, Value, When
 from django.utils import timezone
 from rest_framework.serializers import ValidationError as DRFValidationError
 
@@ -27,6 +27,13 @@ MANAGE_ROLES = {ROLE_SYSTEM_ADMIN, ROLE_SHIFT_MANAGER}
 VIEW_ROLES = MANAGE_ROLES | {ROLE_SUPERVISOR}
 IMMUTABLE_LOCATION_MESSAGE = "拠点は作成後変更できません。別拠点用に複製してください。"
 DUPLICATE_CHILD_ID_MESSAGE = "同じ子要素IDが複数回指定されています。"
+
+
+IMMUTABLE_ASSIGNMENT_CELL_MESSAGE = (
+    "月間表・日付・スタッフは作成後変更できません。勤務を解除して新しく作成してください。"
+)
+INACTIVE_MONTHLY_PLAN_MESSAGE = "無効な月間表には書き込みできません。"
+MONTHLY_ASSIGNMENT_DUPLICATE_MESSAGE = "同じスタッフ・日付の勤務が既に登録されています。"
 
 
 def user_has_any_role(user: User, roles: set[str]) -> bool:
@@ -79,7 +86,7 @@ def _drf_validation(exc: DjangoValidationError | IntegrityError):
         return DRFValidationError(
             exc.message_dict if hasattr(exc, "message_dict") else {"non_field_errors": exc.messages}
         )
-    return DRFValidationError({"non_field_errors": ["Duplicate or invalid data."]})
+    return DRFValidationError({"non_field_errors": [MONTHLY_ASSIGNMENT_DUPLICATE_MESSAGE]})
 
 
 def record_shift_event(*, entity: str, action: str, actor: User, request, metadata: dict):
@@ -624,6 +631,47 @@ def _active_on(queryset, target_date: date):
     ).filter(Q(valid_until__isnull=True) | Q(valid_until__gte=target_date))
 
 
+def ensure_active_monthly_plan(plan: MonthlyShiftPlan):
+    if not plan.is_active:
+        raise DRFValidationError({"monthly_shift_plan": INACTIVE_MONTHLY_PLAN_MESSAGE})
+
+
+def _ordered_capabilities(queryset, location: Location):
+    return queryset.annotate(
+        location_priority=Case(
+            When(location=location, then=Value(0)),
+            When(location__isnull=True, then=Value(1)),
+            default=Value(2),
+            output_field=IntegerField(),
+        )
+    ).order_by("location_priority", "display_order", "created_at")
+
+
+def active_capability_for(staff: User, work_type: WorkType, location: Location, work_date: date):
+    queryset = StaffCapability.objects.filter(staff=staff, work_type=work_type).filter(
+        Q(location=location) | Q(location__isnull=True)
+    )
+    return _ordered_capabilities(_active_on(queryset, work_date), location).first()
+
+
+def _validate_assignment_cell_immutable(instance: MonthlyShiftAssignment | None, validated_data: dict):
+    if instance is None:
+        return
+    errors = {}
+    for field in ["monthly_shift_plan", "work_date", "staff"]:
+        if field not in validated_data:
+            continue
+        incoming = validated_data[field]
+        incoming_value = getattr(incoming, "id", incoming)
+        current_value = (
+            getattr(instance, f"{field}_id") if field in {"monthly_shift_plan", "staff"} else getattr(instance, field)
+        )
+        if str(incoming_value) != str(current_value):
+            errors[field] = IMMUTABLE_ASSIGNMENT_CELL_MESSAGE
+    if errors:
+        raise DRFValidationError(errors)
+
+
 def _validate_plan_immutable(instance: MonthlyShiftPlan | None, validated_data: dict):
     if instance is None:
         return
@@ -679,10 +727,18 @@ def monthly_assignment_metadata(assignment: MonthlyShiftAssignment) -> dict:
 
 
 def _snapshot_segment(segment: MonthlyShiftSegment):
+    _snapshot_work_type(segment)
+    _snapshot_work_area(segment)
+
+
+def _snapshot_work_type(segment: MonthlyShiftSegment):
     segment.work_type_name_snapshot = segment.work_type.name
     segment.work_type_short_name_snapshot = segment.work_type.short_name
     segment.work_type_color_key_snapshot = segment.work_type.color_key
     segment.work_type_is_break_snapshot = segment.work_type.is_break
+
+
+def _snapshot_work_area(segment: MonthlyShiftSegment):
     segment.work_area_name_snapshot = segment.work_area.name if segment.work_area_id else ""
 
 
@@ -744,6 +800,8 @@ def _segment_from_monthly_payload(
     existing: MonthlyShiftSegment | None = None,
 ):
     segment = existing or MonthlyShiftSegment(monthly_shift_assignment=assignment)
+    original_work_type_id = existing.work_type_id if existing else None
+    original_work_area_id = existing.work_area_id if existing else None
     for field in ["work_type", "work_area", "start_offset_minutes", "end_offset_minutes", "display_order", "notes"]:
         if field not in payload:
             continue
@@ -755,23 +813,20 @@ def _segment_from_monthly_payload(
         setattr(segment, field, value)
     segment.monthly_shift_assignment = assignment
     segment.source_pattern_segment = None if existing is None else segment.source_pattern_segment
-    _snapshot_segment(segment)
+    if existing is None:
+        _snapshot_segment(segment)
+    else:
+        if str(original_work_type_id) != str(segment.work_type_id):
+            _snapshot_work_type(segment)
+        if str(original_work_area_id or "") != str(segment.work_area_id or ""):
+            _snapshot_work_area(segment)
     return segment
 
 
 def _capability_issues(staff: User, work_type: WorkType, location: Location, work_date: date) -> list[dict]:
     if not work_type.requires_capability:
         return []
-    capability = (
-        _active_on(
-            StaffCapability.objects.filter(staff=staff, work_type=work_type).filter(
-                Q(location=location) | Q(location__isnull=True)
-            ),
-            work_date,
-        )
-        .order_by("-location_id", "display_order")
-        .first()
-    )
+    capability = active_capability_for(staff, work_type, location, work_date)
     if capability is None:
         return [
             {
@@ -878,13 +933,19 @@ def save_monthly_assignment(
 ):
     try:
         with transaction.atomic():
+            if instance is None and validated_data.get("monthly_shift_plan"):
+                MonthlyShiftPlan.objects.select_for_update().get(pk=validated_data["monthly_shift_plan"].pk)
+            elif instance is not None:
+                MonthlyShiftPlan.objects.select_for_update().get(pk=instance.monthly_shift_plan_id)
             assignment = instance or MonthlyShiftAssignment(created_by=actor)
+            _validate_assignment_cell_immutable(instance, validated_data)
             for field, value in validated_data.items():
                 setattr(assignment, field, value)
             assignment.updated_by = actor
             if instance is None:
                 assignment.is_active = True
                 assignment.source_type = MonthlyShiftAssignment.SourceType.MANUAL
+            ensure_active_monthly_plan(assignment.monthly_shift_plan)
 
             save_segments: list[MonthlyShiftSegment]
             validation_segments: list[MonthlyShiftSegment]
@@ -992,10 +1053,14 @@ def validate_and_reactivate_monthly_assignment(assignment: MonthlyShiftAssignmen
     original_is_active = assignment.is_active
     try:
         with transaction.atomic():
+            ensure_active_monthly_plan(assignment.monthly_shift_plan)
             assignment.is_active = True
-            validate_monthly_assignment(assignment, list(assignment.segments.select_related("work_type", "work_area")))
+            warnings = validate_monthly_assignment(
+                assignment, list(assignment.segments.select_related("work_type", "work_area"))
+            )
             assignment.full_clean()
             assignment.save(update_fields=["is_active", "updated_at"])
+            assignment.validation_warnings = warnings
     except (DjangoValidationError, IntegrityError) as exc:
         assignment.is_active = original_is_active
         raise _drf_validation(exc) from exc
@@ -1034,6 +1099,7 @@ def preview_template_generation(
     existing_mode: str,
     invalid_mode: str,
 ) -> dict:
+    ensure_active_monthly_plan(plan)
     if existing_mode not in {"skip_existing", "replace_template_generated"}:
         raise DRFValidationError({"existing_mode": "Invalid existing_mode."})
     if invalid_mode not in {"strict", "skip_invalid"}:
@@ -1081,6 +1147,7 @@ def preview_template_generation(
         "replace_count": 0,
         "skip_existing_count": 0,
         "skip_manual_count": 0,
+        "skip_invalid_count": 0,
         "error_count": 0,
         "warning_count": 0,
     }
@@ -1095,8 +1162,10 @@ def preview_template_generation(
             summary["replace_count"] += 1
         elif action == "skip_existing":
             summary["skip_existing_count"] += 1
-        elif action in {"skip_manual", "skip_invalid"}:
+        elif action == "skip_manual":
             summary["skip_manual_count"] += 1
+        elif action == "skip_invalid":
+            summary["skip_invalid_count"] += 1
         summary["error_count"] += sum(1 for issue in candidate.issues if issue["severity"] == "error")
         summary["warning_count"] += sum(1 for issue in candidate.issues if issue["severity"] == "warning")
         items.append(
@@ -1123,6 +1192,7 @@ def apply_template_generation(
 ):
     with transaction.atomic():
         plan = MonthlyShiftPlan.objects.select_for_update().get(pk=plan.pk)
+        ensure_active_monthly_plan(plan)
         list(plan.assignments.select_for_update().filter(is_active=True))
         preview = preview_template_generation(
             plan=plan,
@@ -1164,7 +1234,7 @@ def apply_template_generation(
             validate_monthly_assignment(assignment, segments)
             assignment.save()
             if existing:
-                existing.segments.filter(is_active=True).update(is_active=False)
+                existing.segments.filter(is_active=True).update(is_active=False, updated_at=timezone.now())
             for segment in segments:
                 segment.monthly_shift_assignment = assignment
                 segment.save()

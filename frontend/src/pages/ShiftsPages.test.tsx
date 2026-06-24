@@ -108,6 +108,9 @@ const monthlyMatrix = {
           warning_count: 0,
         },
       },
+      inactive_assignments: {
+        "2028-02-02": { id: "old1", pattern_short_name: "遅" },
+      },
     },
   ],
 };
@@ -352,6 +355,7 @@ describe("shift settings pages", () => {
           replace_count: 0,
           skip_existing_count: 0,
           skip_manual_count: 0,
+          skip_invalid_count: 1,
           error_count: 1,
           warning_count: 0,
         },
@@ -390,6 +394,7 @@ describe("shift settings pages", () => {
       },
       "/api/v1/monthly-shift-plans/": { count: 1, next: null, previous: null, results: [monthlyPlan] },
       "/api/v1/locations/": locations,
+      "/api/v1/work-type-availabilities/": { count: 1, next: null, previous: null, results: [{ id: "av1", work_type: "w1", location: "l1", work_area: null, is_active: true }] },
       "/api/v1/shift-patterns/": patterns,
       "/api/v1/weekly-shift-templates/": {
         count: 1,
@@ -415,7 +420,84 @@ describe("shift settings pages", () => {
     await userEvent.selectOptions(screen.getByLabelText("週間テンプレート"), "t1");
     await userEvent.click(screen.getByRole("button", { name: "生成プレビュー" }));
     expect(await screen.findByText(/エラー 1/)).toBeInTheDocument();
+    expect(screen.getByText(/検証エラースキップ 1/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "テンプレート適用" })).toBeDisabled();
+  });
+
+  it("fetches pattern detail, previews segments, moves rows, and reactivates inactive assignments", async () => {
+    confirmMock.mockReturnValue(true);
+    const patternDetail = {
+      ...patterns.results[0],
+      segments: [
+        patterns.results[0].segments[0],
+        { ...patterns.results[0].segments[0], id: "s2", start_offset_minutes: 1020, end_offset_minutes: 1080, display_order: 20 },
+      ],
+    };
+    mockAuthAndApi(["system_admin"], {
+      "/api/v1/monthly-shift-plans/m1/matrix/": monthlyMatrix,
+      "/api/v1/monthly-shift-assignments/old1/reactivate/": {
+        id: "old1",
+        monthly_shift_plan: "m1",
+        work_date: "2028-02-02",
+        staff: "staff1",
+        staff_display_name: "スタッフA",
+        source_type: "manual",
+        source_shift_pattern: "p1",
+        pattern_name_snapshot: "早番",
+        pattern_short_name_snapshot: "早",
+        notes: "",
+        is_customized: false,
+        is_active: true,
+        start_offset_minutes: 510,
+        end_offset_minutes: 1020,
+        work_minutes: 450,
+        break_minutes: 60,
+        segment_count: 1,
+        warnings: [{ severity: "warning", code: "assisted_capability", message: "warning" }],
+        segments: [],
+      },
+      "/api/v1/shift-patterns/p1/": patternDetail,
+      "/api/v1/monthly-shift-plans/": { count: 1, next: null, previous: null, results: [monthlyPlan] },
+      "/api/v1/locations/": locations,
+      "/api/v1/shift-patterns/": patterns,
+      "/api/v1/weekly-shift-templates/": { count: 0, next: null, previous: null, results: [] },
+      "/api/v1/work-types/": workTypes,
+      "/api/v1/work-areas/": workAreas,
+      "/api/v1/work-type-availabilities/": { count: 1, next: null, previous: null, results: [{ id: "av1", work_type: "w1", location: "l1", work_area: null, is_active: true }] },
+    });
+    renderWithAuth(<MonthlyShiftsPage />);
+    await screen.findByRole("option", { name: "本館" });
+    await userEvent.selectOptions(screen.getByLabelText("拠点"), "l1");
+    await userEvent.clear(screen.getByLabelText("年"));
+    await userEvent.type(screen.getByLabelText("年"), "2028");
+    await userEvent.clear(screen.getByLabelText("月"));
+    await userEvent.type(screen.getByLabelText("月"), "2");
+    await userEvent.click(await screen.findByRole("button", { name: "月間表を開く" }));
+    await screen.findAllByText("+");
+    await userEvent.click(screen.getAllByText("+")[0]);
+    await userEvent.selectOptions(screen.getByLabelText("勤務パターン"), "p1");
+    expect(await screen.findByText(/選択パターン: 2/)).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/shift-patterns/p1/"), expect.anything());
+    expect(screen.getAllByRole("button", { name: "↑" })[0]).toBeDisabled();
+    await userEvent.click(screen.getAllByRole("button", { name: "↓" })[0]);
+    await userEvent.click(screen.getByText(/解除済み/));
+    await userEvent.click(await screen.findByRole("button", { name: "再有効化" }));
+    expect(await screen.findByText("warning")).toBeInTheDocument();
+  });
+
+  it("keeps supervisor monthly UI read only", async () => {
+    mockAuthAndApi(["supervisor"], {
+      "/api/v1/monthly-shift-plans/m1/matrix/": monthlyMatrix,
+      "/api/v1/monthly-shift-plans/": { count: 1, next: null, previous: null, results: [monthlyPlan] },
+      "/api/v1/locations/": locations,
+    });
+    renderWithAuth(<MonthlyShiftsPage />);
+    await screen.findByRole("option", { name: "本館" });
+    await userEvent.selectOptions(screen.getByLabelText("拠点"), "l1");
+    await userEvent.click(await screen.findByRole("button", { name: "月間表を開く" }));
+    expect(await screen.findByText("スタッフA")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "生成プレビュー" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "保存" })).not.toBeInTheDocument();
   });
 
   it("redirects staff away from monthly shifts", async () => {

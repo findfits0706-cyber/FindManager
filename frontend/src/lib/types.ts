@@ -187,6 +187,11 @@ export type MonthlyMatrixAssignment = {
   warning_count: number;
 };
 
+export type MonthlyMatrixInactiveAssignment = {
+  id: string;
+  pattern_short_name: string;
+};
+
 export type MonthlyShiftMatrix = {
   plan: Pick<MonthlyShiftPlan, "id" | "location" | "year" | "month" | "name"> & { location_name: string };
   dates: Array<{
@@ -202,6 +207,7 @@ export type MonthlyShiftMatrix = {
     staff_display_name: string;
     employee_code: string;
     assignments: Record<string, MonthlyMatrixAssignment>;
+    inactive_assignments: Record<string, MonthlyMatrixInactiveAssignment>;
   }>;
 };
 
@@ -212,6 +218,7 @@ export type TemplateGenerationResult = {
     replace_count: number;
     skip_existing_count: number;
     skip_manual_count: number;
+    skip_invalid_count: number;
     error_count: number;
     warning_count: number;
     created_count?: number;

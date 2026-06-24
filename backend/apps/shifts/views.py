@@ -1,5 +1,5 @@
 from django.db import transaction
-from django.db.models import Prefetch, Q
+from django.db.models import Count, Prefetch, Q
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
@@ -23,6 +23,7 @@ from .serializers import (
     WeeklyShiftTemplateSerializer,
 )
 from .services import (
+    active_capability_for,
     apply_template_generation,
     can_manage_shifts,
     can_view_shifts,
@@ -30,6 +31,7 @@ from .services import (
     deactivate_monthly_instance,
     duplicate_shift_pattern,
     duplicate_weekly_template,
+    ensure_active_monthly_plan,
     month_dates,
     monthly_assignment_metadata,
     monthly_plan_metadata,
@@ -272,7 +274,10 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
     serializer_class = MonthlyShiftPlanSerializer
     queryset = (
         MonthlyShiftPlan.objects.select_related("location", "source_weekly_template", "last_generated_by")
-        .prefetch_related("assignments")
+        .annotate(
+            active_assignment_count=Count("assignments", filter=Q(assignments__is_active=True), distinct=True),
+            active_staff_count=Count("assignments__staff", filter=Q(assignments__is_active=True), distinct=True),
+        )
         .order_by("-year", "-month", "location__display_order")
     )
 
@@ -370,34 +375,21 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
         )
         assignment_list = list(assignment_queryset)
         assignment_staff_ids = {item.staff_id for item in assignment_list}
+        inactive_assignment_staff_ids = set(
+            MonthlyShiftAssignment.objects.filter(monthly_shift_plan=plan, is_active=False).values_list(
+                "staff_id", flat=True
+            )
+        )
         staff_location_ids = set(
             StaffLocation.objects.filter(location=plan.location, is_active=True, valid_from__lte=end_date)
             .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=start_date))
             .values_list("staff_id", flat=True)
         )
-        staff_ids = assignment_staff_ids if assigned_only else assignment_staff_ids | staff_location_ids
-        required_work_type_ids = {
-            segment.work_type_id
-            for assignment in assignment_list
-            for segment in assignment.segments.all()
-            if segment.work_type.requires_capability
-        }
-        capabilities_by_staff_work_type: dict[tuple[str, str], list[StaffCapability]] = {}
-        if required_work_type_ids:
-            capabilities = (
-                StaffCapability.objects.filter(
-                    staff_id__in=assignment_staff_ids,
-                    work_type_id__in=required_work_type_ids,
-                    is_active=True,
-                    valid_from__lte=end_date,
-                )
-                .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=start_date))
-                .filter(Q(location=plan.location) | Q(location__isnull=True))
-                .order_by("-location_id", "display_order")
-            )
-            for capability in capabilities:
-                key = (str(capability.staff_id), str(capability.work_type_id))
-                capabilities_by_staff_work_type.setdefault(key, []).append(capability)
+        staff_ids = (
+            assignment_staff_ids
+            if assigned_only
+            else assignment_staff_ids | staff_location_ids | inactive_assignment_staff_ids
+        )
 
         def warning_count_for(assignment):
             warning_levels = {StaffCapability.Level.ASSISTED, StaffCapability.Level.TRAINEE}
@@ -405,17 +397,8 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
             for segment in assignment.segments.all():
                 if not segment.work_type.requires_capability:
                     continue
-                capabilities = capabilities_by_staff_work_type.get(
-                    (str(assignment.staff_id), str(segment.work_type_id)), []
-                )
-                capability = next(
-                    (
-                        item
-                        for item in capabilities
-                        if item.valid_from <= assignment.work_date
-                        and (item.valid_until is None or item.valid_until >= assignment.work_date)
-                    ),
-                    None,
+                capability = active_capability_for(
+                    assignment.staff, segment.work_type, plan.location, assignment.work_date
                 )
                 if capability is not None and capability.level in warning_levels:
                     warning_count += 1
@@ -434,33 +417,52 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
             for item in assignment_list
             if item.staff_id in staff_ids
         }
+        inactive_queryset = (
+            MonthlyShiftAssignment.objects.filter(monthly_shift_plan=plan, is_active=False, staff_id__in=staff_ids)
+            .select_related("staff")
+            .order_by("staff_id", "work_date", "-updated_at", "-created_at")
+        )
+        inactive_by_staff_date = {}
+        for item in inactive_queryset:
+            key = (str(item.staff_id), item.work_date.isoformat())
+            if key in assignments_by_staff_date or key in inactive_by_staff_date:
+                continue
+            inactive_by_staff_date[key] = item
         rows = []
         for staff in staff_list:
             assignments = {}
+            inactive_assignments = {}
             for work_date in dates:
                 assignment = assignments_by_staff_date.get((str(staff.id), work_date.isoformat()))
-                if assignment is None:
+                if assignment is not None:
+                    active_segments = list(assignment.segments.all())
+                    assignments[work_date.isoformat()] = {
+                        "id": str(assignment.id),
+                        "pattern_short_name": assignment.pattern_short_name_snapshot,
+                        "start_offset_minutes": min(
+                            (segment.start_offset_minutes for segment in active_segments), default=None
+                        ),
+                        "end_offset_minutes": max(
+                            (segment.end_offset_minutes for segment in active_segments), default=None
+                        ),
+                        "source_type": assignment.source_type,
+                        "is_customized": assignment.is_customized,
+                        "warning_count": warning_count_for(assignment),
+                    }
                     continue
-                active_segments = list(assignment.segments.all())
-                assignments[work_date.isoformat()] = {
-                    "id": str(assignment.id),
-                    "pattern_short_name": assignment.pattern_short_name_snapshot,
-                    "start_offset_minutes": min(
-                        (segment.start_offset_minutes for segment in active_segments), default=None
-                    ),
-                    "end_offset_minutes": max(
-                        (segment.end_offset_minutes for segment in active_segments), default=None
-                    ),
-                    "source_type": assignment.source_type,
-                    "is_customized": assignment.is_customized,
-                    "warning_count": warning_count_for(assignment),
-                }
+                inactive = inactive_by_staff_date.get((str(staff.id), work_date.isoformat()))
+                if inactive is not None:
+                    inactive_assignments[work_date.isoformat()] = {
+                        "id": str(inactive.id),
+                        "pattern_short_name": inactive.pattern_short_name_snapshot,
+                    }
             rows.append(
                 {
                     "staff": str(staff.id),
                     "staff_display_name": staff.display_name,
                     "employee_code": staff.employee_code,
                     "assignments": assignments,
+                    "inactive_assignments": inactive_assignments,
                 }
             )
         weekday_labels = ["月", "火", "水", "木", "金", "土", "日"]
@@ -493,6 +495,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
     def preview_template_generation(self, request, pk=None):
         self._require_manage()
         plan = self.get_object()
+        ensure_active_monthly_plan(plan)
         serializer = TemplateGenerationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         result = preview_template_generation(
@@ -507,6 +510,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
     def apply_template(self, request, pk=None):
         self._require_manage()
         plan = self.get_object()
+        ensure_active_monthly_plan(plan)
         serializer = TemplateGenerationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         with transaction.atomic():
@@ -534,6 +538,9 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                     "created_count": result["summary"].get("created_count", result["summary"]["create_count"]),
                     "replaced_count": result["summary"].get("replaced_count", result["summary"]["replace_count"]),
                     "skipped_count": result["summary"].get("skipped_count", 0),
+                    "skip_existing_count": result["summary"]["skip_existing_count"],
+                    "skip_manual_count": result["summary"]["skip_manual_count"],
+                    "skip_invalid_count": result["summary"]["skip_invalid_count"],
                     "error_count": result["summary"]["error_count"],
                     "warning_count": result["summary"]["warning_count"],
                 },

@@ -322,10 +322,12 @@ class MonthlyShiftPlanSerializer(serializers.ModelSerializer):
         validators = []
 
     def get_assignment_count(self, obj):
-        return obj.assignments.filter(is_active=True).count()
+        return getattr(obj, "active_assignment_count", obj.assignments.filter(is_active=True).count())
 
     def get_staff_count(self, obj):
-        return obj.assignments.filter(is_active=True).values("staff_id").distinct().count()
+        return getattr(
+            obj, "active_staff_count", obj.assignments.filter(is_active=True).values("staff_id").distinct().count()
+        )
 
     def validate(self, attrs):
         forbidden = {"is_active", "created_at", "updated_at", "last_generated_at", "last_generated_by"}.intersection(
@@ -467,6 +469,17 @@ class MonthlyShiftAssignmentSerializer(serializers.ModelSerializer):
         forbidden = {"is_active", "created_at", "updated_at"}.intersection(self.initial_data)
         if forbidden:
             raise serializers.ValidationError({field: "This field is read-only." for field in forbidden})
+        if self.instance is not None:
+            errors = {}
+            message = "月間表・日付・スタッフは作成後変更できません。勤務を解除して新しく作成してください。"
+            if "monthly_shift_plan" in attrs and attrs["monthly_shift_plan"].id != self.instance.monthly_shift_plan_id:
+                errors["monthly_shift_plan"] = message
+            if "work_date" in attrs and attrs["work_date"] != self.instance.work_date:
+                errors["work_date"] = message
+            if "staff" in attrs and attrs["staff"].id != self.instance.staff_id:
+                errors["staff"] = message
+            if errors:
+                raise serializers.ValidationError(errors)
         return attrs
 
     def create(self, validated_data):

@@ -153,7 +153,7 @@ export function ShiftTimelinePage() {
           <p className="eyebrow">Shift timeline</p>
           <h2>日別・週別シフト</h2>
         </div>
-        <button type="button" disabled={!timelineQuery.data} onClick={print}>
+        <button type="button" disabled={!timelineQuery.data?.rows.length} onClick={print}>
           印刷
         </button>
       </div>

@@ -1,6 +1,6 @@
 import { offsetToLabel } from "../../lib/timeOffsets";
 import { timelineWidth, type TimelineRange } from "../../lib/timeline";
-import { printSlotWidthForRange } from "../../lib/timelinePrint";
+import { chunkRowsForPrint, printSlotWidthForRange } from "../../lib/timelinePrint";
 import type { ShiftTimelineResponse, TimelineAssignment, TimelineSegment } from "../../lib/types";
 import { TimelineRow } from "./TimelineRow";
 import type { CSSProperties } from "react";
@@ -54,14 +54,6 @@ function Header({ range, slotWidth, staffWidth = 180 }: { range: TimelineRange; 
       </div>
     </div>
   );
-}
-
-function chunkRows<T>(rows: T[], rowsPerPage: number): T[][] {
-  const chunks: T[][] = [];
-  for (let index = 0; index < rows.length; index += rowsPerPage) {
-    chunks.push(rows.slice(index, index + rowsPerPage));
-  }
-  return chunks.length ? chunks : [[]];
 }
 
 export function ShiftTimeline({ data, mode, range, slotWidth, staffWidth = 180, onSelect }: Props) {
@@ -119,7 +111,7 @@ export function PrintTimeline({ data, mode, range, printedAt, rowsPerPage }: Pri
   const slotWidth = printSlotWidthForRange(range);
   const dates = mode === "day" ? [data.dates[0]] : data.dates;
   const pages = dates.flatMap((date) =>
-    chunkRows(data.rows, rowsPerPage).map((rows, chunkIndex) => ({ date, rows, chunkIndex })),
+    chunkRowsForPrint(data.rows, date.date, 560, rowsPerPage).map((rows, chunkIndex) => ({ date, rows, chunkIndex })),
   );
   return (
     <div className="print-timeline" aria-label="印刷用タイムライン">

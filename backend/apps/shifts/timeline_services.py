@@ -137,13 +137,13 @@ def build_timeline_response(plan: MonthlyShiftPlan, params) -> dict:
     work_type_id = _parse_uuid_param(params, "work_type")
     work_area_id = _parse_uuid_param(params, "work_area")
 
-    segment_queryset = MonthlyShiftSegment.objects.filter(is_active=True).select_related("work_type")
+    visible_segment_queryset = MonthlyShiftSegment.objects.filter(is_active=True).select_related("work_type")
     if work_type_id:
-        segment_queryset = segment_queryset.filter(work_type_id=work_type_id)
+        visible_segment_queryset = visible_segment_queryset.filter(work_type_id=work_type_id)
     if work_area_id:
-        segment_queryset = segment_queryset.filter(work_area_id=work_area_id)
+        visible_segment_queryset = visible_segment_queryset.filter(work_area_id=work_area_id)
     if not include_breaks:
-        segment_queryset = segment_queryset.filter(work_type_is_break_snapshot=False)
+        visible_segment_queryset = visible_segment_queryset.filter(work_type_is_break_snapshot=False)
 
     assignments = list(
         MonthlyShiftAssignment.objects.filter(
@@ -154,11 +154,22 @@ def build_timeline_response(plan: MonthlyShiftPlan, params) -> dict:
         )
         .select_related("staff")
         .prefetch_related(
-            Prefetch("segments", queryset=segment_queryset.order_by("start_offset_minutes", "display_order"))
+            Prefetch(
+                "segments",
+                queryset=visible_segment_queryset.order_by("start_offset_minutes", "display_order"),
+                to_attr="timeline_segments",
+            ),
+            Prefetch(
+                "segments",
+                queryset=MonthlyShiftSegment.objects.filter(is_active=True)
+                .select_related("work_type")
+                .order_by("start_offset_minutes", "display_order"),
+                to_attr="all_active_segments",
+            ),
         )
         .order_by("work_date", "display_order", "staff__employee_code", "staff__display_name")
     )
-    assignments = [assignment for assignment in assignments if list(assignment.segments.all())]
+    assignments = [assignment for assignment in assignments if assignment.timeline_segments]
     assignment_staff_ids = {assignment.staff_id for assignment in assignments}
 
     staff_ids = set(assignment_staff_ids)
@@ -190,12 +201,13 @@ def build_timeline_response(plan: MonthlyShiftPlan, params) -> dict:
         location=plan.location,
         start_date=start_date,
         end_date=end_date,
+        segments_attr="all_active_segments",
     )
 
     assignments_by_staff_date = {
         (assignment.staff_id, assignment.work_date.isoformat()): assignment for assignment in assignments
     }
-    visible_segments = [segment for assignment in assignments for segment in assignment.segments.all()]
+    visible_segments = [segment for assignment in assignments for segment in assignment.timeline_segments]
     range_data = _display_range(visible_segments)
     legend_seen = set()
     legend = []
@@ -215,7 +227,7 @@ def build_timeline_response(plan: MonthlyShiftPlan, params) -> dict:
             if assignment is None:
                 days[date_key] = {"assignment": None, "segments": []}
                 continue
-            segments = list(assignment.segments.all())
+            segments = list(assignment.timeline_segments)
             lanes = _assign_lanes(segments)
             segment_payloads = []
             for segment in sorted(
@@ -254,7 +266,11 @@ def build_timeline_response(plan: MonthlyShiftPlan, params) -> dict:
                     "source_type": assignment.source_type,
                     "is_customized": assignment.is_customized,
                     "notes": assignment.notes,
-                    "warning_count": monthly_assignment_warning_count(assignment, capability_lookup),
+                    "warning_count": monthly_assignment_warning_count(
+                        assignment,
+                        capability_lookup,
+                        segments_attr="all_active_segments",
+                    ),
                 },
                 "segments": segment_payloads,
             }

@@ -679,9 +679,13 @@ button:disabled {
     padding: 0;
   }
 
-  .print-title {
+  .timeline-page,
+  .timeline-layout {
     display: block;
-    margin-bottom: 12px;
+  }
+
+  .print-title {
+    display: none;
   }
 
   .timeline-scroll {
@@ -696,6 +700,8 @@ button:disabled {
 
   .print-timeline {
     display: block;
+    width: max-content;
+    max-width: 100%;
   }
 
   .timeline-header,

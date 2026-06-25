@@ -10,11 +10,12 @@ import { AuthProvider } from "../features/auth/AuthContext";
 import { addDaysToIsoDate } from "../lib/localDate";
 import { labelToOffset, offsetToLabel } from "../lib/timeOffsets";
 import { clampSegmentToRange, durationToWidth, offsetToPosition, type TimelineRange } from "../lib/timeline";
-import { printSlotWidthForRange } from "../lib/timelinePrint";
+import { chunkRowsForPrint, estimatePrintRowHeight, printSlotWidthForRange } from "../lib/timelinePrint";
 import { MonthlyShiftsPage } from "./MonthlyShiftsPage";
 import { ShiftTimelinePage } from "./ShiftTimelinePage";
 import { ShiftPatternsPage } from "./ShiftPatternsPage";
 import { WeeklyTemplatesPage } from "./WeeklyTemplatesPage";
+import type { ShiftTimelineResponse } from "../lib/types";
 
 const fetchMock = vi.fn();
 vi.stubGlobal("fetch", fetchMock);
@@ -127,7 +128,7 @@ const monthlyMatrix = {
           pattern_short_name: "早",
           start_offset_minutes: 510,
           end_offset_minutes: 1020,
-          source_type: "template",
+          source_type: "template" as const,
           is_customized: false,
           warning_count: 0,
         },
@@ -161,7 +162,7 @@ const shiftTimeline = {
             id: "ma1",
             pattern_name: "早番",
             pattern_short_name: "早",
-            source_type: "template",
+            source_type: "template" as const,
             is_customized: true,
             notes: "note",
             warning_count: 1,
@@ -218,7 +219,7 @@ const assignmentDetail = {
   work_date: "2028-02-01",
   staff: "staff1",
   staff_display_name: "スタッフA",
-  source_type: "template",
+  source_type: "template" as const,
   source_shift_pattern: "p1",
   pattern_name_snapshot: "早番",
   pattern_short_name_snapshot: "早",
@@ -311,6 +312,12 @@ const emptyStaffTimeline = {
   legend: [],
   summary: { staff_count: 1, assignment_count: 0, segment_count: 0, work_minutes: 0, break_minutes: 0 },
 };
+const emptyRowsTimeline = {
+  ...shiftTimeline,
+  rows: [],
+  legend: [],
+  summary: { staff_count: 0, assignment_count: 0, segment_count: 0, work_minutes: 0, break_minutes: 0 },
+};
 const weeklyPrintTimeline = {
   ...shiftTimeline,
   range: { ...shiftTimeline.range, date_to: "2028-02-07", day_count: 7 },
@@ -330,6 +337,26 @@ const weeklyPrintTimeline = {
   })),
   summary: { staff_count: 13, assignment_count: 1, segment_count: 2, work_minutes: 510, break_minutes: 60 },
 };
+const threeLaneDay: ShiftTimelineResponse["rows"][number]["days"][string] = {
+  assignment: shiftTimeline.rows[0].days["2028-02-01"].assignment,
+  segments: [
+    { ...shiftTimeline.rows[0].days["2028-02-01"].segments[0], id: "lane-a", start_offset_minutes: 540, end_offset_minutes: 660, lane: 0, lane_count: 3 },
+    { ...shiftTimeline.rows[0].days["2028-02-01"].segments[0], id: "lane-b", start_offset_minutes: 570, end_offset_minutes: 630, lane: 1, lane_count: 3 },
+    { ...shiftTimeline.rows[0].days["2028-02-01"].segments[0], id: "lane-c", start_offset_minutes: 600, end_offset_minutes: 690, lane: 2, lane_count: 3 },
+  ],
+};
+const highLaneRows: ShiftTimelineResponse["rows"] = Array.from({ length: 13 }, (_, index) => ({
+  staff: `high-${index + 1}`,
+  staff_display_name: `高レーン${index + 1}`,
+  employee_code: `EMP-H${index + 1}`,
+  days: { "2028-02-01": threeLaneDay },
+}));
+const oneLaneRows: ShiftTimelineResponse["rows"] = Array.from({ length: 13 }, (_, index) => ({
+  staff: `one-${index + 1}`,
+  staff_display_name: `1レーン${index + 1}`,
+  employee_code: `EMP-O${index + 1}`,
+  days: { "2028-02-01": { assignment: null, segments: [] } },
+}));
 const patterns = {
   count: 1,
   next: null,
@@ -618,7 +645,7 @@ describe("shift settings pages", () => {
         work_date: "2028-02-01",
         staff: "staff1",
         staff_display_name: "スタッフA",
-        source_type: "template",
+        source_type: "template" as const,
         source_shift_pattern: "p1",
         pattern_name_snapshot: "早番",
         pattern_short_name_snapshot: "早",
@@ -763,6 +790,7 @@ describe("shift settings pages", () => {
     expect(within(document.querySelector(".screen-timeline") as HTMLElement).queryByRole("button", { name: /休憩/ })).not.toBeInTheDocument();
     await userEvent.click(await findScreenTimelineButton(/ジム業務/));
     expect(await screen.findByText("休憩備考")).toBeInTheDocument();
+    expect(screen.getByText("1件")).toBeInTheDocument();
     expect(screen.getByText("全体備考")).toBeInTheDocument();
     expect(screen.getByText("60分")).toBeInTheDocument();
     expect(screen.queryByText("無効")).not.toBeInTheDocument();
@@ -788,6 +816,7 @@ describe("shift settings pages", () => {
     await userEvent.click(screen.getByLabelText("勤務ありのみ"));
     expect(await within(document.querySelector(".screen-timeline") as HTMLElement).findByText("空スタッフ")).toBeInTheDocument();
     expect(screen.queryByText("表示できるスタッフがいません。")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "印刷" })).not.toBeDisabled();
 
     await userEvent.selectOptions(screen.getByLabelText("WorkType"), "w1");
     await userEvent.selectOptions(screen.getByLabelText("WorkArea"), "a1");
@@ -810,11 +839,56 @@ describe("shift settings pages", () => {
     expect(await screen.findByText("2日（水）")).toBeInTheDocument();
     const pages = Array.from(document.querySelectorAll("[data-testid='print-page']"));
     expect(pages).toHaveLength(14);
+    expect(pages.every((page) => page.querySelector(".timeline-header"))).toBe(true);
     expect(document.querySelector(".print-timeline")?.textContent).toContain("2028-02-02（水）");
     expect(pages.at(-1)).toHaveClass("print-page-last");
     expect(pages.slice(0, -1).every((page) => !page.classList.contains("print-page-last"))).toBe(true);
     expect(printSlotWidthForRange({ start: 0, end: 2880 } satisfies TimelineRange)).toBeLessThanOrEqual(4.17);
     expect(printSlotWidthForRange({ start: 0, end: 2880 } satisfies TimelineRange)).toBeGreaterThanOrEqual(3);
+    expect(document.querySelector(".timeline-layout .print-timeline")).toBeInTheDocument();
+    expect(document.querySelector(".print-title")).toBeInTheDocument();
+  });
+
+  it("chunks print rows by estimated lane height and keeps staff order per date", () => {
+    const oneLaneChunks = chunkRowsForPrint(oneLaneRows, "2028-02-01");
+    const highLaneChunks = chunkRowsForPrint(highLaneRows, "2028-02-01");
+    expect(oneLaneChunks.map((chunk) => chunk.length)).toEqual([12, 1]);
+    expect(highLaneChunks[0].length).toBeLessThan(oneLaneChunks[0].length);
+    expect(estimatePrintRowHeight(highLaneRows[0], "2028-02-01")).toBe(96);
+    expect(highLaneChunks.flat().map((row) => row.staff)).toEqual(highLaneRows.map((row) => row.staff));
+
+    const weekRows = weeklyPrintTimeline.rows;
+    const firstDateChunks = chunkRowsForPrint(weekRows, "2028-02-01");
+    const secondDateChunks = chunkRowsForPrint(weekRows, "2028-02-02");
+    expect(firstDateChunks.flat().map((row) => row.staff)).toEqual(weekRows.map((row) => row.staff));
+    expect(secondDateChunks.flat().map((row) => row.staff)).toEqual(weekRows.map((row) => row.staff));
+    expect(firstDateChunks).not.toBe(secondDateChunks);
+  });
+
+  it("disables print for zero rows but allows staff rows without assignments", async () => {
+    mockAuthAndApi(["shift_manager"], {
+      "/api/v1/monthly-shift-plans/m1/timeline/": emptyRowsTimeline,
+      "/api/v1/monthly-shift-plans/": { count: 1, next: null, previous: null, results: [monthlyPlan] },
+      "/api/v1/locations/": locations,
+      "/api/v1/work-types/": workTypes,
+      "/api/v1/work-areas/": workAreas,
+    });
+    renderWithAuth(<ShiftTimelinePage />);
+    expect(await screen.findByText("表示できるスタッフがいません。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "印刷" })).toBeDisabled();
+
+    cleanup();
+    fetchMock.mockReset();
+    mockAuthAndApi(["shift_manager"], {
+      "/api/v1/monthly-shift-plans/m1/timeline/": emptyStaffTimeline,
+      "/api/v1/monthly-shift-plans/": { count: 1, next: null, previous: null, results: [monthlyPlan] },
+      "/api/v1/locations/": locations,
+      "/api/v1/work-types/": workTypes,
+      "/api/v1/work-areas/": workAreas,
+    });
+    renderWithAuth(<ShiftTimelinePage />);
+    expect((await screen.findAllByText("空スタッフ")).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "印刷" })).not.toBeDisabled();
   });
 
   it("shows API-specific timeline errors without masking plan failures", async () => {
@@ -904,7 +978,7 @@ describe("shift settings pages", () => {
         work_date: "2028-02-02",
         staff: "staff1",
         staff_display_name: "スタッフA",
-        source_type: "manual",
+        source_type: "manual" as const,
         source_shift_pattern: "p1",
         pattern_name_snapshot: "早番",
         pattern_short_name_snapshot: "早",

@@ -668,11 +668,17 @@ def build_capability_lookup(
     location: Location,
     start_date: date,
     end_date: date,
+    segments_attr: str | None = None,
 ) -> dict[tuple[str, str], list[StaffCapability]]:
+    def assignment_segments(assignment: MonthlyShiftAssignment):
+        if segments_attr:
+            return getattr(assignment, segments_attr, [])
+        return assignment.segments.all()
+
     required_pairs = {
         (item.staff_id, segment.work_type_id)
         for item in assignments
-        for segment in item.segments.all()
+        for segment in assignment_segments(item)
         if segment.is_active and segment.work_type.requires_capability
     }
     if not required_pairs:
@@ -723,10 +729,13 @@ def active_capability_from_lookup(
 def monthly_assignment_warning_count(
     assignment: MonthlyShiftAssignment,
     capability_lookup: dict[tuple[str, str], list[StaffCapability]],
+    *,
+    segments_attr: str | None = None,
 ) -> int:
     warning_levels = {StaffCapability.Level.ASSISTED, StaffCapability.Level.TRAINEE}
     warning_count = 0
-    for segment in assignment.segments.all():
+    segments = getattr(assignment, segments_attr, []) if segments_attr else assignment.segments.all()
+    for segment in segments:
         if not segment.is_active or not segment.work_type.requires_capability:
             continue
         capability = active_capability_from_lookup(

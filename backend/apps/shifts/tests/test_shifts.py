@@ -1,3 +1,4 @@
+import uuid
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
@@ -8,6 +9,7 @@ from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
+from apps.accounts.constants import ROLE_STAFF
 from apps.accounts.models import User
 from apps.accounts.test_accounts import BaseAPITestCase
 from apps.common.models import AuditEvent
@@ -613,6 +615,31 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
                 403,
             )
 
+    def test_timeline_uuid_filters_validate_and_return_empty_for_missing_or_other_location(self):
+        plan = self.create_plan()
+        self.create_assignment_record(plan, work_date="2026-07-01")
+        client = self.force_client(self.system_admin)
+        url = f"/api/v1/monthly-shift-plans/{plan.id}/timeline/?date_from=2026-07-01&date_to=2026-07-01"
+
+        invalid_work_type = client.get(f"{url}&work_type=bad-id")
+        self.assertEqual(invalid_work_type.status_code, 400)
+        self.assertIn("work_type", invalid_work_type.data)
+        invalid_work_area = client.get(f"{url}&work_area=bad-id")
+        self.assertEqual(invalid_work_area.status_code, 400)
+        self.assertIn("work_area", invalid_work_area.data)
+
+        missing_work_type = client.get(f"{url}&work_type={uuid.uuid4()}")
+        self.assertEqual(missing_work_type.status_code, 200, missing_work_type.data)
+        self.assertEqual(missing_work_type.data["summary"]["segment_count"], 0)
+        missing_work_area = client.get(f"{url}&work_area={uuid.uuid4()}")
+        self.assertEqual(missing_work_area.status_code, 200, missing_work_area.data)
+        self.assertEqual(missing_work_area.data["summary"]["segment_count"], 0)
+
+        other_location_area = WorkArea.objects.filter(location=Location.objects.get(code="findfits")).first()
+        response = client.get(f"{url}&work_area={other_location_area.id}")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["summary"]["segment_count"], 0)
+
     def test_timeline_snapshots_filters_lanes_summary_and_warnings(self):
         plan = self.create_plan()
         assignment = self.create_assignment_record(
@@ -683,6 +710,51 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         self.assertEqual(filtered_segments[0]["work_type"], str(self.front_work.id))
         self.assertEqual(filtered.data["legend"][0]["name"], "Snapshot Front")
 
+    def test_timeline_lanes_reuse_touching_boundaries_and_overlap_three_segments(self):
+        plan = self.create_plan()
+        assignment = self.create_assignment_record(
+            plan,
+            work_date="2026-07-01",
+            start_offset_minutes=540,
+            end_offset_minutes=600,
+            display_order=10,
+        )
+        MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=self.front_work,
+            work_area=self.front_area,
+            work_type_name_snapshot=self.front_work.name,
+            work_type_short_name_snapshot=self.front_work.short_name,
+            work_type_color_key_snapshot=self.front_work.color_key,
+            work_type_is_break_snapshot=self.front_work.is_break,
+            work_area_name_snapshot=self.front_area.name,
+            start_offset_minutes=570,
+            end_offset_minutes=630,
+            display_order=20,
+        )
+        MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=self.gym_work,
+            work_area=self.gym_area,
+            work_type_name_snapshot=self.gym_work.name,
+            work_type_short_name_snapshot=self.gym_work.short_name,
+            work_type_color_key_snapshot=self.gym_work.color_key,
+            work_type_is_break_snapshot=self.gym_work.is_break,
+            work_area_name_snapshot=self.gym_area.name,
+            start_offset_minutes=600,
+            end_offset_minutes=660,
+            display_order=30,
+        )
+
+        response = self.force_client(self.system_admin).get(
+            f"/api/v1/monthly-shift-plans/{plan.id}/timeline/?date_from=2026-07-01&date_to=2026-07-01"
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        segments = response.data["rows"][0]["days"]["2026-07-01"]["segments"]
+        lanes_by_start = {segment["start_offset_minutes"]: segment["lane"] for segment in segments}
+        self.assertEqual(lanes_by_start, {540: 0, 570: 1, 600: 0})
+        self.assertEqual({segment["lane_count"] for segment in segments}, {2})
+
     def test_timeline_assigned_only_false_staff_search_and_query_count(self):
         plan = self.create_plan()
         self.create_assignment_record(plan, work_date="2026-07-01")
@@ -713,8 +785,17 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         self.assertEqual(searched.data["summary"]["staff_count"], 1)
 
         large_plan = self.create_plan(month=8)
-        for day in range(1, 29):
-            self.create_assignment_record(large_plan, work_date=f"2026-08-{day:02d}")
+        large_staff = [self.create_user(f"timeline_staff_{index}", ROLE_STAFF) for index in range(8)]
+        for staff in large_staff:
+            StaffLocation.objects.create(
+                staff=staff,
+                location=self.location,
+                is_primary=False,
+                valid_from="2026-08-01",
+                valid_until=None,
+            )
+            for day in range(1, 8):
+                self.create_assignment_record(large_plan, staff=staff, work_date=f"2026-08-{day:02d}")
         with CaptureQueriesContext(connection) as small_queries:
             small = client.get(
                 f"/api/v1/monthly-shift-plans/{plan.id}/timeline/?date_from=2026-07-01&date_to=2026-07-01"
@@ -725,6 +806,8 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
                 f"/api/v1/monthly-shift-plans/{large_plan.id}/timeline/?date_from=2026-08-01&date_to=2026-08-07"
             )
         self.assertEqual(large.status_code, 200, large.data)
+        self.assertEqual(large.data["summary"]["assignment_count"], 56)
+        self.assertEqual(large.data["summary"]["staff_count"], 8)
         self.assertLessEqual(len(large_queries) - len(small_queries), 3)
 
     def test_plan_permissions_immutability_deactivate_and_reactivate_conflict(self):

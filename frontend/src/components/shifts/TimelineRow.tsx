@@ -16,10 +16,11 @@ type Props = {
   date: string;
   range: TimelineRange;
   slotWidth: number;
+  staffWidth?: number;
   onSelect: (selection: Selection) => void;
 };
 
-export function TimelineRow({ row, date, range, slotWidth, onSelect }: Props) {
+export function TimelineRow({ row, date, range, slotWidth, staffWidth = 180, onSelect }: Props) {
   const day = row.days[date] ?? { assignment: null, segments: [] };
   const assignment = day.assignment;
   const laneCount = Math.max(1, ...day.segments.map((segment) => segment.lane_count));
@@ -30,10 +31,14 @@ export function TimelineRow({ row, date, range, slotWidth, onSelect }: Props) {
     "--timeline-hour": `${slotWidth * 4}px`,
   } as CSSProperties;
   return (
-    <div className="timeline-row" style={{ minWidth: timelineWidth(range, slotWidth) + 180 }}>
+    <div
+      className="timeline-row"
+      style={{ minWidth: timelineWidth(range, slotWidth) + staffWidth, gridTemplateColumns: `${staffWidth}px 1fr` }}
+    >
       <button
         type="button"
         className="timeline-staff"
+        style={{ width: staffWidth }}
         onClick={() =>
           onSelect({
             staffId: row.staff,

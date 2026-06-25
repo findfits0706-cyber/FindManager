@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from uuid import UUID
 
 from django.db.models import Prefetch, Q
 from rest_framework.serializers import ValidationError
@@ -33,6 +34,16 @@ def _parse_bool_param(params, name: str, default: bool) -> bool:
     if value == "false":
         return False
     raise ValidationError({name: "Use true or false."})
+
+
+def _parse_uuid_param(params, name: str) -> str | None:
+    value = params.get(name)
+    if not value:
+        return None
+    try:
+        return str(UUID(value))
+    except ValueError as exc:
+        raise ValidationError({name: "Invalid UUID."}) from exc
 
 
 def _timeline_dates(plan: MonthlyShiftPlan, params) -> list[date]:
@@ -123,8 +134,8 @@ def build_timeline_response(plan: MonthlyShiftPlan, params) -> dict:
     staff_search = params.get("staff_search", "").strip()
     assigned_only = _parse_bool_param(params, "assigned_only", True)
     include_breaks = _parse_bool_param(params, "include_breaks", True)
-    work_type_id = params.get("work_type") or None
-    work_area_id = params.get("work_area") or None
+    work_type_id = _parse_uuid_param(params, "work_type")
+    work_area_id = _parse_uuid_param(params, "work_area")
 
     segment_queryset = MonthlyShiftSegment.objects.filter(is_active=True).select_related("work_type")
     if work_type_id:

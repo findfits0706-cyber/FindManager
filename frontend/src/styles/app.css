@@ -609,6 +609,20 @@ button:disabled {
   display: none;
 }
 
+.print-timeline {
+  display: none;
+}
+
+.screen-timeline {
+  display: block;
+}
+
+.print-page-header {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
 @media (max-width: 768px) {
   .layout {
     grid-template-columns: 1fr;
@@ -640,6 +654,11 @@ button:disabled {
 }
 
 @media print {
+  @page {
+    size: A4 landscape;
+    margin: 8mm;
+  }
+
   body {
     background: white;
   }
@@ -671,6 +690,14 @@ button:disabled {
     border: 0;
   }
 
+  .screen-timeline {
+    display: none !important;
+  }
+
+  .print-timeline {
+    display: block;
+  }
+
   .timeline-header,
   .timeline-staff,
   .timeline-day-section h3 {
@@ -678,13 +705,29 @@ button:disabled {
   }
 
   .timeline-day-section {
-    break-after: page;
+    break-inside: auto;
   }
 
   .timeline-row,
   .timeline-segment,
-  .legend-item {
+  .legend-item,
+  .print-page {
     break-inside: avoid;
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+
+  .print-page {
+    break-after: page;
+    overflow: visible;
+  }
+
+  .print-page-last {
+    break-after: auto;
+  }
+
+  .timeline-track,
+  .timeline-hours {
     print-color-adjust: exact;
     -webkit-print-color-adjust: exact;
   }

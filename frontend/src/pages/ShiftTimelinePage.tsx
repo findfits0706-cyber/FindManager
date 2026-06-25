@@ -3,22 +3,21 @@ import { useEffect, useMemo, useState } from "react";
 import { Navigate } from "react-router-dom";
 import { api } from "../api/client";
 import { ShiftDetailPanel, type TimelineSelection } from "../components/shifts/ShiftDetailPanel";
-import { ShiftTimeline } from "../components/shifts/ShiftTimeline";
+import { PrintTimeline, ShiftTimeline } from "../components/shifts/ShiftTimeline";
 import { useAuth } from "../features/auth/AuthContext";
+import { addDaysToIsoDate, formatLocalDateTime, formatLocalIsoDate, yearMonthFromIsoDate } from "../lib/localDate";
 import { offsetToLabel } from "../lib/timeOffsets";
-import type { Location, MonthlyShiftPlan, Paginated, ShiftTimelineResponse, WorkArea, WorkType } from "../lib/types";
+import type {
+  Location,
+  MonthlyShiftAssignment,
+  MonthlyShiftPlan,
+  Paginated,
+  ShiftTimelineResponse,
+  WorkArea,
+  WorkType,
+} from "../lib/types";
 
 const today = new Date();
-const isoDate = (date: Date) => date.toISOString().slice(0, 10);
-const addDays = (value: string, days: number) => {
-  const date = new Date(`${value}T00:00:00`);
-  date.setDate(date.getDate() + days);
-  return isoDate(date);
-};
-const currentMonth = (value: string) => {
-  const date = new Date(`${value}T00:00:00`);
-  return { year: date.getFullYear(), month: date.getMonth() + 1 };
-};
 
 export function ShiftTimelinePage() {
   const { user } = useAuth();
@@ -27,8 +26,8 @@ export function ShiftTimelinePage() {
   const canView = canManage || roles.includes("supervisor");
   const [location, setLocation] = useState("");
   const [mode, setMode] = useState<"day" | "week">("day");
-  const [anchorDate, setAnchorDate] = useState(isoDate(today));
-  const [{ year, month }, setYearMonth] = useState(currentMonth(isoDate(today)));
+  const [anchorDate, setAnchorDate] = useState(formatLocalIsoDate(today));
+  const [{ year, month }, setYearMonth] = useState(yearMonthFromIsoDate(formatLocalIsoDate(today)));
   const [staffSearch, setStaffSearch] = useState("");
   const [assignedOnly, setAssignedOnly] = useState(true);
   const [workType, setWorkType] = useState("");
@@ -37,6 +36,7 @@ export function ShiftTimelinePage() {
   const [rangeMode, setRangeMode] = useState<"auto" | "business" | "full" | "next">("auto");
   const [zoom, setZoom] = useState<"compact" | "normal" | "wide">("normal");
   const [selection, setSelection] = useState<TimelineSelection | null>(null);
+  const [printedAt, setPrintedAt] = useState("");
 
   const locationQuery = useQuery({
     enabled: canView,
@@ -58,7 +58,7 @@ export function ShiftTimelinePage() {
   const plan = planQuery.data?.results[0] ?? null;
 
   const dateFrom = anchorDate;
-  const dateTo = mode === "day" ? anchorDate : addDays(anchorDate, 6);
+  const dateTo = mode === "day" ? anchorDate : addDaysToIsoDate(anchorDate, 6);
   const timelineQuery = useQuery({
     enabled: canView && Boolean(plan),
     queryKey: ["shift-timeline", plan?.id, dateFrom, dateTo, staffSearch, assignedOnly, workType, workArea, includeBreaks],
@@ -85,8 +85,17 @@ export function ShiftTimelinePage() {
     queryKey: ["work-areas", "timeline", location],
     queryFn: () => api<Paginated<WorkArea>>(`/api/v1/work-areas/?page_size=100&is_active=true&location=${location}`),
   });
+  const selectedAssignmentId = selection?.assignment?.id ?? "";
+  const assignmentDetailQuery = useQuery({
+    enabled: Boolean(selectedAssignmentId),
+    queryKey: ["monthly-shift-assignment-detail", selectedAssignmentId],
+    queryFn: () => api<MonthlyShiftAssignment>(`/api/v1/monthly-shift-assignments/${selectedAssignmentId}/`),
+  });
 
   const slotWidth = zoom === "compact" ? 8 : zoom === "wide" ? 16 : 12;
+  useEffect(() => {
+    setSelection(null);
+  }, [plan?.id, dateFrom, dateTo, mode, staffSearch, assignedOnly, workType, workArea, includeBreaks, location]);
   useEffect(() => {
     if (!selection) return undefined;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -108,15 +117,24 @@ export function ShiftTimelinePage() {
   if (!canView) return <Navigate to="/403" replace />;
 
   const move = (days: number) => {
-    const next = addDays(anchorDate, days);
+    const next = addDaysToIsoDate(anchorDate, days);
     setAnchorDate(next);
-    setYearMonth(currentMonth(next));
+    setYearMonth(yearMonthFromIsoDate(next));
     setSelection(null);
   };
   const setToday = () => {
-    const next = isoDate(new Date());
+    const next = formatLocalIsoDate(new Date());
     setAnchorDate(next);
-    setYearMonth(currentMonth(next));
+    setYearMonth(yearMonthFromIsoDate(next));
+  };
+  const print = () => {
+    setPrintedAt(formatLocalDateTime(new Date()));
+    const runPrint = () => window.print();
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(runPrint);
+      return;
+    }
+    window.setTimeout(runPrint, 0);
   };
 
   return (
@@ -127,6 +145,7 @@ export function ShiftTimelinePage() {
           {timelineQuery.data?.plan.location_name ?? ""} / {timelineQuery.data?.range.date_from ?? dateFrom}
           {mode === "week" ? `-${timelineQuery.data?.range.date_to ?? dateTo}` : ""} / {mode === "day" ? "日別" : "週別"} /{" "}
           {offsetToLabel(range.start)}-{offsetToLabel(range.end)}
+          {printedAt ? ` / 印刷日時：${printedAt}` : ""}
         </p>
       </div>
       <div className="section-header no-print">
@@ -134,14 +153,21 @@ export function ShiftTimelinePage() {
           <p className="eyebrow">Shift timeline</p>
           <h2>日別・週別シフト</h2>
         </div>
-        <button type="button" onClick={() => window.print()}>
+        <button type="button" disabled={!timelineQuery.data} onClick={print}>
           印刷
         </button>
       </div>
       <div className="timeline-controls field-grid no-print">
         <label>
           拠点
-          <select value={location} onChange={(event) => setLocation(event.target.value)}>
+          <select
+            value={location}
+            onChange={(event) => {
+              setLocation(event.target.value);
+              setWorkType("");
+              setWorkArea("");
+            }}
+          >
             <option value="">選択してください</option>
             {locationQuery.data?.results.map((item) => (
               <option key={item.id} value={item.id}>
@@ -157,7 +183,7 @@ export function ShiftTimelinePage() {
             value={anchorDate}
             onChange={(event) => {
               setAnchorDate(event.target.value);
-              setYearMonth(currentMonth(event.target.value));
+              setYearMonth(yearMonthFromIsoDate(event.target.value));
             }}
           />
         </label>
@@ -229,15 +255,33 @@ export function ShiftTimelinePage() {
           </select>
         </label>
       </div>
-      {!plan && !planQuery.isLoading ? <p className="empty-state">対象月の月間シフトがありません。</p> : null}
+      {locationQuery.isError ? <p className="error">Location APIの取得に失敗しました。</p> : null}
+      {planQuery.isError ? <p className="error">Plan APIの取得に失敗しました。</p> : null}
+      {workTypeQuery.isError ? <p className="error">WorkType APIの取得に失敗しました。</p> : null}
+      {workAreaQuery.isError ? <p className="error">WorkArea APIの取得に失敗しました。</p> : null}
+      {!plan && !planQuery.isLoading && !planQuery.isError ? <p className="empty-state">対象月の月間シフトがありません。</p> : null}
       {timelineQuery.isLoading ? <p>読み込み中...</p> : null}
       {timelineQuery.isError ? <p className="error">Timeline APIの取得に失敗しました。</p> : null}
       <div className="timeline-layout">
-        <div className="timeline-scroll">
+        <div className="timeline-scroll screen-timeline">
           {timelineQuery.data ? <ShiftTimeline data={timelineQuery.data} mode={mode} range={range} slotWidth={slotWidth} onSelect={setSelection} /> : null}
         </div>
-        {timelineQuery.data ? <ShiftDetailPanel plan={timelineQuery.data.plan} selection={selection} canManage={canManage} onClose={() => setSelection(null)} /> : null}
+        {timelineQuery.data ? (
+          <PrintTimeline data={timelineQuery.data} mode={mode} range={range} printedAt={printedAt} rowsPerPage={12} />
+        ) : null}
+        {timelineQuery.data ? (
+          <ShiftDetailPanel
+            plan={timelineQuery.data.plan}
+            selection={selection}
+            assignmentDetail={assignmentDetailQuery.data ?? null}
+            isLoading={assignmentDetailQuery.isLoading}
+            isError={assignmentDetailQuery.isError}
+            canManage={canManage}
+            onClose={() => setSelection(null)}
+          />
+        ) : null}
       </div>
+      {assignmentDetailQuery.isError ? <p className="error">Assignment詳細APIの取得に失敗しました。</p> : null}
       {timelineQuery.data?.legend.length ? (
         <div className="timeline-legend">
           {timelineQuery.data.legend.map((item) => (

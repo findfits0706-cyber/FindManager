@@ -67,3 +67,16 @@ Phase 3 adds the `shifts` app with reusable shift settings:
 - Shift setting screens at `/shifts/patterns` and `/shifts/templates`
 
 Shift segment times are stored as minutes from local midnight in 15-minute increments. Values may extend into the next day up to 2880 minutes, for example `1470` means `翌00:30`.
+
+## Phase 4 Scope
+
+Phase 4 adds dated monthly shift planning:
+
+- Monthly shift plans by location, year, and month
+- Template generation preview and apply APIs
+- Staff-by-date monthly matrix API
+- Manual assignment creation from shift patterns
+- Assignment segment editing with soft-deactivated history
+- StaffLocation and StaffCapability validation on concrete work dates
+- Snapshot fields so existing monthly shifts keep their display values after master/template changes
+- Monthly shift screen at `/shifts/monthly`

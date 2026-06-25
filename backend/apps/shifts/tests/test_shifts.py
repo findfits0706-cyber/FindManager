@@ -2,16 +2,27 @@ from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
+from django.db import IntegrityError, connection
 from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from apps.accounts.models import User
 from apps.accounts.test_accounts import BaseAPITestCase
 from apps.common.models import AuditEvent
-from apps.operations.models import Location, WorkArea, WorkType, WorkTypeAvailability
+from apps.operations.models import Location, StaffCapability, StaffLocation, WorkArea, WorkType, WorkTypeAvailability
 from apps.operations.services import seed_operations
 
-from ..models import ShiftPattern, ShiftPatternSegment, WeeklyShiftTemplate, WeeklyShiftTemplateEntry
+from ..models import (
+    MonthlyShiftAssignment,
+    MonthlyShiftPlan,
+    MonthlyShiftSegment,
+    ShiftPattern,
+    ShiftPatternSegment,
+    WeeklyShiftTemplate,
+    WeeklyShiftTemplateEntry,
+)
 from ..services import seed_shifts
 
 
@@ -29,7 +40,9 @@ class ShiftsBaseTestCase(BaseAPITestCase):
         seed_shifts(self.dev_users)
         self.location = Location.objects.get(code="main")
         self.gym_area = WorkArea.objects.get(location=self.location, code="gym")
+        self.front_area = WorkArea.objects.get(location=self.location, code="front")
         self.gym_work = WorkType.objects.get(code="gym_duty")
+        self.front_work = WorkType.objects.get(code="front_duty")
         self.break_work = WorkType.objects.get(code="break")
 
     def pattern_payload(self, code="api_pattern"):
@@ -503,6 +516,749 @@ class TestWeeklyTemplateApi(ShiftsBaseTestCase):
             )
         self.assertGreaterEqual(response.status_code, 500)
         self.assertFalse(WeeklyShiftTemplate.objects.filter(code="audit_week").exists())
+
+
+class TestMonthlyShiftApi(ShiftsBaseTestCase):
+    def plan_payload(self, year=2026, month=7, suffix=""):
+        return {
+            "location": str(self.location.id),
+            "year": year,
+            "month": month,
+            "name": f"{year}年{month}月 本館シフト{suffix}",
+            "notes": "",
+        }
+
+    def create_plan(self, year=2026, month=7):
+        return MonthlyShiftPlan.objects.create(
+            location=self.location,
+            year=year,
+            month=month,
+            name=f"{year}年{month}月 本館シフト",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+
+    def assignment_payload(self, plan, staff=None, work_date="2026-07-01", pattern_code="gym_early"):
+        return {
+            "monthly_shift_plan": str(plan.id),
+            "work_date": work_date,
+            "staff": str((staff or self.staff).id),
+            "shift_pattern": str(ShiftPattern.objects.get(code=pattern_code).id),
+            "notes": "",
+        }
+
+    def create_assignment_record(
+        self,
+        plan,
+        *,
+        staff=None,
+        work_date="2026-07-01",
+        work_type=None,
+        work_area=None,
+        pattern_code="gym_early",
+    ):
+        pattern = ShiftPattern.objects.get(code=pattern_code)
+        work_type = work_type or self.gym_work
+        work_area = work_area or self.gym_area
+        assignment = MonthlyShiftAssignment.objects.create(
+            monthly_shift_plan=plan,
+            work_date=work_date,
+            staff=staff or self.staff,
+            source_shift_pattern=pattern,
+            pattern_code_snapshot=pattern.code,
+            pattern_name_snapshot=pattern.name,
+            pattern_short_name_snapshot=pattern.short_name,
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=work_type,
+            work_area=work_area,
+            work_type_name_snapshot=work_type.name,
+            work_type_short_name_snapshot=work_type.short_name,
+            work_type_color_key_snapshot=work_type.color_key,
+            work_type_is_break_snapshot=work_type.is_break,
+            work_area_name_snapshot=work_area.name if work_area else "",
+            start_offset_minutes=540,
+            end_offset_minutes=600,
+        )
+        return assignment
+
+    def test_plan_permissions_immutability_deactivate_and_reactivate_conflict(self):
+        admin = self.force_client(self.system_admin)
+        response = admin.post("/api/v1/monthly-shift-plans/", self.plan_payload(), format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(
+            self.force_client(self.shift_manager)
+            .post("/api/v1/monthly-shift-plans/", self.plan_payload(month=8), format="json")
+            .status_code,
+            201,
+        )
+        plan = MonthlyShiftPlan.objects.get(year=2026, month=7)
+        supervisor_response = self.force_client(self.supervisor).post(
+            "/api/v1/monthly-shift-plans/",
+            self.plan_payload(month=9),
+            format="json",
+        )
+        self.assertEqual(supervisor_response.status_code, 403)
+        self.assertEqual(self.force_client(self.staff).get("/api/v1/monthly-shift-plans/").status_code, 403)
+        self.assertEqual(
+            admin.patch(f"/api/v1/monthly-shift-plans/{plan.id}/", {"month": 9}, format="json").status_code, 400
+        )
+        self.assertEqual(admin.delete(f"/api/v1/monthly-shift-plans/{plan.id}/").status_code, 405)
+        self.assertEqual(
+            admin.post(f"/api/v1/monthly-shift-plans/{plan.id}/deactivate/", {}, format="json").status_code, 200
+        )
+        MonthlyShiftPlan.objects.create(
+            location=self.location,
+            year=2026,
+            month=7,
+            name="Replacement",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        self.assertEqual(
+            admin.post(f"/api/v1/monthly-shift-plans/{plan.id}/reactivate/", {}, format="json").status_code, 400
+        )
+        self.assertTrue(AuditEvent.objects.filter(event_type="monthly_shift_plan_created").exists())
+
+    def test_plan_list_counts_do_not_add_queries_per_plan(self):
+        client = self.force_client(self.system_admin)
+        first_plan = self.create_plan()
+        self.create_assignment_record(first_plan, staff=self.staff, work_date="2026-07-01")
+        self.create_assignment_record(first_plan, staff=self.shift_manager, work_date="2026-07-02")
+        inactive = self.create_assignment_record(first_plan, staff=self.staff, work_date="2026-07-03")
+        inactive.is_active = False
+        inactive.save(update_fields=["is_active", "updated_at"])
+
+        with CaptureQueriesContext(connection) as single_plan_queries:
+            response = client.get("/api/v1/monthly-shift-plans/?page_size=100")
+        self.assertEqual(response.status_code, 200, response.data)
+        first_result = next(item for item in response.data["results"] if item["id"] == str(first_plan.id))
+        self.assertEqual(first_result["assignment_count"], 2)
+        self.assertEqual(first_result["staff_count"], 2)
+
+        for month in range(8, 13):
+            plan = self.create_plan(month=month)
+            self.create_assignment_record(plan, staff=self.staff, work_date=f"2026-{month:02d}-01")
+        with CaptureQueriesContext(connection) as many_plan_queries:
+            many_response = client.get("/api/v1/monthly-shift-plans/?page_size=100")
+        self.assertEqual(many_response.status_code, 200, many_response.data)
+        self.assertLessEqual(len(many_plan_queries) - len(single_plan_queries), 2)
+        first_result = next(item for item in many_response.data["results"] if item["id"] == str(first_plan.id))
+        self.assertEqual(first_result["assignment_count"], 2)
+        self.assertEqual(first_result["staff_count"], 2)
+
+    def test_matrix_capability_query_count_does_not_grow_per_assignment(self):
+        client = self.force_client(self.system_admin)
+        self.gym_work.requires_capability = True
+        self.gym_work.save(update_fields=["requires_capability", "updated_at"])
+        StaffCapability.objects.update_or_create(
+            staff=self.staff,
+            work_type=self.gym_work,
+            location=self.location,
+            valid_from="2026-01-01",
+            valid_until=None,
+            defaults={
+                "level": StaffCapability.Level.ASSISTED,
+                "approved_by": self.system_admin,
+                "approved_at": timezone.now(),
+            },
+        )
+        small_plan = self.create_plan(month=7)
+        self.create_assignment_record(small_plan, work_date="2026-07-01", work_type=self.gym_work)
+        large_plan = self.create_plan(month=8)
+        for day in range(1, 16):
+            self.create_assignment_record(
+                large_plan,
+                work_date=f"2026-08-{day:02d}",
+                work_type=self.gym_work,
+            )
+
+        with CaptureQueriesContext(connection) as small_queries:
+            small_response = client.get(f"/api/v1/monthly-shift-plans/{small_plan.id}/matrix/?assigned_only=true")
+        self.assertEqual(small_response.status_code, 200, small_response.data)
+        with CaptureQueriesContext(connection) as large_queries:
+            large_response = client.get(f"/api/v1/monthly-shift-plans/{large_plan.id}/matrix/?assigned_only=true")
+        self.assertEqual(large_response.status_code, 200, large_response.data)
+        self.assertLessEqual(len(large_queries) - len(small_queries), 2)
+        warning_counts = [
+            assignment["warning_count"]
+            for row in large_response.data["rows"]
+            for assignment in row["assignments"].values()
+        ]
+        self.assertTrue(warning_counts)
+        self.assertTrue(all(count == 1 for count in warning_counts))
+
+    def test_duplicate_error_messages_are_scoped_by_resource(self):
+        client = self.force_client(self.system_admin)
+        plan = self.create_plan()
+        created = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan),
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        duplicate_assignment = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan),
+            format="json",
+        )
+        self.assertEqual(duplicate_assignment.status_code, 400)
+        self.assertIn("同じスタッフ・日付", str(duplicate_assignment.data))
+
+        duplicate_plan = client.post("/api/v1/monthly-shift-plans/", self.plan_payload(), format="json")
+        self.assertEqual(duplicate_plan.status_code, 400)
+        self.assertIn("同じ拠点・年月", str(duplicate_plan.data))
+
+        duplicate_pattern = client.post(
+            "/api/v1/shift-patterns/",
+            self.pattern_payload(code="gym_early"),
+            format="json",
+        )
+        self.assertEqual(duplicate_pattern.status_code, 400)
+        self.assertNotIn("同じスタッフ・日付", str(duplicate_pattern.data))
+
+        duplicate_template = client.post(
+            "/api/v1/weekly-shift-templates/",
+            {"location": str(self.location.id), "code": "standard_week", "name": "Dup", "entries": []},
+            format="json",
+        )
+        self.assertEqual(duplicate_template.status_code, 400)
+        self.assertNotIn("同じスタッフ・日付", str(duplicate_template.data))
+
+    def test_assignment_pattern_copy_snapshots_validation_warnings_and_segment_history(self):
+        client = self.force_client(self.system_admin)
+        plan = self.create_plan()
+        created = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan, staff=self.staff),
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        assignment = MonthlyShiftAssignment.objects.get(id=created.data["id"])
+        self.assertEqual(assignment.source_type, "manual")
+        self.assertEqual(assignment.pattern_short_name_snapshot, "早番")
+        first_segment = assignment.segments.filter(is_active=True).first()
+        old_snapshots = {
+            "work_type_name_snapshot": first_segment.work_type_name_snapshot,
+            "work_type_short_name_snapshot": first_segment.work_type_short_name_snapshot,
+            "work_type_color_key_snapshot": first_segment.work_type_color_key_snapshot,
+            "work_type_is_break_snapshot": first_segment.work_type_is_break_snapshot,
+            "work_area_name_snapshot": first_segment.work_area_name_snapshot,
+        }
+        first_segment.work_type.name = "Changed Work"
+        first_segment.work_type.short_name = "CHG"
+        first_segment.work_type.color_key = "changed"
+        first_segment.work_type.is_break = True
+        first_segment.work_type.save(update_fields=["name", "short_name", "color_key", "is_break", "updated_at"])
+        first_segment.work_area.name = "Changed Area"
+        first_segment.work_area.save(update_fields=["name", "updated_at"])
+
+        stale = MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=self.gym_work,
+            work_area=self.gym_area,
+            work_type_name_snapshot=self.gym_work.name,
+            work_type_short_name_snapshot=self.gym_work.short_name,
+            work_type_color_key_snapshot=self.gym_work.color_key,
+            work_type_is_break_snapshot=self.gym_work.is_break,
+            work_area_name_snapshot=self.gym_area.name,
+            start_offset_minutes=1200,
+            end_offset_minutes=1260,
+            is_active=False,
+        )
+        stale_updated_at = stale.updated_at
+        detail = client.get(f"/api/v1/monthly-shift-assignments/{assignment.id}/")
+        segments = [
+            {
+                "id": item["id"],
+                "work_type": item["work_type"],
+                "work_area": item["work_area"],
+                "start_offset_minutes": item["start_offset_minutes"],
+                "end_offset_minutes": item["end_offset_minutes"],
+                "display_order": item["display_order"],
+                "notes": item["notes"],
+            }
+            for item in detail.data["segments"]
+            if item["is_active"]
+        ]
+        segments[0]["notes"] = "custom"
+        updated = client.patch(
+            f"/api/v1/monthly-shift-assignments/{assignment.id}/",
+            {"segments": segments},
+            format="json",
+        )
+        self.assertEqual(updated.status_code, 200, updated.data)
+        first_segment.refresh_from_db()
+        for field, value in old_snapshots.items():
+            self.assertEqual(getattr(first_segment, field), value)
+        segments[0]["start_offset_minutes"] = 555
+        updated_time = client.patch(
+            f"/api/v1/monthly-shift-assignments/{assignment.id}/",
+            {"segments": segments},
+            format="json",
+        )
+        self.assertEqual(updated_time.status_code, 200, updated_time.data)
+        first_segment.refresh_from_db()
+        for field, value in old_snapshots.items():
+            self.assertEqual(getattr(first_segment, field), value)
+
+        WorkTypeAvailability.objects.get_or_create(
+            work_type=self.front_work,
+            location=self.location,
+            work_area=self.gym_area,
+        )
+        segments[0]["work_type"] = str(self.front_work.id)
+        changed_work_type = client.patch(
+            f"/api/v1/monthly-shift-assignments/{assignment.id}/",
+            {"segments": segments},
+            format="json",
+        )
+        self.assertEqual(changed_work_type.status_code, 200, changed_work_type.data)
+        first_segment.refresh_from_db()
+        self.assertEqual(first_segment.work_type_name_snapshot, self.front_work.name)
+        self.assertEqual(first_segment.work_type_short_name_snapshot, self.front_work.short_name)
+        self.assertEqual(first_segment.work_type_color_key_snapshot, self.front_work.color_key)
+        self.assertEqual(first_segment.work_type_is_break_snapshot, self.front_work.is_break)
+        self.assertEqual(first_segment.work_area_name_snapshot, old_snapshots["work_area_name_snapshot"])
+
+        segments[0]["work_area"] = str(self.front_area.id)
+        changed_area = client.patch(
+            f"/api/v1/monthly-shift-assignments/{assignment.id}/",
+            {"segments": segments},
+            format="json",
+        )
+        self.assertEqual(changed_area.status_code, 200, changed_area.data)
+        first_segment.refresh_from_db()
+        self.assertEqual(first_segment.work_area_name_snapshot, self.front_area.name)
+        WorkTypeAvailability.objects.get_or_create(
+            work_type=self.front_work,
+            location=self.location,
+            work_area=None,
+        )
+        segments[0]["work_area"] = None
+        cleared_area = client.patch(
+            f"/api/v1/monthly-shift-assignments/{assignment.id}/",
+            {"segments": segments},
+            format="json",
+        )
+        self.assertEqual(cleared_area.status_code, 200, cleared_area.data)
+        first_segment.refresh_from_db()
+        self.assertEqual(first_segment.work_area_name_snapshot, "")
+        stale.refresh_from_db()
+        self.assertEqual(stale.updated_at, stale_updated_at)
+        self.assertTrue(MonthlyShiftAssignment.objects.get(id=assignment.id).is_customized)
+
+        trial = WorkType.objects.get(code="trial")
+        pattern = ShiftPattern.objects.create(location=self.location, code="trial_shift", name="Trial", short_name="TR")
+        ShiftPatternSegment.objects.create(
+            shift_pattern=pattern,
+            work_type=trial,
+            work_area=self.gym_area,
+            start_offset_minutes=600,
+            end_offset_minutes=660,
+        )
+        warning_response = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan, staff=self.staff, work_date="2026-07-02", pattern_code="trial_shift"),
+            format="json",
+        )
+        self.assertEqual(warning_response.status_code, 201, warning_response.data)
+        self.assertEqual(warning_response.data["warnings"][0]["code"], "assisted_capability")
+        error_response = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan, staff=self.shift_manager, work_date="2026-07-03", pattern_code="trial_shift"),
+            format="json",
+        )
+        self.assertEqual(error_response.status_code, 400)
+
+    def test_template_preview_apply_modes_matrix_and_reactivation(self):
+        client = self.force_client(self.system_admin)
+        plan = self.create_plan()
+        template = WeeklyShiftTemplate.objects.get(code="standard_week")
+        StaffCapability.objects.get_or_create(
+            staff=self.staff,
+            work_type=WorkType.objects.get(code="front_duty"),
+            location=self.location,
+            valid_from=timezone.localdate(),
+            valid_until=None,
+            defaults={
+                "level": StaffCapability.Level.INDEPENDENT,
+                "approved_by": self.system_admin,
+                "approved_at": timezone.now(),
+            },
+        )
+        preview = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/preview-template-generation/",
+            {"weekly_shift_template": str(template.id), "existing_mode": "skip_existing", "invalid_mode": "strict"},
+            format="json",
+        )
+        self.assertEqual(preview.status_code, 200, preview.data)
+        self.assertGreater(preview.data["summary"]["candidate_count"], 0)
+        apply_response = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/apply-template/",
+            {"weekly_shift_template": str(template.id), "existing_mode": "skip_existing", "invalid_mode": "strict"},
+            format="json",
+        )
+        self.assertEqual(apply_response.status_code, 200, apply_response.data)
+        first_count = MonthlyShiftAssignment.objects.filter(monthly_shift_plan=plan, is_active=True).count()
+        repeat = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/apply-template/",
+            {"weekly_shift_template": str(template.id), "existing_mode": "skip_existing", "invalid_mode": "strict"},
+            format="json",
+        )
+        self.assertEqual(repeat.status_code, 200, repeat.data)
+        self.assertEqual(
+            MonthlyShiftAssignment.objects.filter(monthly_shift_plan=plan, is_active=True).count(), first_count
+        )
+        manual = MonthlyShiftAssignment.objects.filter(monthly_shift_plan=plan, source_type="template").first()
+        manual.source_type = "manual"
+        manual.is_customized = True
+        manual.save(update_fields=["source_type", "is_customized", "updated_at"])
+        replace_preview = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/preview-template-generation/",
+            {
+                "weekly_shift_template": str(template.id),
+                "existing_mode": "replace_template_generated",
+                "invalid_mode": "strict",
+            },
+            format="json",
+        )
+        self.assertEqual(replace_preview.status_code, 200)
+        self.assertGreaterEqual(replace_preview.data["summary"]["skip_manual_count"], 1)
+        matrix = client.get(f"/api/v1/monthly-shift-plans/{plan.id}/matrix/")
+        self.assertEqual(matrix.status_code, 200)
+        self.assertEqual(len(matrix.data["dates"]), 31)
+        self.assertTrue(any(item["is_saturday"] for item in matrix.data["dates"]))
+        self.assertTrue(any(item["is_sunday"] for item in matrix.data["dates"]))
+
+        staff_assignment = MonthlyShiftAssignment.objects.filter(
+            monthly_shift_plan=plan,
+            staff=self.staff,
+            is_active=True,
+        ).first()
+        required_work_type = staff_assignment.segments.filter(is_active=True).first().work_type
+        required_work_type.requires_capability = True
+        required_work_type.save(update_fields=["requires_capability", "updated_at"])
+        StaffCapability.objects.update_or_create(
+            staff=self.staff,
+            work_type=required_work_type,
+            location=self.location,
+            valid_from=timezone.localdate(),
+            valid_until=None,
+            defaults={
+                "level": StaffCapability.Level.ASSISTED,
+                "approved_by": self.system_admin,
+                "approved_at": timezone.now(),
+            },
+        )
+        warning_matrix = client.get(f"/api/v1/monthly-shift-plans/{plan.id}/matrix/")
+        self.assertEqual(warning_matrix.status_code, 200)
+        warning_counts = [
+            assignment["warning_count"]
+            for row in warning_matrix.data["rows"]
+            for assignment in row["assignments"].values()
+            if row["staff"] == str(self.staff.id)
+        ]
+        self.assertTrue(any(count > 0 for count in warning_counts))
+
+        assignment = MonthlyShiftAssignment.objects.filter(monthly_shift_plan=plan, is_active=True).first()
+        deactivate = client.post(f"/api/v1/monthly-shift-assignments/{assignment.id}/deactivate/", {}, format="json")
+        self.assertEqual(deactivate.status_code, 200)
+        conflict = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan, staff=assignment.staff, work_date=assignment.work_date.isoformat()),
+            format="json",
+        )
+        self.assertEqual(conflict.status_code, 201, conflict.data)
+        reactivate = client.post(f"/api/v1/monthly-shift-assignments/{assignment.id}/reactivate/", {}, format="json")
+        self.assertEqual(reactivate.status_code, 400)
+
+    def test_assignment_rejects_date_location_and_availability_failures(self):
+        client = self.force_client(self.system_admin)
+        plan = self.create_plan()
+        outside = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan, work_date="2026-08-01"),
+            format="json",
+        )
+        self.assertEqual(outside.status_code, 400)
+        StaffLocation.objects.filter(staff=self.staff, location=self.location).update(valid_until="2026-06-30")
+        no_location = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan, work_date="2026-07-04"),
+            format="json",
+        )
+        self.assertEqual(no_location.status_code, 400)
+        StaffLocation.objects.filter(staff=self.staff, location=self.location).update(valid_until=None)
+        WorkTypeAvailability.objects.filter(work_type=self.gym_work, location=self.location).update(is_active=False)
+        no_availability = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan, work_date="2026-07-05"),
+            format="json",
+        )
+        self.assertEqual(no_availability.status_code, 400)
+
+    def test_assignment_cell_fields_are_immutable(self):
+        client = self.force_client(self.system_admin)
+        plan = self.create_plan()
+        other_plan = self.create_plan(month=8)
+        created = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan),
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        assignment = MonthlyShiftAssignment.objects.get(id=created.data["id"])
+        same_values = client.patch(
+            f"/api/v1/monthly-shift-assignments/{assignment.id}/",
+            {
+                "monthly_shift_plan": str(plan.id),
+                "work_date": assignment.work_date.isoformat(),
+                "staff": str(assignment.staff_id),
+                "notes": "same",
+            },
+            format="json",
+        )
+        self.assertEqual(same_values.status_code, 200, same_values.data)
+        for payload in [
+            {"monthly_shift_plan": str(other_plan.id)},
+            {"work_date": "2026-07-02"},
+            {"staff": str(self.shift_manager.id)},
+        ]:
+            response = client.patch(f"/api/v1/monthly-shift-assignments/{assignment.id}/", payload, format="json")
+            self.assertEqual(response.status_code, 400)
+            assignment.refresh_from_db()
+            self.assertEqual(assignment.monthly_shift_plan_id, plan.id)
+            self.assertEqual(assignment.work_date.isoformat(), "2026-07-01")
+            self.assertEqual(assignment.staff_id, self.staff.id)
+
+    def test_inactive_plan_rejects_writes_without_audit(self):
+        client = self.force_client(self.system_admin)
+        plan = self.create_plan()
+        assignment = MonthlyShiftAssignment.objects.create(
+            monthly_shift_plan=plan,
+            work_date="2026-07-01",
+            staff=self.staff,
+            source_shift_pattern=ShiftPattern.objects.get(code="gym_early"),
+            pattern_code_snapshot="gym_early",
+            pattern_name_snapshot="Early",
+            pattern_short_name_snapshot="E",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=self.gym_work,
+            work_area=self.gym_area,
+            work_type_name_snapshot=self.gym_work.name,
+            work_type_short_name_snapshot=self.gym_work.short_name,
+            work_type_color_key_snapshot=self.gym_work.color_key,
+            work_type_is_break_snapshot=self.gym_work.is_break,
+            work_area_name_snapshot=self.gym_area.name,
+            start_offset_minutes=540,
+            end_offset_minutes=600,
+        )
+        plan.is_active = False
+        plan.save(update_fields=["is_active", "updated_at"])
+        before_audit_count = AuditEvent.objects.count()
+        before_assignment_count = MonthlyShiftAssignment.objects.count()
+        create_response = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan, work_date="2026-07-02"),
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, 400)
+        update_response = client.patch(
+            f"/api/v1/monthly-shift-assignments/{assignment.id}/",
+            {"segments": [{"id": str(assignment.segments.first().id), "notes": "blocked"}]},
+            format="json",
+        )
+        self.assertEqual(update_response.status_code, 400)
+        template = WeeklyShiftTemplate.objects.get(code="standard_week")
+        preview = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/preview-template-generation/",
+            {"weekly_shift_template": str(template.id), "existing_mode": "skip_existing", "invalid_mode": "strict"},
+            format="json",
+        )
+        self.assertEqual(preview.status_code, 400)
+        apply = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/apply-template/",
+            {"weekly_shift_template": str(template.id), "existing_mode": "skip_existing", "invalid_mode": "strict"},
+            format="json",
+        )
+        self.assertEqual(apply.status_code, 400)
+        assignment.is_active = False
+        assignment.save(update_fields=["is_active", "updated_at"])
+        reactivate = client.post(f"/api/v1/monthly-shift-assignments/{assignment.id}/reactivate/", {}, format="json")
+        self.assertEqual(reactivate.status_code, 400)
+        self.assertEqual(MonthlyShiftAssignment.objects.count(), before_assignment_count)
+        self.assertEqual(AuditEvent.objects.count(), before_audit_count)
+
+    def test_skip_invalid_count_and_integrity_error_mapping(self):
+        client = self.force_client(self.system_admin)
+        plan = self.create_plan()
+        trial = WorkType.objects.get(code="trial")
+        pattern = ShiftPattern.objects.create(
+            location=self.location, code="invalid_trial", name="Trial", short_name="TR"
+        )
+        ShiftPatternSegment.objects.create(
+            shift_pattern=pattern,
+            work_type=trial,
+            work_area=self.gym_area,
+            start_offset_minutes=600,
+            end_offset_minutes=660,
+        )
+        template = WeeklyShiftTemplate.objects.create(location=self.location, code="invalid_week", name="Invalid")
+        WeeklyShiftTemplateEntry.objects.create(
+            weekly_shift_template=template,
+            weekday=2,
+            staff=self.shift_manager,
+            shift_pattern=pattern,
+        )
+        StaffCapability.objects.filter(staff=self.shift_manager, work_type=trial).delete()
+        preview = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/preview-template-generation/",
+            {
+                "weekly_shift_template": str(template.id),
+                "existing_mode": "skip_existing",
+                "invalid_mode": "skip_invalid",
+            },
+            format="json",
+        )
+        self.assertEqual(preview.status_code, 200, preview.data)
+        self.assertGreater(preview.data["summary"]["skip_invalid_count"], 0)
+        self.assertEqual(preview.data["summary"]["skip_manual_count"], 0)
+        with patch("apps.shifts.models.MonthlyShiftAssignment.save", side_effect=IntegrityError("duplicate")):
+            response = client.post(
+                "/api/v1/monthly-shift-assignments/",
+                self.assignment_payload(plan),
+                format="json",
+            )
+        self.assertEqual(response.status_code, 400)
+
+    def test_capability_priority_is_consistent_for_save_preview_and_matrix(self):
+        client = self.force_client(self.system_admin)
+        plan = self.create_plan()
+        trial = WorkType.objects.get(code="trial")
+        pattern = ShiftPattern.objects.create(
+            location=self.location, code="priority_trial", name="Trial", short_name="TR"
+        )
+        ShiftPatternSegment.objects.create(
+            shift_pattern=pattern,
+            work_type=trial,
+            work_area=self.gym_area,
+            start_offset_minutes=600,
+            end_offset_minutes=660,
+        )
+        template = WeeklyShiftTemplate.objects.create(
+            location=self.location,
+            code="priority_week",
+            name="Priority",
+        )
+        WeeklyShiftTemplateEntry.objects.create(
+            weekly_shift_template=template,
+            weekday=2,
+            staff=self.staff,
+            shift_pattern=pattern,
+        )
+        StaffCapability.objects.filter(staff=self.staff, work_type=trial).delete()
+        StaffCapability.objects.create(
+            staff=self.staff,
+            work_type=trial,
+            location=None,
+            level=StaffCapability.Level.TRAINER,
+            valid_from="2026-01-01",
+        )
+        specific = StaffCapability.objects.create(
+            staff=self.staff,
+            work_type=trial,
+            location=self.location,
+            level=StaffCapability.Level.ASSISTED,
+            valid_from="2026-01-01",
+        )
+        manual = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan, work_date="2026-07-01", pattern_code="priority_trial"),
+            format="json",
+        )
+        self.assertEqual(manual.status_code, 201, manual.data)
+        self.assertEqual(manual.data["warnings"][0]["code"], "assisted_capability")
+        preview = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/preview-template-generation/",
+            {"weekly_shift_template": str(template.id), "existing_mode": "skip_existing", "invalid_mode": "strict"},
+            format="json",
+        )
+        self.assertEqual(preview.status_code, 200, preview.data)
+        self.assertGreater(preview.data["summary"]["warning_count"], 0)
+        matrix = client.get(f"/api/v1/monthly-shift-plans/{plan.id}/matrix/")
+        self.assertTrue(
+            any(
+                assignment["warning_count"] > 0
+                for row in matrix.data["rows"]
+                for assignment in row["assignments"].values()
+                if row["staff"] == str(self.staff.id)
+            )
+        )
+        specific.level = StaffCapability.Level.TRAINER
+        specific.save(update_fields=["level", "updated_at"])
+        StaffCapability.objects.filter(staff=self.staff, work_type=trial, location__isnull=True).update(
+            level=StaffCapability.Level.ASSISTED
+        )
+        manual_no_warning = client.post(
+            "/api/v1/monthly-shift-assignments/",
+            self.assignment_payload(plan, work_date="2026-07-02", pattern_code="priority_trial"),
+            format="json",
+        )
+        self.assertEqual(manual_no_warning.status_code, 201, manual_no_warning.data)
+        self.assertEqual(manual_no_warning.data["warnings"], [])
+        specific.delete()
+        StaffCapability.objects.filter(staff=self.staff, work_type=trial, location__isnull=True).update(
+            level=StaffCapability.Level.TRAINEE
+        )
+        trainee_preview = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/preview-template-generation/",
+            {"weekly_shift_template": str(template.id), "existing_mode": "skip_existing", "invalid_mode": "strict"},
+            format="json",
+        )
+        self.assertEqual(trainee_preview.status_code, 200)
+        self.assertGreater(trainee_preview.data["summary"]["warning_count"], 0)
+
+    def test_audit_rollback_for_monthly_resources(self):
+        client = self.force_client(self.system_admin)
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            plan_response = client.post("/api/v1/monthly-shift-plans/", self.plan_payload(month=10), format="json")
+        self.assertGreaterEqual(plan_response.status_code, 500)
+        self.assertFalse(MonthlyShiftPlan.objects.filter(month=10).exists())
+
+        plan = self.create_plan()
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            assignment_response = client.post(
+                "/api/v1/monthly-shift-assignments/",
+                self.assignment_payload(plan),
+                format="json",
+            )
+        self.assertGreaterEqual(assignment_response.status_code, 500)
+        self.assertFalse(MonthlyShiftAssignment.objects.filter(monthly_shift_plan=plan).exists())
+
+        template = WeeklyShiftTemplate.objects.get(code="standard_week")
+        before_last_generated_at = plan.last_generated_at
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            apply_response = client.post(
+                f"/api/v1/monthly-shift-plans/{plan.id}/apply-template/",
+                {
+                    "weekly_shift_template": str(template.id),
+                    "existing_mode": "skip_existing",
+                    "invalid_mode": "strict",
+                },
+                format="json",
+            )
+        self.assertGreaterEqual(apply_response.status_code, 500)
+        self.assertFalse(MonthlyShiftAssignment.objects.filter(monthly_shift_plan=plan).exists())
+        plan.refresh_from_db()
+        self.assertEqual(plan.last_generated_at, before_last_generated_at)
 
 
 class TestSeedDevShifts(APITestCase):

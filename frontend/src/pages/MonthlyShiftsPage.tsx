@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
-import { Navigate } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { Navigate, useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
 import { useAuth } from "../features/auth/AuthContext";
 import { buildOffsetOptions, offsetToLabel } from "../lib/timeOffsets";
@@ -68,12 +68,16 @@ function patternSegmentToForm(segment: NonNullable<ShiftPattern["segments"]>[num
 
 export function MonthlyShiftsPage() {
   const { user } = useAuth();
+  const [searchParams] = useSearchParams();
+  const initialYear = Number(searchParams.get("year")) || defaultYear;
+  const initialMonth = Number(searchParams.get("month")) || defaultMonth;
+  const initialLocation = searchParams.get("location") ?? "";
   const roles = user?.roles ?? [];
   const canManage = roles.includes("system_admin") || roles.includes("shift_manager");
   const canView = canManage || roles.includes("supervisor");
-  const [location, setLocation] = useState("");
-  const [year, setYear] = useState(defaultYear);
-  const [month, setMonth] = useState(defaultMonth);
+  const [location, setLocation] = useState(initialLocation);
+  const [year, setYear] = useState(initialYear);
+  const [month, setMonth] = useState(initialMonth);
   const [plan, setPlan] = useState<MonthlyShiftPlan | null>(null);
   const [staffSearch, setStaffSearch] = useState("");
   const [assignedOnly, setAssignedOnly] = useState(false);
@@ -144,6 +148,41 @@ export function MonthlyShiftsPage() {
         `/api/v1/work-type-availabilities/?page_size=200&is_active=true&location=${plan?.location}`,
       ),
   });
+  useEffect(() => {
+    if (!plan && initialLocation && planQuery.data?.results[0]) {
+      setPlan(planQuery.data.results[0]);
+    }
+  }, [initialLocation, plan, planQuery.data?.results]);
+  useEffect(() => {
+    const targetDate = searchParams.get("date");
+    const targetStaff = searchParams.get("staff");
+    if (!targetDate || !targetStaff || selected || !matrixQuery.data) return;
+    const row = matrixQuery.data.rows.find((item) => item.staff === targetStaff);
+    if (!row) return;
+    const cell = row.assignments[targetDate];
+    const inactive = row.inactive_assignments?.[targetDate];
+    setSelected({
+      staff: row.staff,
+      staffName: row.staff_display_name,
+      workDate: targetDate,
+      assignmentId: cell?.id,
+      inactiveAssignmentId: inactive?.id,
+      inactivePatternShortName: inactive?.pattern_short_name,
+    });
+    if (!cell) return;
+    let cancelled = false;
+    void api<MonthlyShiftAssignment>(`/api/v1/monthly-shift-assignments/${cell.id}/`).then((detail) => {
+      if (cancelled) return;
+      setAssignment(detail);
+      setSelectedPattern(detail.source_shift_pattern ?? "");
+      setSegments((detail.segments ?? []).filter((segment) => segment.is_active).map(toSegmentForm));
+      setNotes(detail.notes);
+      setIsDirty(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [matrixQuery.data, searchParams, selected]);
 
   const currentPreviewKey = `${plan?.id ?? ""}|${templateId}|${existingMode}|${invalidMode}`;
   const availableWorkTypeIds = useMemo(

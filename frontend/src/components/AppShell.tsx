@@ -44,6 +44,7 @@ export function AppShell() {
     ...(canViewShiftSettings
       ? [
           { to: "/shifts/monthly", label: "月間シフト" },
+          { to: "/shifts/timeline", label: "日別・週別シフト" },
           { to: "/shifts/patterns", label: "勤務パターン" },
           { to: "/shifts/templates", label: "週間テンプレート" },
         ]

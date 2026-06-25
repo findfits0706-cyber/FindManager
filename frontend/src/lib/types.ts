@@ -211,6 +211,68 @@ export type MonthlyShiftMatrix = {
   }>;
 };
 
+export type TimelineSegment = {
+  id: string;
+  work_type: string;
+  work_area: string | null;
+  work_type_name: string;
+  work_type_short_name: string;
+  work_type_color_key: string;
+  work_type_is_break: boolean;
+  work_area_name: string;
+  start_offset_minutes: number;
+  end_offset_minutes: number;
+  duration_minutes: number;
+  display_order: number;
+  notes: string;
+  lane: number;
+  lane_count: number;
+};
+
+export type TimelineAssignment = {
+  id: string;
+  pattern_name: string;
+  pattern_short_name: string;
+  source_type: "template" | "manual";
+  is_customized: boolean;
+  notes: string;
+  warning_count: number;
+};
+
+export type ShiftTimelineResponse = {
+  plan: Pick<MonthlyShiftPlan, "id" | "location" | "year" | "month" | "name"> & { location_name: string };
+  range: {
+    date_from: string;
+    date_to: string;
+    day_count: number;
+    earliest_start_offset: number | null;
+    latest_end_offset: number | null;
+    suggested_start_offset: number;
+    suggested_end_offset: number;
+  };
+  dates: MonthlyShiftMatrix["dates"];
+  rows: Array<{
+    staff: string;
+    staff_display_name: string;
+    employee_code: string;
+    days: Record<string, { assignment: TimelineAssignment | null; segments: TimelineSegment[] }>;
+  }>;
+  legend: Array<{
+    work_type: string;
+    name: string;
+    short_name: string;
+    color_key: string;
+    is_break: boolean;
+  }>;
+  summary: {
+    staff_count: number;
+    assignment_count: number;
+    segment_count: number;
+    work_minutes: number;
+    break_minutes: number;
+  };
+};
+
 export type TemplateGenerationResult = {
   summary: {
     candidate_count: number;

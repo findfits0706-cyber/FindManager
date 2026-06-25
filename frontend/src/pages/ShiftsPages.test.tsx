@@ -8,13 +8,16 @@ import { vi } from "vitest";
 import { AppShell } from "../components/AppShell";
 import { AuthProvider } from "../features/auth/AuthContext";
 import { labelToOffset, offsetToLabel } from "../lib/timeOffsets";
+import { clampSegmentToRange, durationToWidth, offsetToPosition } from "../lib/timeline";
 import { MonthlyShiftsPage } from "./MonthlyShiftsPage";
+import { ShiftTimelinePage } from "./ShiftTimelinePage";
 import { ShiftPatternsPage } from "./ShiftPatternsPage";
 import { WeeklyTemplatesPage } from "./WeeklyTemplatesPage";
 
 const fetchMock = vi.fn();
 vi.stubGlobal("fetch", fetchMock);
 const confirmMock = vi.spyOn(window, "confirm");
+const printMock = vi.spyOn(window, "print").mockImplementation(() => undefined);
 
 function renderWithAuth(element: ReactNode) {
   render(
@@ -114,6 +117,80 @@ const monthlyMatrix = {
     },
   ],
 };
+const shiftTimeline = {
+  plan: { id: "m1", location: "l1", location_name: "本館", year: 2028, month: 2, name: "2028年2月 本館シフト" },
+  range: {
+    date_from: "2028-02-01",
+    date_to: "2028-02-01",
+    day_count: 1,
+    earliest_start_offset: 510,
+    latest_end_offset: 1500,
+    suggested_start_offset: 360,
+    suggested_end_offset: 1500,
+  },
+  dates: [monthlyMatrix.dates[0]],
+  rows: [
+    {
+      staff: "staff1",
+      staff_display_name: "スタッフA",
+      employee_code: "EMP-A",
+      days: {
+        "2028-02-01": {
+          assignment: {
+            id: "ma1",
+            pattern_name: "早番",
+            pattern_short_name: "早",
+            source_type: "template",
+            is_customized: true,
+            notes: "note",
+            warning_count: 1,
+          },
+          segments: [
+            {
+              id: "seg1",
+              work_type: "w1",
+              work_area: "a1",
+              work_type_name: "ジム業務",
+              work_type_short_name: "ジム",
+              work_type_color_key: "blue",
+              work_type_is_break: false,
+              work_area_name: "ジム",
+              start_offset_minutes: 510,
+              end_offset_minutes: 1020,
+              duration_minutes: 510,
+              display_order: 10,
+              notes: "",
+              lane: 0,
+              lane_count: 2,
+            },
+            {
+              id: "seg2",
+              work_type: "w2",
+              work_area: null,
+              work_type_name: "休憩",
+              work_type_short_name: "休",
+              work_type_color_key: "amber",
+              work_type_is_break: true,
+              work_area_name: "",
+              start_offset_minutes: 900,
+              end_offset_minutes: 960,
+              duration_minutes: 60,
+              display_order: 20,
+              notes: "",
+              lane: 1,
+              lane_count: 2,
+            },
+          ],
+        },
+      },
+    },
+  ],
+  legend: [
+    { work_type: "w1", name: "ジム業務", short_name: "ジム", color_key: "blue", is_break: false },
+    { work_type: "w2", name: "休憩", short_name: "休", color_key: "amber", is_break: true },
+  ],
+  summary: { staff_count: 1, assignment_count: 1, segment_count: 2, work_minutes: 510, break_minutes: 60 },
+};
 const patterns = {
   count: 1,
   next: null,
@@ -157,6 +234,7 @@ describe("shift settings pages", () => {
   beforeEach(() => {
     fetchMock.mockReset();
     confirmMock.mockReset();
+    printMock.mockClear();
   });
 
   it("shows shift settings menu for managers and hides it for staff", async () => {
@@ -170,7 +248,22 @@ describe("shift settings pages", () => {
     );
     expect(await screen.findByRole("link", { name: "勤務パターン" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "月間シフト" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "日別・週別シフト" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "週間テンプレート" })).toBeInTheDocument();
+  });
+
+  it("calculates timeline positions and clamps next-day segments", () => {
+    expect(offsetToPosition(540, 360, 12)).toBe(144);
+    expect(durationToWidth(60, 12)).toBe(48);
+    expect(clampSegmentToRange({ start_offset_minutes: 300, end_offset_minutes: 1500 }, { start: 360, end: 1440 })).toEqual({
+      start: 360,
+      end: 1440,
+      duration: 1080,
+      continuesLeft: true,
+      continuesRight: true,
+      isVisible: true,
+    });
+    expect(clampSegmentToRange({ start_offset_minutes: 1440, end_offset_minutes: 2880 }, { start: 0, end: 2880 }).duration).toBe(1440);
   });
 
   it("converts all 15 minute offsets including 2880", () => {
@@ -422,6 +515,64 @@ describe("shift settings pages", () => {
     expect(await screen.findByText(/エラー 1/)).toBeInTheDocument();
     expect(screen.getByText(/検証エラースキップ 1/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "テンプレート適用" })).toBeDisabled();
+  });
+
+  it("shows daily and weekly timelines, filters, opens detail, and prints", async () => {
+    mockAuthAndApi(["shift_manager"], {
+      "/api/v1/monthly-shift-plans/m1/timeline/": shiftTimeline,
+      "/api/v1/monthly-shift-plans/": { count: 1, next: null, previous: null, results: [monthlyPlan] },
+      "/api/v1/locations/": locations,
+      "/api/v1/work-types/": workTypes,
+      "/api/v1/work-areas/": workAreas,
+    });
+    renderWithAuth(<ShiftTimelinePage />);
+    expect(await screen.findByText("日別・週別シフト")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /ジム業務/ })).toBeInTheDocument();
+    expect(screen.getAllByText(/休憩/).length).toBeGreaterThan(0);
+    await userEvent.click(screen.getByRole("button", { name: /ジム業務/ }));
+    expect(await screen.findByLabelText("勤務詳細")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "月間シフトで編集" })).toHaveAttribute(
+      "href",
+      "/shifts/monthly?location=l1&year=2028&month=2&date=2028-02-01&staff=staff1",
+    );
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByLabelText("勤務詳細")).not.toBeInTheDocument();
+    await userEvent.selectOptions(screen.getByLabelText("表示"), "week");
+    expect(await screen.findByText("1日（火）")).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("スタッフ検索"), "EMP");
+    await userEvent.selectOptions(screen.getByLabelText("WorkType"), "w1");
+    await userEvent.selectOptions(screen.getByLabelText("WorkArea"), "a1");
+    await userEvent.click(screen.getByLabelText("休憩を表示"));
+    await userEvent.selectOptions(screen.getByLabelText("表示時間範囲"), "next");
+    await userEvent.selectOptions(screen.getByLabelText("表示倍率"), "拡大");
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("staff_search=EMP"), expect.anything());
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("work_type=w1"), expect.anything());
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("include_breaks=false"), expect.anything());
+    await userEvent.click(screen.getByRole("button", { name: "印刷" }));
+    expect(printMock).toHaveBeenCalled();
+  });
+
+  it("keeps timeline read-only for supervisors and redirects staff", async () => {
+    mockAuthAndApi(["supervisor"], {
+      "/api/v1/monthly-shift-plans/m1/timeline/": shiftTimeline,
+      "/api/v1/monthly-shift-plans/": { count: 1, next: null, previous: null, results: [monthlyPlan] },
+      "/api/v1/locations/": locations,
+      "/api/v1/work-types/": workTypes,
+      "/api/v1/work-areas/": workAreas,
+    });
+    renderWithAuth(<ShiftTimelinePage />);
+    await userEvent.click(await screen.findByRole("button", { name: /ジム業務/ }));
+    expect(screen.queryByRole("link", { name: "月間シフトで編集" })).not.toBeInTheDocument();
+
+    fetchMock.mockReset();
+    mockAuthAndApi(["staff"], {});
+    renderWithAuth(
+      <Routes>
+        <Route path="/" element={<ShiftTimelinePage />} />
+        <Route path="/403" element={<div>Forbidden</div>} />
+      </Routes>,
+    );
+    expect(await screen.findByText("Forbidden")).toBeInTheDocument();
   });
 
   it("fetches pattern detail, previews segments, moves rows, and reactivates inactive assignments", async () => {

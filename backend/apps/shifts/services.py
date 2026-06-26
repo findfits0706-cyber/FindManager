@@ -84,8 +84,8 @@ EVENT_MAP = {
         "reactivate": "monthly_shift_plan_reactivated",
         "confirm": "monthly_shift_plan_confirmed",
         "reopen": "monthly_shift_plan_reopened",
-        "publish": "monthly_shift_plan_published",
-        "withdraw": "monthly_shift_plan_publication_withdrawn",
+        "publish": "monthly_shift_publication_created",
+        "withdraw": "monthly_shift_publication_withdrawn",
     },
     "monthly_shift_assignment": {
         "create": "monthly_shift_assignment_created",
@@ -1139,6 +1139,16 @@ def build_monthly_plan_content_hash(plan: MonthlyShiftPlan) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def next_publication_version(plan: MonthlyShiftPlan) -> int:
+    latest_version = (
+        MonthlyShiftPublication.objects.filter(monthly_shift_plan=plan).aggregate(max_version=Max("version"))[
+            "max_version"
+        ]
+        or 0
+    )
+    return latest_version + 1
+
+
 def _validation_error_issue(exc: DRFValidationError, *, code: str = "validation_error") -> dict:
     return {"severity": "error", "code": code, "message": str(exc.detail)}
 
@@ -1146,6 +1156,11 @@ def _validation_error_issue(exc: DRFValidationError, *, code: str = "validation_
 def build_publication_preview(plan: MonthlyShiftPlan) -> dict:
     ensure_active_monthly_plan(plan)
     assignments = _prefetched_active_assignments(plan)
+    content_hash = build_monthly_plan_content_hash(plan)
+    confirmation_stale = (
+        plan.workflow_status in {MonthlyShiftPlan.WorkflowStatus.CONFIRMED, MonthlyShiftPlan.WorkflowStatus.PUBLISHED}
+        and content_hash != plan.confirmed_content_hash
+    )
     start_date, end_date = _plan_bounds(plan)
     capability_lookup = build_capability_lookup(
         assignments=assignments,
@@ -1167,7 +1182,12 @@ def build_publication_preview(plan: MonthlyShiftPlan) -> dict:
     if not assignments:
         summary["error_count"] = 1
         return {
-            "content_hash": build_monthly_plan_content_hash(plan),
+            "plan": str(plan.id),
+            "workflow_status": plan.workflow_status,
+            "content_hash": content_hash,
+            "confirmed_content_hash": plan.confirmed_content_hash,
+            "confirmation_stale": confirmation_stale,
+            "next_publication_version": next_publication_version(plan),
             "summary": summary,
             "items": [
                 {
@@ -1224,12 +1244,25 @@ def build_publication_preview(plan: MonthlyShiftPlan) -> dict:
                 }
             )
     return {
-        "content_hash": build_monthly_plan_content_hash(plan),
+        "plan": str(plan.id),
+        "workflow_status": plan.workflow_status,
+        "content_hash": content_hash,
+        "confirmed_content_hash": plan.confirmed_content_hash,
+        "confirmation_stale": confirmation_stale,
+        "next_publication_version": next_publication_version(plan),
         "summary": summary,
         "items": items,
-        "can_confirm": summary["error_count"] == 0,
+        "can_confirm": (
+            plan.workflow_status == MonthlyShiftPlan.WorkflowStatus.DRAFT
+            and plan.is_active
+            and summary["error_count"] == 0
+            and summary["assignment_count"] > 0
+        ),
         "can_publish": (
-            plan.workflow_status == MonthlyShiftPlan.WorkflowStatus.CONFIRMED and summary["error_count"] == 0
+            plan.workflow_status == MonthlyShiftPlan.WorkflowStatus.CONFIRMED
+            and summary["error_count"] == 0
+            and not confirmation_stale
+            and not plan.publications.filter(is_active=True).exists()
         ),
     }
 
@@ -1298,15 +1331,9 @@ def _create_publication_snapshot(*, plan: MonthlyShiftPlan, actor: User, preview
         end_date=end_date,
         segments_attr="active_segments",
     )
-    latest_version = (
-        MonthlyShiftPublication.objects.filter(monthly_shift_plan=plan).aggregate(max_version=Max("version"))[
-            "max_version"
-        ]
-        or 0
-    )
     publication = MonthlyShiftPublication.objects.create(
         monthly_shift_plan=plan,
-        version=latest_version + 1,
+        version=next_publication_version(plan),
         content_hash=preview["content_hash"],
         location=plan.location,
         location_name_snapshot=plan.location.name,

@@ -424,17 +424,24 @@ describe("shift settings pages", () => {
     expect(await screen.findByRole("link", { name: "勤務パターン" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "月間シフト" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "日別・週別シフト" })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "自分の公開シフト" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "自分のシフト" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "週間テンプレート" })).toBeInTheDocument();
   });
 
   it("shows my published shifts from snapshot API", async () => {
     mockAuthAndApi(["staff"], {
       "/api/v1/my-published-shifts/": {
-        count: 1,
-        next: null,
-        previous: null,
-        results: [
+        range: { date_from: "2028-02-01", date_to: "2028-02-29" },
+        dates: [
+          {
+            date: "2028-02-01",
+            weekday: 1,
+            weekday_label: "火",
+            is_saturday: false,
+            is_sunday: false,
+          },
+        ],
+        shifts: [
           {
             id: "pub-a1",
             source_assignment: "ma1",
@@ -487,10 +494,12 @@ describe("shift settings pages", () => {
       },
     });
     renderWithAuth(<MyPublishedShiftsPage />);
-    expect(await screen.findByText("自分の公開シフト")).toBeInTheDocument();
+    expect(await screen.findByText("自分のシフト")).toBeInTheDocument();
     expect(await screen.findByText("2028-02-01")).toBeInTheDocument();
-    expect(screen.getByText("本館")).toBeInTheDocument();
+    expect(screen.getAllByText("本館").length).toBeGreaterThan(0);
     expect(screen.getByText("08:30~17:00")).toBeInTheDocument();
+    expect(screen.getByText("火")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "2028-02-01" }));
     expect(screen.getByText("公開備考")).toBeInTheDocument();
   });
 

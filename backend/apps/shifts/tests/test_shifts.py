@@ -1082,8 +1082,14 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
             "/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-07-31"
         )
         self.assertEqual(my_shifts.status_code, 200, my_shifts.data)
-        self.assertEqual(my_shifts.data["count"], 1)
-        self.assertEqual(my_shifts.data["results"][0]["publication"]["id"], str(publication.id))
+        self.assertEqual(len(my_shifts.data["shifts"]), 1)
+        self.assertEqual(my_shifts.data["shifts"][0]["publication"]["id"], str(publication.id))
+        history = client.get(f"/api/v1/monthly-shift-plans/{plan.id}/publications/")
+        self.assertEqual(history.status_code, 200, history.data)
+        self.assertEqual(history.data[0]["assignment_count"], 1)
+        self.assertEqual(history.data[0]["segment_count"], 1)
+        staff_history = self.force_client(self.staff).get(f"/api/v1/monthly-shift-plans/{plan.id}/publications/")
+        self.assertEqual(staff_history.status_code, 403)
         self.assertEqual(
             self.force_client(self.shift_manager)
             .get("/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-09-10")
@@ -1102,11 +1108,15 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         self.assertEqual(plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.CONFIRMED)
         self.assertFalse(publication.is_active)
         self.assertEqual(
-            self.force_client(self.staff)
-            .get("/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-07-31")
-            .data["count"],
+            len(
+                self.force_client(self.staff)
+                .get("/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-07-31")
+                .data["shifts"]
+            ),
             0,
         )
+        self.assertTrue(AuditEvent.objects.filter(event_type="monthly_shift_publication_created").exists())
+        self.assertTrue(AuditEvent.objects.filter(event_type="monthly_shift_publication_withdrawn").exists())
 
     def test_publish_rejects_stale_confirmed_hash(self):
         client = self.force_client(self.system_admin)
@@ -1126,6 +1136,100 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertIn("content_hash", response.data)
+
+    def test_publication_audit_failure_rolls_back_state_changes(self):
+        client = self.force_client(self.system_admin)
+        client.raise_request_exception = False
+
+        confirm_plan = self.create_plan(month=8)
+        self.create_assignment_record(confirm_plan, work_date="2026-08-01")
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = client.post(
+                f"/api/v1/monthly-shift-plans/{confirm_plan.id}/confirm/",
+                {"acknowledge_warnings": True},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 500)
+        confirm_plan.refresh_from_db()
+        self.assertEqual(confirm_plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.DRAFT)
+        self.assertIsNone(confirm_plan.confirmed_at)
+        self.assertIsNone(confirm_plan.confirmed_by)
+        self.assertEqual(confirm_plan.confirmed_content_hash, "")
+
+        reopen_plan = self.create_plan(month=9)
+        self.create_assignment_record(reopen_plan, work_date="2026-09-01")
+        self.assertEqual(
+            client.post(
+                f"/api/v1/monthly-shift-plans/{reopen_plan.id}/confirm/",
+                {"acknowledge_warnings": True},
+                format="json",
+            ).status_code,
+            200,
+        )
+        reopen_plan.refresh_from_db()
+        previous_hash = reopen_plan.confirmed_content_hash
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = client.post(
+                f"/api/v1/monthly-shift-plans/{reopen_plan.id}/reopen/",
+                {"reason": "audit rollback"},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 500)
+        reopen_plan.refresh_from_db()
+        self.assertEqual(reopen_plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.CONFIRMED)
+        self.assertEqual(reopen_plan.confirmed_content_hash, previous_hash)
+
+        publish_plan = self.create_plan(month=10)
+        self.create_assignment_record(publish_plan, work_date="2026-10-01")
+        self.assertEqual(
+            client.post(
+                f"/api/v1/monthly-shift-plans/{publish_plan.id}/confirm/",
+                {"acknowledge_warnings": True},
+                format="json",
+            ).status_code,
+            200,
+        )
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = client.post(
+                f"/api/v1/monthly-shift-plans/{publish_plan.id}/publish/",
+                {"acknowledge_warnings": True},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 500)
+        publish_plan.refresh_from_db()
+        self.assertEqual(publish_plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.CONFIRMED)
+        self.assertFalse(MonthlyShiftPublication.objects.filter(monthly_shift_plan=publish_plan).exists())
+
+        withdraw_plan = self.create_plan(month=11)
+        self.create_assignment_record(withdraw_plan, work_date="2026-11-01")
+        self.assertEqual(
+            client.post(
+                f"/api/v1/monthly-shift-plans/{withdraw_plan.id}/confirm/",
+                {"acknowledge_warnings": True},
+                format="json",
+            ).status_code,
+            200,
+        )
+        published = client.post(
+            f"/api/v1/monthly-shift-plans/{withdraw_plan.id}/publish/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(published.status_code, 201, published.data)
+        publication = MonthlyShiftPublication.objects.get(id=published.data["publication"]["id"])
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = client.post(
+                f"/api/v1/monthly-shift-plans/{withdraw_plan.id}/withdraw-publication/",
+                {"reason": "audit rollback"},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 500)
+        withdraw_plan.refresh_from_db()
+        publication.refresh_from_db()
+        self.assertEqual(withdraw_plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.PUBLISHED)
+        self.assertTrue(publication.is_active)
+        self.assertIsNone(publication.withdrawn_at)
+        self.assertEqual(publication.withdrawal_reason, "")
 
     def test_matrix_capability_query_count_does_not_grow_per_assignment(self):
         client = self.force_client(self.system_admin)

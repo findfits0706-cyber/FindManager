@@ -369,6 +369,7 @@ class MonthlyShiftPlanSerializer(serializers.ModelSerializer):
             "version": publication.version,
             "published_at": publication.published_at,
             "published_by": str(publication.published_by_id),
+            "published_by_display_name": publication.published_by.display_name,
         }
 
     def get_publication_count(self, obj):
@@ -579,6 +580,10 @@ class TemplateGenerationSerializer(serializers.Serializer):
 
 class PublicationAcknowledgeSerializer(serializers.Serializer):
     acknowledge_warnings = serializers.BooleanField(default=False)
+
+
+class PublicationReopenSerializer(serializers.Serializer):
+    reason = serializers.CharField(max_length=1000, required=False, allow_blank=True, trim_whitespace=True)
 
 
 class PublicationWithdrawSerializer(serializers.Serializer):

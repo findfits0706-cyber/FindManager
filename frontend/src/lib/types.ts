@@ -319,6 +319,7 @@ export type PublicationPreview = {
   confirmed_content_hash: string;
   confirmation_stale: boolean;
   next_publication_version: number;
+  validation_fingerprint: string;
   summary: {
     assignment_count: number;
     staff_count: number;

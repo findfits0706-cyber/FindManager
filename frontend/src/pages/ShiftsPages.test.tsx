@@ -16,7 +16,7 @@ import { MyPublishedShiftsPage } from "./MyPublishedShiftsPage";
 import { ShiftTimelinePage } from "./ShiftTimelinePage";
 import { ShiftPatternsPage } from "./ShiftPatternsPage";
 import { WeeklyTemplatesPage } from "./WeeklyTemplatesPage";
-import type { ShiftTimelineResponse } from "../lib/types";
+import type { PublicationPreview, ShiftTimelineResponse } from "../lib/types";
 
 const fetchMock = vi.fn();
 vi.stubGlobal("fetch", fetchMock);
@@ -111,6 +111,48 @@ const monthlyPlan = {
   publication_count: 0,
   is_active: true,
 };
+const confirmedMonthlyPlan = {
+  ...monthlyPlan,
+  workflow_status: "confirmed" as const,
+  confirmed_content_hash: "hash-current",
+  is_editable: false,
+};
+function publicationPreview(overrides: Partial<PublicationPreview> = {}): PublicationPreview {
+  return {
+    plan: "m1",
+    workflow_status: "draft",
+    content_hash: "hash-current",
+    confirmed_content_hash: "",
+    confirmation_stale: false,
+    next_publication_version: 1,
+    validation_fingerprint: "fingerprint-1",
+    summary: {
+      assignment_count: 1,
+      staff_count: 1,
+      segment_count: 1,
+      work_minutes: 450,
+      break_minutes: 60,
+      error_count: 0,
+      warning_count: 1,
+    },
+    items: [
+      {
+        scope: "assignment",
+        assignment: "ma1",
+        work_date: "2028-02-01",
+        staff: "staff1",
+        staff_display_name: "スタッフA",
+        pattern_short_name: "早",
+        warning_count: 1,
+        segment_count: 1,
+        issues: [{ severity: "warning", code: "assisted_capability", message: "warning" }],
+      },
+    ],
+    can_confirm: true,
+    can_publish: false,
+    ...overrides,
+  };
+}
 const monthlyMatrix = {
   plan: { id: "m1", location: "l1", location_name: "本館", year: 2028, month: 2, name: "2028年2月 本館シフト" },
   dates: Array.from({ length: 29 }, (_, index) => {
@@ -501,6 +543,9 @@ describe("shift settings pages", () => {
     expect(screen.getByText("火")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "2028-02-01" }));
     expect(screen.getByText("公開備考")).toBeInTheDocument();
+    await userEvent.clear(screen.getByLabelText("年"));
+    await userEvent.type(screen.getByLabelText("年"), "2029");
+    expect(screen.queryByText("公開備考")).not.toBeInTheDocument();
   });
 
   it("calculates timeline positions and clamps next-day segments", () => {
@@ -1104,6 +1149,94 @@ describe("shift settings pages", () => {
     await userEvent.click(screen.getByText(/解除済み/));
     await userEvent.click(await screen.findByRole("button", { name: "再有効化" }));
     expect(await screen.findByText("warning")).toBeInTheDocument();
+  });
+
+  it("requires rechecking warnings when confirm preview fingerprint changes", async () => {
+    let previewCalls = 0;
+    mockAuthAndApi(["system_admin"], {
+      "/api/v1/monthly-shift-plans/m1/matrix/": monthlyMatrix,
+      "/api/v1/monthly-shift-plans/m1/publication-preview/": () => {
+        previewCalls += 1;
+        return publicationPreview({
+          validation_fingerprint: previewCalls === 1 ? "fingerprint-1" : "fingerprint-2",
+          items: [
+            {
+              scope: "assignment",
+              assignment: "ma1",
+              work_date: "2028-02-01",
+              staff: "staff1",
+              staff_display_name: "スタッフA",
+              pattern_short_name: "早",
+              warning_count: 1,
+              segment_count: 1,
+              issues: [{ severity: "warning", code: previewCalls === 1 ? "assisted_capability" : "trainee_capability", message: "warning" }],
+            },
+          ],
+        });
+      },
+      "/api/v1/monthly-shift-plans/": { count: 1, next: null, previous: null, results: [monthlyPlan] },
+      "/api/v1/locations/": locations,
+      "/api/v1/shift-patterns/": patterns,
+      "/api/v1/weekly-shift-templates/": { count: 0, next: null, previous: null, results: [] },
+      "/api/v1/work-types/": workTypes,
+      "/api/v1/work-areas/": workAreas,
+      "/api/v1/work-type-availabilities/": { count: 0, next: null, previous: null, results: [] },
+    });
+    renderWithAuth(<MonthlyShiftsPage />);
+    await screen.findByRole("option", { name: "本館" });
+    await userEvent.selectOptions(screen.getByLabelText("拠点"), "l1");
+    await userEvent.click(await screen.findByRole("button", { name: "月間表を開く" }));
+    await userEvent.click(await screen.findByRole("button", { name: "公開プレビュー" }));
+    await userEvent.click(await screen.findByLabelText("警告内容を確認しました。"));
+    await userEvent.click(screen.getByRole("button", { name: "確定" }));
+    expect(await screen.findByText("検証結果が更新されました。最新の内容を確認してください。")).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(expect.stringContaining("/confirm/"), expect.anything());
+  });
+
+  it("does not publish when latest preview fingerprint changes with same warning count", async () => {
+    let previewCalls = 0;
+    mockAuthAndApi(["system_admin"], {
+      "/api/v1/monthly-shift-plans/m1/matrix/": monthlyMatrix,
+      "/api/v1/monthly-shift-plans/m1/publication-preview/": () => {
+        previewCalls += 1;
+        return publicationPreview({
+          workflow_status: "confirmed",
+          confirmed_content_hash: "hash-current",
+          can_confirm: false,
+          can_publish: true,
+          validation_fingerprint: previewCalls === 1 ? "fingerprint-1" : "fingerprint-2",
+          items: [
+            {
+              scope: "assignment",
+              assignment: "ma1",
+              work_date: "2028-02-01",
+              staff: "staff1",
+              staff_display_name: "スタッフA",
+              pattern_short_name: "早",
+              warning_count: 1,
+              segment_count: 1,
+              issues: [{ severity: "warning", code: previewCalls === 1 ? "assisted_capability" : "trainee_capability", message: "warning" }],
+            },
+          ],
+        });
+      },
+      "/api/v1/monthly-shift-plans/": { count: 1, next: null, previous: null, results: [confirmedMonthlyPlan] },
+      "/api/v1/locations/": locations,
+      "/api/v1/shift-patterns/": patterns,
+      "/api/v1/weekly-shift-templates/": { count: 0, next: null, previous: null, results: [] },
+      "/api/v1/work-types/": workTypes,
+      "/api/v1/work-areas/": workAreas,
+      "/api/v1/work-type-availabilities/": { count: 0, next: null, previous: null, results: [] },
+    });
+    renderWithAuth(<MonthlyShiftsPage />);
+    await screen.findByRole("option", { name: "本館" });
+    await userEvent.selectOptions(screen.getByLabelText("拠点"), "l1");
+    await userEvent.click(await screen.findByRole("button", { name: "月間表を開く" }));
+    await userEvent.click(await screen.findByRole("button", { name: "公開プレビュー" }));
+    await userEvent.click(await screen.findByLabelText("警告内容を確認しました。"));
+    await userEvent.click(screen.getByRole("button", { name: "公開" }));
+    expect(await screen.findByText("検証結果が更新されました。最新の内容を確認してください。")).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(expect.stringContaining("/publish/"), expect.anything());
   });
 
   it("keeps supervisor monthly UI read only", async () => {

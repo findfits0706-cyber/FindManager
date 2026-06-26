@@ -618,7 +618,7 @@ class MonthlyShiftPublicationSegmentSerializer(serializers.ModelSerializer):
 
 
 class MonthlyShiftPublicationAssignmentSerializer(serializers.ModelSerializer):
-    segments = MonthlyShiftPublicationSegmentSerializer(many=True, read_only=True)
+    segments = serializers.SerializerMethodField()
     start_offset_minutes = serializers.SerializerMethodField()
     end_offset_minutes = serializers.SerializerMethodField()
     work_minutes = serializers.SerializerMethodField()
@@ -650,7 +650,18 @@ class MonthlyShiftPublicationAssignmentSerializer(serializers.ModelSerializer):
         ]
 
     def _segments(self, obj):
-        return list(obj.segments.all())
+        cached = getattr(obj, "_publication_segments_cache", None)
+        if cached is not None:
+            return cached
+        if hasattr(obj, "prefetched_segments"):
+            cached = list(obj.prefetched_segments)
+        else:
+            cached = list(obj.segments.all())
+        obj._publication_segments_cache = cached
+        return cached
+
+    def get_segments(self, obj):
+        return MonthlyShiftPublicationSegmentSerializer(self._segments(obj), many=True).data
 
     def get_start_offset_minutes(self, obj):
         return min((segment.start_offset_minutes for segment in self._segments(obj)), default=None)

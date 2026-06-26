@@ -990,6 +990,206 @@ def _capability_issues(staff: User, work_type: WorkType, location: Location, wor
     return []
 
 
+@dataclass
+class PublicationValidationContext:
+    plan: MonthlyShiftPlan
+    start_date: date
+    end_date: date
+    staff_locations: dict[str, list[StaffLocation]]
+    availability_keys: set[tuple[str, str | None]]
+    capability_lookup: dict[tuple[str, str], list[StaffCapability]]
+
+
+def build_publication_validation_context(
+    *,
+    plan: MonthlyShiftPlan,
+    assignments: list[MonthlyShiftAssignment],
+) -> PublicationValidationContext:
+    start_date, end_date = _plan_bounds(plan)
+    staff_ids = {assignment.staff_id for assignment in assignments}
+    work_type_ids = set()
+    work_area_ids = set()
+    for assignment in assignments:
+        for segment in getattr(assignment, "active_segments", []):
+            work_type_ids.add(segment.work_type_id)
+            if segment.work_area_id:
+                work_area_ids.add(segment.work_area_id)
+
+    staff_locations: dict[str, list[StaffLocation]] = {}
+    if staff_ids:
+        locations = (
+            StaffLocation.objects.filter(
+                staff_id__in=staff_ids,
+                location_id=plan.location_id,
+                is_active=True,
+                staff__is_active=True,
+                location__is_active=True,
+                valid_from__lte=end_date,
+            )
+            .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=start_date))
+            .order_by("staff_id", "valid_from", "id")
+        )
+        for staff_location in locations:
+            staff_locations.setdefault(str(staff_location.staff_id), []).append(staff_location)
+
+    availability_keys: set[tuple[str, str | None]] = set()
+    if work_type_ids:
+        availabilities = (
+            WorkTypeAvailability.objects.filter(
+                work_type_id__in=work_type_ids,
+                location_id=plan.location_id,
+                is_active=True,
+                work_type__is_active=True,
+                location__is_active=True,
+            )
+            .filter(Q(work_area__isnull=True) | Q(work_area_id__in=work_area_ids))
+            .filter(Q(work_area__isnull=True) | Q(work_area__is_active=True))
+            .order_by("work_type_id", "work_area_id", "id")
+        )
+        availability_keys = {
+            (str(item.work_type_id), str(item.work_area_id) if item.work_area_id else None) for item in availabilities
+        }
+
+    return PublicationValidationContext(
+        plan=plan,
+        start_date=start_date,
+        end_date=end_date,
+        staff_locations=staff_locations,
+        availability_keys=availability_keys,
+        capability_lookup=build_capability_lookup(
+            assignments=assignments,
+            location=plan.location,
+            start_date=start_date,
+            end_date=end_date,
+            segments_attr="active_segments",
+        ),
+    )
+
+
+def _is_active_for_date(valid_from: date, valid_until: date | None, target_date: date) -> bool:
+    return valid_from <= target_date and (valid_until is None or valid_until >= target_date)
+
+
+def _validation_issue(message: str, *, code: str = "validation_error") -> dict:
+    return {"severity": "error", "code": code, "message": message}
+
+
+def _has_staff_location(context: PublicationValidationContext, assignment: MonthlyShiftAssignment) -> bool:
+    return any(
+        _is_active_for_date(item.valid_from, item.valid_until, assignment.work_date)
+        for item in context.staff_locations.get(str(assignment.staff_id), [])
+    )
+
+
+def _has_work_type_availability(context: PublicationValidationContext, segment: MonthlyShiftSegment) -> bool:
+    work_type_id = str(segment.work_type_id)
+    work_area_id = str(segment.work_area_id) if segment.work_area_id else None
+    return (work_type_id, None) in context.availability_keys or (
+        work_type_id,
+        work_area_id,
+    ) in context.availability_keys
+
+
+def validate_assignments_for_publication(
+    assignment: MonthlyShiftAssignment,
+    segments: list[MonthlyShiftSegment],
+    context: PublicationValidationContext,
+) -> list[dict]:
+    issues: list[dict] = []
+    plan = context.plan
+    if assignment.work_date.year != plan.year or assignment.work_date.month != plan.month:
+        issues.append(_validation_issue("{'work_date': 'work_date must be within the monthly shift plan.'}"))
+    if not assignment.staff.is_login_allowed():
+        issues.append(_validation_issue("{'staff': 'Inactive staff cannot be assigned.'}"))
+    if not _has_staff_location(context, assignment):
+        issues.append(_validation_issue("{'staff': 'Staff must belong to the plan location on work_date.'}"))
+
+    active_segments = [segment for segment in segments if segment.is_active]
+    if assignment.is_active and not active_segments:
+        issues.append(_validation_issue("{'segments': 'Active assignments require at least one active segment.'}"))
+    if active_segments:
+        first_start = min(segment.start_offset_minutes for segment in active_segments)
+        last_end = max(segment.end_offset_minutes for segment in active_segments)
+        if last_end - first_start > 1440:
+            issues.append(_validation_issue("{'segments': 'An assignment cannot span more than 24 hours.'}"))
+
+    for segment in active_segments:
+        if not segment.work_type.is_active:
+            issues.append(_validation_issue("{'work_type': 'Inactive work types cannot be assigned.'}"))
+        if segment.work_area_id:
+            if not segment.work_area.is_active:
+                issues.append(_validation_issue("{'work_area': 'Inactive work areas cannot be assigned.'}"))
+            elif segment.work_area.location_id != plan.location_id:
+                issues.append(
+                    _validation_issue("{'work_area': 'work_area must belong to the monthly shift plan location.'}")
+                )
+        if (
+            segment.start_offset_minutes < 0
+            or segment.start_offset_minutes >= 2880
+            or segment.end_offset_minutes <= 0
+            or segment.end_offset_minutes > 2880
+            or segment.end_offset_minutes <= segment.start_offset_minutes
+            or segment.start_offset_minutes % 15 != 0
+            or segment.end_offset_minutes % 15 != 0
+            or segment.end_offset_minutes - segment.start_offset_minutes > 1440
+        ):
+            issues.append(_validation_issue("{'segments': 'Invalid segment time range.'}"))
+        if not _has_work_type_availability(context, segment):
+            issues.append(_validation_issue("{'segments': 'Work type availability is missing for a segment.'}"))
+        issues.extend(
+            _capability_issues_from_lookup(
+                context.capability_lookup,
+                staff_id=assignment.staff_id,
+                work_type=segment.work_type,
+                location=plan.location,
+                work_date=assignment.work_date,
+            )
+        )
+
+    ordered = sorted(active_segments, key=lambda item: (item.start_offset_minutes, item.end_offset_minutes))
+    for index, current in enumerate(ordered):
+        for other in ordered[index + 1 :]:
+            if current.end_offset_minutes <= other.start_offset_minutes:
+                break
+            if current.work_type.is_break or other.work_type.is_break:
+                issues.append(_validation_issue("{'segments': 'Break segments cannot overlap other segments.'}"))
+                continue
+            if not (current.work_type.can_overlap or other.work_type.can_overlap):
+                issues.append(_validation_issue("{'segments': 'Monthly shift segments cannot overlap.'}"))
+    return issues
+
+
+def _capability_issues_from_lookup(
+    lookup: dict[tuple[str, str], list[StaffCapability]],
+    *,
+    staff_id,
+    work_type: WorkType,
+    location: Location,
+    work_date: date,
+) -> list[dict]:
+    if not work_type.requires_capability:
+        return []
+    capability = active_capability_from_lookup(
+        lookup,
+        staff_id=staff_id,
+        work_type_id=work_type.id,
+        work_date=work_date,
+    )
+    if capability is None:
+        return [
+            {
+                "severity": "error",
+                "code": "missing_capability",
+                "message": "対象日に必要なスタッフ対応可能業務がありません。",
+            }
+        ]
+    if capability.level == StaffCapability.Level.ASSISTED:
+        return [{"severity": "warning", "code": "assisted_capability", "message": ASSISTED_WARNING}]
+    if capability.level == StaffCapability.Level.TRAINEE:
+        return [{"severity": "warning", "code": "trainee_capability", "message": TRAINEE_WARNING}]
+    return []
+
+
 def validate_monthly_assignment(
     assignment: MonthlyShiftAssignment,
     segments: list[MonthlyShiftSegment],
@@ -1080,7 +1280,7 @@ def _prefetched_active_assignments(plan: MonthlyShiftPlan) -> list[MonthlyShiftA
             "segments__work_type",
             "segments__work_area",
         )
-        .order_by("work_date", "display_order", "staff__employee_code", "created_at")
+        .order_by("work_date", "display_order", "staff_id", "id")
     )
     result = list(assignments)
     for assignment in result:
@@ -1088,8 +1288,23 @@ def _prefetched_active_assignments(plan: MonthlyShiftPlan) -> list[MonthlyShiftA
     return result
 
 
-def build_monthly_plan_content_hash(plan: MonthlyShiftPlan) -> str:
-    assignments = _prefetched_active_assignments(plan)
+def build_monthly_plan_content_hash(
+    plan: MonthlyShiftPlan,
+    assignments: list[MonthlyShiftAssignment] | None = None,
+) -> str:
+    assignments = assignments if assignments is not None else _prefetched_active_assignments(plan)
+    ordered_assignments = sorted(
+        assignments,
+        key=lambda item: (
+            item.work_date,
+            item.display_order,
+            str(item.staff_id),
+            str(item.id),
+        ),
+    )
+    for assignment in ordered_assignments:
+        if not hasattr(assignment, "active_segments"):
+            assignment.active_segments = [segment for segment in assignment.segments.all() if segment.is_active]
     payload = {
         "plan": {
             "id": str(plan.id),
@@ -1127,12 +1342,12 @@ def build_monthly_plan_content_hash(plan: MonthlyShiftPlan) -> str:
                         "notes": segment.notes,
                     }
                     for segment in sorted(
-                        assignment.active_segments,
+                        getattr(assignment, "active_segments", []),
                         key=lambda item: (item.start_offset_minutes, item.display_order, str(item.id)),
                     )
                 ],
             }
-            for assignment in assignments
+            for assignment in ordered_assignments
         ],
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -1153,22 +1368,101 @@ def _validation_error_issue(exc: DRFValidationError, *, code: str = "validation_
     return {"severity": "error", "code": code, "message": str(exc.detail)}
 
 
-def build_publication_preview(plan: MonthlyShiftPlan) -> dict:
+def build_validation_fingerprint(
+    *,
+    plan: MonthlyShiftPlan,
+    content_hash: str,
+    summary: dict,
+    items: list[dict],
+) -> str:
+    payload = {
+        "plan": str(plan.id),
+        "workflow_status": plan.workflow_status,
+        "content_hash": content_hash,
+        "error_count": summary["error_count"],
+        "warning_count": summary["warning_count"],
+        "items": [
+            {
+                "assignment": item.get("assignment") or "",
+                "work_date": item.get("work_date") or "",
+                "staff": item.get("staff") or "",
+                "issues": [
+                    {
+                        "severity": issue["severity"],
+                        "code": issue["code"],
+                        "message": issue["message"],
+                    }
+                    for issue in sorted(
+                        item.get("issues", []),
+                        key=lambda issue: (issue["severity"], issue["code"], issue["message"]),
+                    )
+                ],
+            }
+            for item in sorted(
+                items,
+                key=lambda item: (
+                    item.get("assignment") or "",
+                    item.get("work_date") or "",
+                    item.get("staff") or "",
+                ),
+            )
+        ],
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _publication_preview_response(
+    *,
+    plan: MonthlyShiftPlan,
+    content_hash: str,
+    confirmation_stale: bool,
+    summary: dict,
+    items: list[dict],
+) -> dict:
+    response = {
+        "plan": str(plan.id),
+        "workflow_status": plan.workflow_status,
+        "content_hash": content_hash,
+        "confirmed_content_hash": plan.confirmed_content_hash,
+        "confirmation_stale": confirmation_stale,
+        "next_publication_version": next_publication_version(plan),
+        "summary": summary,
+        "items": items,
+        "can_confirm": (
+            plan.workflow_status == MonthlyShiftPlan.WorkflowStatus.DRAFT
+            and plan.is_active
+            and summary["error_count"] == 0
+            and summary["assignment_count"] > 0
+        ),
+        "can_publish": (
+            plan.workflow_status == MonthlyShiftPlan.WorkflowStatus.CONFIRMED
+            and summary["error_count"] == 0
+            and not confirmation_stale
+            and not plan.publications.filter(is_active=True).exists()
+        ),
+    }
+    response["validation_fingerprint"] = build_validation_fingerprint(
+        plan=plan,
+        content_hash=content_hash,
+        summary=summary,
+        items=items,
+    )
+    return response
+
+
+def build_publication_preview(
+    plan: MonthlyShiftPlan,
+    assignments: list[MonthlyShiftAssignment] | None = None,
+) -> dict:
     ensure_active_monthly_plan(plan)
-    assignments = _prefetched_active_assignments(plan)
-    content_hash = build_monthly_plan_content_hash(plan)
+    assignments = assignments if assignments is not None else _prefetched_active_assignments(plan)
+    content_hash = build_monthly_plan_content_hash(plan, assignments=assignments)
     confirmation_stale = (
         plan.workflow_status in {MonthlyShiftPlan.WorkflowStatus.CONFIRMED, MonthlyShiftPlan.WorkflowStatus.PUBLISHED}
         and content_hash != plan.confirmed_content_hash
     )
-    start_date, end_date = _plan_bounds(plan)
-    capability_lookup = build_capability_lookup(
-        assignments=assignments,
-        location=plan.location,
-        start_date=start_date,
-        end_date=end_date,
-        segments_attr="active_segments",
-    )
+    validation_context = build_publication_validation_context(plan=plan, assignments=assignments)
     items = []
     summary = {
         "assignment_count": len(assignments),
@@ -1181,15 +1475,12 @@ def build_publication_preview(plan: MonthlyShiftPlan) -> dict:
     }
     if not assignments:
         summary["error_count"] = 1
-        return {
-            "plan": str(plan.id),
-            "workflow_status": plan.workflow_status,
-            "content_hash": content_hash,
-            "confirmed_content_hash": plan.confirmed_content_hash,
-            "confirmation_stale": confirmation_stale,
-            "next_publication_version": next_publication_version(plan),
-            "summary": summary,
-            "items": [
+        return _publication_preview_response(
+            plan=plan,
+            content_hash=content_hash,
+            confirmation_stale=confirmation_stale,
+            summary=summary,
+            items=[
                 {
                     "scope": "plan",
                     "issues": [
@@ -1201,20 +1492,14 @@ def build_publication_preview(plan: MonthlyShiftPlan) -> dict:
                     ],
                 }
             ],
-            "can_confirm": False,
-            "can_publish": False,
-        }
+        )
 
     for assignment in assignments:
         active_segments = assignment.active_segments
-        issues = []
-        try:
-            issues.extend(validate_monthly_assignment(assignment, active_segments, validate_current_masters=True))
-        except DRFValidationError as exc:
-            issues.append(_validation_error_issue(exc))
+        issues = validate_assignments_for_publication(assignment, active_segments, validation_context)
         warning_count = monthly_assignment_warning_count(
             assignment,
-            capability_lookup,
+            validation_context.capability_lookup,
             segments_attr="active_segments",
         )
         segment_count = len(active_segments)
@@ -1243,35 +1528,21 @@ def build_publication_preview(plan: MonthlyShiftPlan) -> dict:
                     "issues": issues,
                 }
             )
-    return {
-        "plan": str(plan.id),
-        "workflow_status": plan.workflow_status,
-        "content_hash": content_hash,
-        "confirmed_content_hash": plan.confirmed_content_hash,
-        "confirmation_stale": confirmation_stale,
-        "next_publication_version": next_publication_version(plan),
-        "summary": summary,
-        "items": items,
-        "can_confirm": (
-            plan.workflow_status == MonthlyShiftPlan.WorkflowStatus.DRAFT
-            and plan.is_active
-            and summary["error_count"] == 0
-            and summary["assignment_count"] > 0
-        ),
-        "can_publish": (
-            plan.workflow_status == MonthlyShiftPlan.WorkflowStatus.CONFIRMED
-            and summary["error_count"] == 0
-            and not confirmation_stale
-            and not plan.publications.filter(is_active=True).exists()
-        ),
-    }
+    return _publication_preview_response(
+        plan=plan,
+        content_hash=content_hash,
+        confirmation_stale=confirmation_stale,
+        summary=summary,
+        items=items,
+    )
 
 
 def confirm_monthly_shift_plan(*, plan: MonthlyShiftPlan, actor: User, acknowledge_warnings: bool = False) -> dict:
     with transaction.atomic():
         plan = MonthlyShiftPlan.objects.select_for_update().select_related("location").get(pk=plan.pk)
         ensure_monthly_plan_editable(plan)
-        preview = build_publication_preview(plan)
+        assignments = _prefetched_active_assignments(plan)
+        preview = build_publication_preview(plan, assignments=assignments)
         if preview["summary"]["error_count"]:
             raise DRFValidationError({"items": preview["items"]})
         if preview["summary"]["warning_count"] and not acknowledge_warnings:
@@ -1321,8 +1592,14 @@ def reopen_monthly_shift_plan(*, plan: MonthlyShiftPlan, actor: User):
     return plan
 
 
-def _create_publication_snapshot(*, plan: MonthlyShiftPlan, actor: User, preview: dict) -> MonthlyShiftPublication:
-    assignments = _prefetched_active_assignments(plan)
+def _create_publication_snapshot(
+    *,
+    plan: MonthlyShiftPlan,
+    actor: User,
+    preview: dict,
+    assignments: list[MonthlyShiftAssignment] | None = None,
+) -> MonthlyShiftPublication:
+    assignments = assignments if assignments is not None else _prefetched_active_assignments(plan)
     start_date, end_date = _plan_bounds(plan)
     capability_lookup = build_capability_lookup(
         assignments=assignments,
@@ -1395,14 +1672,15 @@ def publish_monthly_shift_plan(*, plan: MonthlyShiftPlan, actor: User, acknowled
                 raise DRFValidationError({"workflow_status": "確定済みの月間シフトのみ公開できます。"})
             if plan.publications.filter(is_active=True).select_for_update().exists():
                 raise DRFValidationError({"monthly_shift_plan": MONTHLY_PLAN_ACTIVE_PUBLICATION_MESSAGE})
-            preview = build_publication_preview(plan)
+            assignments = _prefetched_active_assignments(plan)
+            preview = build_publication_preview(plan, assignments=assignments)
             if preview["content_hash"] != plan.confirmed_content_hash:
                 raise DRFValidationError({"content_hash": MONTHLY_PLAN_STALE_HASH_MESSAGE})
             if preview["summary"]["error_count"]:
                 raise DRFValidationError({"items": preview["items"]})
             if preview["summary"]["warning_count"] and not acknowledge_warnings:
                 raise DRFValidationError({"warnings": MONTHLY_PLAN_PUBLISH_WARNING_MESSAGE})
-            publication = _create_publication_snapshot(plan=plan, actor=actor, preview=preview)
+            publication = _create_publication_snapshot(plan=plan, actor=actor, preview=preview, assignments=assignments)
             plan.workflow_status = MonthlyShiftPlan.WorkflowStatus.PUBLISHED
             plan.updated_by = actor
             plan.save(update_fields=["workflow_status", "updated_by", "updated_at"])

@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import { offsetToLabel } from "../lib/timeOffsets";
 import type { MyPublishedShift, MyPublishedShiftsResponse } from "../lib/types";
@@ -26,6 +26,7 @@ export function MyPublishedShiftsPage() {
   const [month, setMonth] = useState(today.getMonth() + 1);
   const [location, setLocation] = useState("");
   const [selectedShift, setSelectedShift] = useState<MyPublishedShift | null>(null);
+  const [knownLocations, setKnownLocations] = useState<Array<{ id: string; name: string }>>([]);
   const range = monthRange(year, month);
   const query = useQuery({
     queryKey: ["my-published-shifts", year, month, location],
@@ -37,13 +38,32 @@ export function MyPublishedShiftsPage() {
       ),
   });
   const shifts = query.data?.shifts ?? emptyShifts;
+  useEffect(() => {
+    if (!query.data) return;
+    setKnownLocations((current) => {
+      const result = new Map(current.map((item) => [item.id, item.name]));
+      for (const shift of query.data.shifts) {
+        result.set(shift.publication.location, shift.publication.location_name);
+      }
+      return Array.from(result.entries()).map(([id, name]) => ({ id, name }));
+    });
+  }, [query.data]);
+  useEffect(() => {
+    if (query.isError) {
+      setSelectedShift(null);
+      return;
+    }
+    if (selectedShift && !shifts.some((shift) => shift.id === selectedShift.id)) {
+      setSelectedShift(null);
+    }
+  }, [query.data, query.isError, selectedShift, shifts]);
   const locationOptions = useMemo(() => {
-    const result = new Map<string, string>();
+    const result = new Map(knownLocations.map((item) => [item.id, item.name]));
     for (const shift of shifts) {
       result.set(shift.publication.location, shift.publication.location_name);
     }
     return Array.from(result.entries()).map(([id, name]) => ({ id, name }));
-  }, [shifts]);
+  }, [knownLocations, shifts]);
 
   const changeMonth = (delta: number) => {
     const next = new Date(year, month - 1 + delta, 1);
@@ -67,8 +87,8 @@ export function MyPublishedShiftsPage() {
         </div>
       </div>
       <div className="toolbar field-grid">
-        <label>年<input type="number" value={year} onChange={(event) => setYear(Number(event.target.value))} /></label>
-        <label>月<input type="number" min={1} max={12} value={month} onChange={(event) => setMonth(Number(event.target.value))} /></label>
+        <label>年<input type="number" value={year} onChange={(event) => { setYear(Number(event.target.value)); setSelectedShift(null); }} /></label>
+        <label>月<input type="number" min={1} max={12} value={month} onChange={(event) => { setMonth(Number(event.target.value)); setSelectedShift(null); }} /></label>
         <button type="button" onClick={() => changeMonth(-1)}>前月</button>
         <button type="button" onClick={() => changeMonth(1)}>次月</button>
         <button type="button" onClick={goThisMonth}>今月</button>

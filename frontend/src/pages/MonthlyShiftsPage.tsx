@@ -96,7 +96,7 @@ export function MonthlyShiftsPage() {
   const [preview, setPreview] = useState<TemplateGenerationResult | null>(null);
   const [previewKey, setPreviewKey] = useState("");
   const [publicationPreview, setPublicationPreview] = useState<PublicationPreview | null>(null);
-  const [warningAcknowledged, setWarningAcknowledged] = useState(false);
+  const [acknowledgedValidationFingerprint, setAcknowledgedValidationFingerprint] = useState("");
   const [selectedPublicationId, setSelectedPublicationId] = useState("");
   const [isDirty, setIsDirty] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -230,8 +230,11 @@ export function MonthlyShiftsPage() {
   const currentPreviewKey = `${activePlan?.id ?? ""}|${templateId}|${existingMode}|${invalidMode}`;
   const planStatus = activePlan?.workflow_status ?? "draft";
   const publicationPreviewKey = publicationPreview
-    ? `${publicationPreview.plan}|${publicationPreview.workflow_status}|${publicationPreview.content_hash}|${publicationPreview.confirmed_content_hash}`
+    ? `${publicationPreview.plan}|${publicationPreview.workflow_status}|${publicationPreview.content_hash}|${publicationPreview.confirmed_content_hash}|${publicationPreview.validation_fingerprint}`
     : "";
+  const warningAcknowledged =
+    Boolean(publicationPreview) &&
+    acknowledgedValidationFingerprint === publicationPreview?.validation_fingerprint;
   const isPlanEditable =
     canManage && Boolean(activePlan) && (activePlan?.is_editable ?? !["confirmed", "published"].includes(planStatus));
   const lockMessage =
@@ -253,7 +256,7 @@ export function MonthlyShiftsPage() {
     (publicationPreview.summary.warning_count === 0 || warningAcknowledged) &&
     !isSubmitting;
   useEffect(() => {
-    setWarningAcknowledged(false);
+    setAcknowledgedValidationFingerprint("");
   }, [publicationPreviewKey, activePlan?.id, planStatus]);
   const availableWorkTypeIds = useMemo(
     () => new Set((availabilityQuery.data?.results ?? []).map((item) => item.work_type)),
@@ -532,11 +535,28 @@ export function MonthlyShiftsPage() {
     }
   };
 
+  const loadLatestPublicationPreviewForAction = async () => {
+    if (!activePlan || !publicationPreview) return null;
+    const latestPreview = await api<PublicationPreview>(`/api/v1/monthly-shift-plans/${activePlan.id}/publication-preview/`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    setPublicationPreview(latestPreview);
+    if (latestPreview.validation_fingerprint !== publicationPreview.validation_fingerprint) {
+      setAcknowledgedValidationFingerprint("");
+      setError("検証結果が更新されました。最新の内容を確認してください。");
+      return null;
+    }
+    return latestPreview;
+  };
+
   const confirmPlan = async () => {
     if (!activePlan || !canConfirmPlan) return;
     setIsSubmitting(true);
     setError("");
     try {
+      const latestPreview = await loadLatestPublicationPreviewForAction();
+      if (!latestPreview) return;
       const result = await api<{ plan: MonthlyShiftPlan; preview: PublicationPreview }>(`/api/v1/monthly-shift-plans/${activePlan.id}/confirm/`, {
         method: "POST",
         body: JSON.stringify({ acknowledge_warnings: warningAcknowledged }),
@@ -572,15 +592,12 @@ export function MonthlyShiftsPage() {
   };
 
   const publishPlan = async () => {
-    if (!activePlan || isSubmitting) return;
+    if (!activePlan || !publicationPreview || isSubmitting) return;
     setIsSubmitting(true);
     setError("");
     try {
-      const latestPreview = await api<PublicationPreview>(`/api/v1/monthly-shift-plans/${activePlan.id}/publication-preview/`, {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
-      setPublicationPreview(latestPreview);
+      const latestPreview = await loadLatestPublicationPreviewForAction();
+      if (!latestPreview) return;
       if (latestPreview.confirmation_stale) {
         setError("確定後にシフト内容が変更されています。確定解除して再度確定してください。");
         return;
@@ -745,14 +762,16 @@ export function MonthlyShiftsPage() {
           <p>確定時ハッシュ {publicationPreview.confirmed_content_hash || "-"} / 現在ハッシュ {publicationPreview.content_hash} / 内容変更：{publicationPreview.confirmation_stale ? "あり" : "なし"} / 公開予定Version {publicationPreview.next_publication_version}</p>
           {publicationPreview.confirmation_stale ? <p className="error">確定後にシフト内容が変更されています。確定解除して再度確定してください。</p> : null}
           <p>勤務 {publicationPreview.summary.assignment_count} / スタッフ {publicationPreview.summary.staff_count} / セグメント {publicationPreview.summary.segment_count} / 勤務時間 {publicationPreview.summary.work_minutes}分 / 休憩 {publicationPreview.summary.break_minutes}分 / エラー {publicationPreview.summary.error_count} / 警告 {publicationPreview.summary.warning_count}</p>
-          <label><input type="checkbox" checked={warningAcknowledged} onChange={(event) => setWarningAcknowledged(event.target.checked)} /> 警告内容を確認しました。</label>
+          <label><input type="checkbox" checked={warningAcknowledged} onChange={(event) => setAcknowledgedValidationFingerprint(event.target.checked ? publicationPreview.validation_fingerprint : "")} /> 警告内容を確認しました。</label>
           <table className="table"><thead><tr><th>日付</th><th>スタッフ</th><th>勤務</th><th>issue</th></tr></thead><tbody>{publicationPreview.items.slice(0, 80).map((item, index) => <tr key={`${item.assignment ?? item.scope}-${index}`}><td>{item.work_date ?? "-"}</td><td>{item.staff_display_name ?? "-"}</td><td>{item.pattern_short_name ?? "-"}</td><td>{item.issues.map((issue) => `${issue.severity}:${issue.message}`).join(" / ")}</td></tr>)}</tbody></table>
         </section>
       ) : null}
       {activePlan ? (
         <section className="preview-panel">
           <h3>公開履歴</h3>
+          {publicationHistoryQuery.isLoading ? <p>読み込み中...</p> : null}
           {publicationHistoryQuery.isError ? <p className="error">公開履歴の取得に失敗しました。</p> : null}
+          {!publicationHistoryQuery.isLoading && !publicationHistoryQuery.isError && publicationHistory.length === 0 ? <p className="subtle-text">公開履歴はありません。</p> : null}
           <table className="table">
             <thead><tr><th>Version</th><th>公開日時</th><th>公開者</th><th>状態</th><th>停止日時</th><th>停止者</th><th>停止理由</th><th>Assignment数</th><th>スタッフ数</th><th>Segment数</th><th></th></tr></thead>
             <tbody>
@@ -775,6 +794,8 @@ export function MonthlyShiftsPage() {
           </table>
         </section>
       ) : null}
+      {selectedPublicationId && publicationDetailQuery.isLoading ? <section className="preview-panel"><h3>公開詳細</h3><p>読み込み中...</p></section> : null}
+      {selectedPublicationId && publicationDetailQuery.isError ? <section className="preview-panel"><h3>公開詳細</h3><p className="error">公開詳細の取得に失敗しました。</p></section> : null}
       {publicationDetailQuery.data ? (
         <section className="preview-panel">
           <h3>公開詳細 v{publicationDetailQuery.data.version}</h3>

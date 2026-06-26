@@ -71,6 +71,34 @@ from .services import (
 from .timeline_services import build_timeline_response
 
 
+def publication_base_queryset():
+    return MonthlyShiftPublication.objects.select_related(
+        "monthly_shift_plan",
+        "location",
+        "published_by",
+        "withdrawn_by",
+    ).annotate(
+        assignment_total=Count("assignments", distinct=True),
+        staff_total=Count("assignments__staff", distinct=True),
+        segment_total=Count("assignments__segments", distinct=True),
+    )
+
+
+def publication_detail_queryset():
+    return publication_base_queryset().prefetch_related(
+        Prefetch(
+            "assignments",
+            queryset=MonthlyShiftPublicationAssignment.objects.select_related("staff").prefetch_related(
+                Prefetch(
+                    "segments",
+                    queryset=MonthlyShiftPublicationSegment.objects.select_related("work_type", "work_area"),
+                    to_attr="prefetched_segments",
+                )
+            ),
+        )
+    )
+
+
 class ShiftSettingsPermission(permissions.BasePermission):
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
@@ -664,6 +692,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                 acknowledge_warnings=serializer.validated_data["acknowledge_warnings"],
             )
             plan.refresh_from_db()
+            publication = publication_base_queryset().get(pk=publication.pk)
             record_shift_event(
                 entity="monthly_shift_plan",
                 action="publish",
@@ -682,7 +711,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
             )
             response_data = {
                 "plan": self.get_serializer(plan).data,
-                "publication": MonthlyShiftPublicationSerializer(publication).data,
+                "publication": MonthlyShiftPublicationListSerializer(publication).data,
                 "preview": preview,
             }
         return Response(
@@ -704,6 +733,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                 reason=reason,
             )
             plan.refresh_from_db()
+            publication = publication_base_queryset().get(pk=publication.pk)
             record_shift_event(
                 entity="monthly_shift_plan",
                 action="withdraw",
@@ -718,7 +748,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
             )
             response_data = {
                 "plan": self.get_serializer(plan).data,
-                "publication": MonthlyShiftPublicationSerializer(publication).data,
+                "publication": MonthlyShiftPublicationListSerializer(publication).data,
             }
         return Response(response_data)
 
@@ -835,20 +865,7 @@ class MonthlyShiftAssignmentViewSet(ShiftManagementBaseViewSet):
 class MonthlyShiftPublicationViewSet(viewsets.ReadOnlyModelViewSet):
     http_method_names = ["get", "head", "options"]
     permission_classes = [ShiftSettingsPermission]
-    queryset = (
-        MonthlyShiftPublication.objects.select_related(
-            "monthly_shift_plan",
-            "location",
-            "published_by",
-            "withdrawn_by",
-        )
-        .annotate(
-            assignment_total=Count("assignments", distinct=True),
-            staff_total=Count("assignments__staff", distinct=True),
-            segment_total=Count("assignments__segments", distinct=True),
-        )
-        .order_by("-published_at", "-version")
-    )
+    queryset = publication_base_queryset().order_by("-published_at", "-version")
 
     def get_serializer_class(self):
         if self.action == "list":
@@ -857,6 +874,8 @@ class MonthlyShiftPublicationViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         queryset = self.queryset
+        if self.action == "retrieve":
+            queryset = publication_detail_queryset().order_by("-published_at", "-version")
         params = self.request.query_params
         if params.get("monthly_shift_plan"):
             queryset = queryset.filter(monthly_shift_plan_id=params["monthly_shift_plan"])
@@ -868,18 +887,6 @@ class MonthlyShiftPublicationViewSet(viewsets.ReadOnlyModelViewSet):
             queryset = queryset.filter(month=params["month"])
         if params.get("is_active") in {"true", "false"}:
             queryset = queryset.filter(is_active=params["is_active"] == "true")
-        if self.action == "retrieve":
-            queryset = queryset.prefetch_related(
-                Prefetch(
-                    "assignments",
-                    queryset=MonthlyShiftPublicationAssignment.objects.select_related("staff").prefetch_related(
-                        Prefetch(
-                            "segments",
-                            queryset=MonthlyShiftPublicationSegment.objects.select_related("work_type", "work_area"),
-                        )
-                    ),
-                )
-            )
         return queryset
 
 
@@ -941,6 +948,7 @@ class MyPublishedShiftViewSet(viewsets.GenericViewSet):
                 Prefetch(
                     "segments",
                     queryset=MonthlyShiftPublicationSegment.objects.select_related("work_type", "work_area"),
+                    to_attr="prefetched_segments",
                 )
             )
             .order_by("work_date", "display_order", "created_at")

@@ -12,6 +12,7 @@ import { StaffAssignmentsPage } from "./pages/StaffAssignmentsPage";
 import { StaffEditPage } from "./pages/StaffEditPage";
 import { StaffListPage } from "./pages/StaffListPage";
 import { MonthlyShiftsPage } from "./pages/MonthlyShiftsPage";
+import { ShiftTimelinePage } from "./pages/ShiftTimelinePage";
 import { ShiftPatternsPage } from "./pages/ShiftPatternsPage";
 import { WeeklyTemplatesPage } from "./pages/WeeklyTemplatesPage";
 
@@ -50,6 +51,7 @@ export function App() {
           <Route path="operations/my-staff-locations" element={<MyCapabilitiesPage section="locations" />} />
           <Route path="operations/my-capabilities" element={<MyCapabilitiesPage />} />
           <Route path="shifts/monthly" element={<MonthlyShiftsPage />} />
+          <Route path="shifts/timeline" element={<ShiftTimelinePage />} />
           <Route path="shifts/patterns" element={<ShiftPatternsPage />} />
           <Route path="shifts/templates" element={<WeeklyTemplatesPage />} />
           <Route path="403" element={<ForbiddenPage />} />

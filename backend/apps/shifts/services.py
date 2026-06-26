@@ -662,6 +662,93 @@ def active_capability_for(staff: User, work_type: WorkType, location: Location, 
     return _ordered_capabilities(_active_on(queryset, work_date), location).first()
 
 
+def build_capability_lookup(
+    *,
+    assignments: list[MonthlyShiftAssignment],
+    location: Location,
+    start_date: date,
+    end_date: date,
+    segments_attr: str | None = None,
+) -> dict[tuple[str, str], list[StaffCapability]]:
+    def assignment_segments(assignment: MonthlyShiftAssignment):
+        if segments_attr:
+            return getattr(assignment, segments_attr, [])
+        return assignment.segments.all()
+
+    required_pairs = {
+        (item.staff_id, segment.work_type_id)
+        for item in assignments
+        for segment in assignment_segments(item)
+        if segment.is_active and segment.work_type.requires_capability
+    }
+    if not required_pairs:
+        return {}
+    staff_ids = {staff_id for staff_id, _work_type_id in required_pairs}
+    work_type_ids = {work_type_id for _staff_id, work_type_id in required_pairs}
+    capabilities = (
+        StaffCapability.objects.filter(
+            staff_id__in=staff_ids,
+            work_type_id__in=work_type_ids,
+            is_active=True,
+            valid_from__lte=end_date,
+        )
+        .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=start_date))
+        .filter(Q(location=location) | Q(location__isnull=True))
+        .annotate(
+            location_priority=Case(
+                When(location=location, then=Value(0)),
+                When(location__isnull=True, then=Value(1)),
+                default=Value(2),
+                output_field=IntegerField(),
+            )
+        )
+        .order_by("staff_id", "work_type_id", "location_priority", "display_order", "created_at")
+    )
+    result: dict[tuple[str, str], list[StaffCapability]] = {}
+    for capability in capabilities:
+        key = (str(capability.staff_id), str(capability.work_type_id))
+        result.setdefault(key, []).append(capability)
+    return result
+
+
+def active_capability_from_lookup(
+    lookup: dict[tuple[str, str], list[StaffCapability]],
+    *,
+    staff_id,
+    work_type_id,
+    work_date: date,
+) -> StaffCapability | None:
+    for capability in lookup.get((str(staff_id), str(work_type_id)), []):
+        if capability.valid_from <= work_date and (
+            capability.valid_until is None or capability.valid_until >= work_date
+        ):
+            return capability
+    return None
+
+
+def monthly_assignment_warning_count(
+    assignment: MonthlyShiftAssignment,
+    capability_lookup: dict[tuple[str, str], list[StaffCapability]],
+    *,
+    segments_attr: str | None = None,
+) -> int:
+    warning_levels = {StaffCapability.Level.ASSISTED, StaffCapability.Level.TRAINEE}
+    warning_count = 0
+    segments = getattr(assignment, segments_attr, []) if segments_attr else assignment.segments.all()
+    for segment in segments:
+        if not segment.is_active or not segment.work_type.requires_capability:
+            continue
+        capability = active_capability_from_lookup(
+            capability_lookup,
+            staff_id=assignment.staff_id,
+            work_type_id=segment.work_type_id,
+            work_date=assignment.work_date,
+        )
+        if capability is not None and capability.level in warning_levels:
+            warning_count += 1
+    return warning_count
+
+
 def _validate_assignment_cell_immutable(instance: MonthlyShiftAssignment | None, validated_data: dict):
     if instance is None:
         return

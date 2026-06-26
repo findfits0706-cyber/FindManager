@@ -57,6 +57,7 @@
 - Self-service capability page
 - Shift pattern and weekly template pages
 - Monthly shift planning page
+- Daily/weekly shift timeline page
 
 ## Phase 3 Domain Rules
 
@@ -76,6 +77,18 @@
 - `strict` generation rejects the whole apply if any candidate has an error. `skip_invalid` applies only valid candidates.
 - StaffLocation and StaffCapability are validated against each assignment work date. `assisted` and `trainee` capabilities are warnings; missing required capability is an error.
 - The monthly matrix is staff-by-date. 15-minute day/week timeline views and advanced cross-location conflict detection are later phases.
+
+## Phase 5 Domain Rules
+
+- Timeline viewing is read-only and uses saved MonthlyShiftAssignment and MonthlyShiftSegment rows.
+- The daily and weekly views share `/api/v1/monthly-shift-plans/{id}/timeline/` with a maximum effective range of seven days.
+- Timeline display values come from assignment and segment snapshots, not current WorkType or WorkArea names.
+- Segment offsets remain minute offsets from the assignment start date, so next-day work stays on the starting date row.
+- Overlapping segments are assigned deterministic lanes so bars do not fully overlap.
+- Capability warnings reuse the monthly assignment capability lookup and are returned as `warning_count`.
+- The frontend draws 15-minute and hourly grid lines with CSS backgrounds instead of rendering cells for every staff/day/slot.
+- Printing uses the browser print dialog and print CSS; server-side PDF generation is outside the phase.
+- Timeline bars open detail only. Editing remains in the monthly shift screen.
 
 ## Quality Gates
 

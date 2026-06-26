@@ -80,3 +80,16 @@ Phase 4 adds dated monthly shift planning:
 - StaffLocation and StaffCapability validation on concrete work dates
 - Snapshot fields so existing monthly shifts keep their display values after master/template changes
 - Monthly shift screen at `/shifts/monthly`
+
+## Phase 5 Scope
+
+Phase 5 adds daily and weekly timeline viewing and browser printing for saved monthly shifts:
+
+- Timeline API at `/api/v1/monthly-shift-plans/{id}/timeline/`
+- Daily and weekly 15-minute timeline screen at `/shifts/timeline`
+- Staff, WorkType, WorkArea, assigned-only, and break filters
+- Snapshot-based segment labels and colors
+- Next-day work display up to 2880 minutes
+- Lane placement for overlapping segments
+- Detail panel with a deep link back to the monthly shift screen
+- Browser printing with print-specific CSS

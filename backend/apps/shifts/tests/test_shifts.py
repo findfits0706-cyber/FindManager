@@ -1,3 +1,4 @@
+import uuid
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
@@ -8,6 +9,7 @@ from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
+from apps.accounts.constants import ROLE_STAFF
 from apps.accounts.models import User
 from apps.accounts.test_accounts import BaseAPITestCase
 from apps.common.models import AuditEvent
@@ -556,6 +558,9 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         work_type=None,
         work_area=None,
         pattern_code="gym_early",
+        start_offset_minutes=540,
+        end_offset_minutes=600,
+        display_order=0,
     ):
         pattern = ShiftPattern.objects.get(code=pattern_code)
         work_type = work_type or self.gym_work
@@ -580,10 +585,354 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
             work_type_color_key_snapshot=work_type.color_key,
             work_type_is_break_snapshot=work_type.is_break,
             work_area_name_snapshot=work_area.name if work_area else "",
-            start_offset_minutes=540,
-            end_offset_minutes=600,
+            start_offset_minutes=start_offset_minutes,
+            end_offset_minutes=end_offset_minutes,
+            display_order=display_order,
         )
         return assignment
+
+    def test_timeline_parameter_validation_and_permissions(self):
+        plan = self.create_plan()
+        url = f"/api/v1/monthly-shift-plans/{plan.id}/timeline/"
+        client = self.force_client(self.system_admin)
+        self.assertEqual(client.get(url).status_code, 400)
+        self.assertEqual(client.get(f"{url}?date_from=bad&date_to=2026-07-01").status_code, 400)
+        self.assertEqual(client.get(f"{url}?date_from=2026-07-02&date_to=2026-07-01").status_code, 400)
+        self.assertEqual(client.get(f"{url}?date_from=2026-07-01&date_to=2026-07-08").status_code, 400)
+        self.assertEqual(client.get(f"{url}?date_from=2026-08-01&date_to=2026-08-01").status_code, 400)
+        self.assertEqual(client.get(f"{url}?date_from=2026-07-01&date_to=2026-07-01").status_code, 200)
+        self.assertEqual(
+            client.get(f"{url}?date_from=2026-06-29&date_to=2026-07-02").data["range"]["date_from"], "2026-07-01"
+        )
+        for user in [self.shift_manager, self.supervisor]:
+            self.assertEqual(
+                self.force_client(user).get(f"{url}?date_from=2026-07-01&date_to=2026-07-01").status_code,
+                200,
+            )
+        for user in [self.staff, self.viewer]:
+            self.assertEqual(
+                self.force_client(user).get(f"{url}?date_from=2026-07-01&date_to=2026-07-01").status_code,
+                403,
+            )
+
+    def test_timeline_uuid_filters_validate_and_return_empty_for_missing_or_other_location(self):
+        plan = self.create_plan()
+        self.create_assignment_record(plan, work_date="2026-07-01")
+        client = self.force_client(self.system_admin)
+        url = f"/api/v1/monthly-shift-plans/{plan.id}/timeline/?date_from=2026-07-01&date_to=2026-07-01"
+
+        invalid_work_type = client.get(f"{url}&work_type=bad-id")
+        self.assertEqual(invalid_work_type.status_code, 400)
+        self.assertIn("work_type", invalid_work_type.data)
+        invalid_work_area = client.get(f"{url}&work_area=bad-id")
+        self.assertEqual(invalid_work_area.status_code, 400)
+        self.assertIn("work_area", invalid_work_area.data)
+
+        missing_work_type = client.get(f"{url}&work_type={uuid.uuid4()}")
+        self.assertEqual(missing_work_type.status_code, 200, missing_work_type.data)
+        self.assertEqual(missing_work_type.data["summary"]["segment_count"], 0)
+        missing_work_area = client.get(f"{url}&work_area={uuid.uuid4()}")
+        self.assertEqual(missing_work_area.status_code, 200, missing_work_area.data)
+        self.assertEqual(missing_work_area.data["summary"]["segment_count"], 0)
+
+        other_location_area = WorkArea.objects.filter(location=Location.objects.get(code="findfits")).first()
+        response = client.get(f"{url}&work_area={other_location_area.id}")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["summary"]["segment_count"], 0)
+
+    def test_timeline_snapshots_filters_lanes_summary_and_warnings(self):
+        plan = self.create_plan()
+        assignment = self.create_assignment_record(
+            plan,
+            work_date="2026-07-01",
+            start_offset_minutes=1380,
+            end_offset_minutes=1500,
+        )
+        gym_snapshot_name = self.gym_work.name
+        MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=self.front_work,
+            work_area=self.front_area,
+            work_type_name_snapshot="Snapshot Front",
+            work_type_short_name_snapshot="SF",
+            work_type_color_key_snapshot="green",
+            work_type_is_break_snapshot=False,
+            work_area_name_snapshot="Snapshot Area",
+            start_offset_minutes=1410,
+            end_offset_minutes=1470,
+            display_order=10,
+        )
+        MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=self.break_work,
+            work_area=None,
+            work_type_name_snapshot="Snapshot Break",
+            work_type_short_name_snapshot="BR",
+            work_type_color_key_snapshot="amber",
+            work_type_is_break_snapshot=True,
+            work_area_name_snapshot="",
+            start_offset_minutes=1500,
+            end_offset_minutes=1530,
+            display_order=20,
+        )
+        self.gym_work.name = "Changed Gym"
+        self.gym_work.requires_capability = True
+        self.gym_work.save(update_fields=["name", "requires_capability", "updated_at"])
+        StaffCapability.objects.create(
+            staff=self.staff,
+            work_type=self.gym_work,
+            location=self.location,
+            level=StaffCapability.Level.TRAINEE,
+            valid_from="2026-01-01",
+        )
+
+        response = self.force_client(self.system_admin).get(
+            f"/api/v1/monthly-shift-plans/{plan.id}/timeline/?date_from=2026-07-01&date_to=2026-07-01"
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        day = response.data["rows"][0]["days"]["2026-07-01"]
+        self.assertEqual(day["assignment"]["warning_count"], 1)
+        self.assertEqual(day["segments"][0]["work_type_name"], gym_snapshot_name)
+        self.assertEqual(day["segments"][1]["work_type_name"], "Snapshot Front")
+        self.assertEqual({segment["lane_count"] for segment in day["segments"]}, {2})
+        self.assertEqual(response.data["range"]["latest_end_offset"], 1530)
+        self.assertEqual(response.data["range"]["suggested_end_offset"], 1560)
+        self.assertEqual(response.data["summary"]["segment_count"], 3)
+        self.assertEqual(response.data["summary"]["break_minutes"], 30)
+
+        filtered = self.force_client(self.system_admin).get(
+            f"/api/v1/monthly-shift-plans/{plan.id}/timeline/"
+            f"?date_from=2026-07-01&date_to=2026-07-01&work_type={self.front_work.id}&include_breaks=false"
+        )
+        self.assertEqual(filtered.status_code, 200, filtered.data)
+        filtered_segments = filtered.data["rows"][0]["days"]["2026-07-01"]["segments"]
+        self.assertEqual(len(filtered_segments), 1)
+        self.assertEqual(filtered_segments[0]["work_type"], str(self.front_work.id))
+        self.assertEqual(filtered.data["legend"][0]["name"], "Snapshot Front")
+
+    def test_timeline_warning_count_uses_all_active_segments_when_filtered(self):
+        plan = self.create_plan()
+        self.front_work.requires_capability = True
+        self.front_work.save(update_fields=["requires_capability", "updated_at"])
+        StaffCapability.objects.create(
+            staff=self.staff,
+            work_type=self.front_work,
+            location=self.location,
+            level=StaffCapability.Level.ASSISTED,
+            valid_from="2026-01-01",
+            approved_by=self.system_admin,
+            approved_at=timezone.now(),
+        )
+        assignment = self.create_assignment_record(
+            plan,
+            work_date="2026-07-01",
+            work_type=self.gym_work,
+            work_area=self.gym_area,
+            start_offset_minutes=540,
+            end_offset_minutes=600,
+            display_order=10,
+        )
+        MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=self.front_work,
+            work_area=self.front_area,
+            work_type_name_snapshot=self.front_work.name,
+            work_type_short_name_snapshot=self.front_work.short_name,
+            work_type_color_key_snapshot=self.front_work.color_key,
+            work_type_is_break_snapshot=self.front_work.is_break,
+            work_area_name_snapshot=self.front_area.name,
+            start_offset_minutes=600,
+            end_offset_minutes=660,
+            display_order=20,
+        )
+
+        client = self.force_client(self.system_admin)
+        filtered = client.get(
+            f"/api/v1/monthly-shift-plans/{plan.id}/timeline/"
+            f"?date_from=2026-07-01&date_to=2026-07-01&work_type={self.gym_work.id}"
+        )
+        self.assertEqual(filtered.status_code, 200, filtered.data)
+        day = filtered.data["rows"][0]["days"]["2026-07-01"]
+        self.assertEqual([segment["work_type"] for segment in day["segments"]], [str(self.gym_work.id)])
+        self.assertEqual(day["assignment"]["warning_count"], 1)
+
+        matrix = client.get(f"/api/v1/monthly-shift-plans/{plan.id}/matrix/")
+        self.assertEqual(matrix.status_code, 200, matrix.data)
+        matrix_row = next(row for row in matrix.data["rows"] if row["staff"] == str(self.staff.id))
+        matrix_assignment = matrix_row["assignments"]["2026-07-01"]
+        self.assertEqual(matrix_assignment["warning_count"], day["assignment"]["warning_count"])
+
+        large_plan = self.create_plan(month=8)
+        large_staff = [self.create_user(f"warning_timeline_staff_{index}", ROLE_STAFF) for index in range(4)]
+        for staff in large_staff:
+            StaffCapability.objects.create(
+                staff=staff,
+                work_type=self.front_work,
+                location=self.location,
+                level=StaffCapability.Level.ASSISTED,
+                valid_from="2026-01-01",
+                approved_by=self.system_admin,
+                approved_at=timezone.now(),
+            )
+            for day_number in range(1, 5):
+                item = self.create_assignment_record(
+                    large_plan,
+                    staff=staff,
+                    work_date=f"2026-08-{day_number:02d}",
+                    work_type=self.gym_work,
+                    work_area=self.gym_area,
+                    start_offset_minutes=540,
+                    end_offset_minutes=600,
+                    display_order=10,
+                )
+                MonthlyShiftSegment.objects.create(
+                    monthly_shift_assignment=item,
+                    work_type=self.front_work,
+                    work_area=self.front_area,
+                    work_type_name_snapshot=self.front_work.name,
+                    work_type_short_name_snapshot=self.front_work.short_name,
+                    work_type_color_key_snapshot=self.front_work.color_key,
+                    work_type_is_break_snapshot=self.front_work.is_break,
+                    work_area_name_snapshot=self.front_area.name,
+                    start_offset_minutes=600,
+                    end_offset_minutes=660,
+                    display_order=20,
+                )
+
+        with CaptureQueriesContext(connection) as small_queries:
+            small = client.get(
+                f"/api/v1/monthly-shift-plans/{plan.id}/timeline/"
+                f"?date_from=2026-07-01&date_to=2026-07-01&work_type={self.gym_work.id}"
+            )
+        self.assertEqual(small.status_code, 200, small.data)
+        with CaptureQueriesContext(connection) as large_queries:
+            large = client.get(
+                f"/api/v1/monthly-shift-plans/{large_plan.id}/timeline/"
+                f"?date_from=2026-08-01&date_to=2026-08-04&work_type={self.gym_work.id}"
+            )
+        self.assertEqual(large.status_code, 200, large.data)
+        self.assertEqual(large.data["summary"]["assignment_count"], 16)
+        self.assertLessEqual(len(large_queries) - len(small_queries), 3)
+
+    def test_timeline_lanes_reuse_touching_boundaries_and_overlap_three_segments(self):
+        plan = self.create_plan()
+        assignment = self.create_assignment_record(
+            plan,
+            work_date="2026-07-01",
+            start_offset_minutes=540,
+            end_offset_minutes=660,
+            display_order=30,
+        )
+        MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=self.break_work,
+            work_area=None,
+            work_type_name_snapshot=self.break_work.name,
+            work_type_short_name_snapshot=self.break_work.short_name,
+            work_type_color_key_snapshot=self.break_work.color_key,
+            work_type_is_break_snapshot=self.break_work.is_break,
+            work_area_name_snapshot="",
+            start_offset_minutes=570,
+            end_offset_minutes=630,
+            display_order=10,
+        )
+        MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=self.front_work,
+            work_area=self.front_area,
+            work_type_name_snapshot=self.front_work.name,
+            work_type_short_name_snapshot=self.front_work.short_name,
+            work_type_color_key_snapshot=self.front_work.color_key,
+            work_type_is_break_snapshot=self.front_work.is_break,
+            work_area_name_snapshot=self.front_area.name,
+            start_offset_minutes=600,
+            end_offset_minutes=690,
+            display_order=20,
+        )
+        MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=self.front_work,
+            work_area=self.front_area,
+            work_type_name_snapshot=self.front_work.name,
+            work_type_short_name_snapshot=self.front_work.short_name,
+            work_type_color_key_snapshot=self.front_work.color_key,
+            work_type_is_break_snapshot=self.front_work.is_break,
+            work_area_name_snapshot=self.front_area.name,
+            start_offset_minutes=690,
+            end_offset_minutes=750,
+            display_order=5,
+        )
+
+        response = self.force_client(self.system_admin).get(
+            f"/api/v1/monthly-shift-plans/{plan.id}/timeline/?date_from=2026-07-01&date_to=2026-07-01"
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        segments = response.data["rows"][0]["days"]["2026-07-01"]["segments"]
+        lanes_by_start = {segment["start_offset_minutes"]: segment["lane"] for segment in segments}
+        self.assertEqual(lanes_by_start, {540: 0, 570: 1, 600: 2, 690: 0})
+        self.assertEqual({segment["lane_count"] for segment in segments}, {3})
+
+    def test_timeline_assigned_only_false_staff_search_and_query_count(self):
+        plan = self.create_plan()
+        self.create_assignment_record(plan, work_date="2026-07-01")
+        other_staff = self.shift_manager
+        StaffLocation.objects.update_or_create(
+            staff=other_staff,
+            location=self.location,
+            valid_from="2026-07-03",
+            valid_until=None,
+            defaults={"is_active": True},
+        )
+        client = self.force_client(self.system_admin)
+        assigned = client.get(
+            f"/api/v1/monthly-shift-plans/{plan.id}/timeline/?date_from=2026-07-01&date_to=2026-07-03"
+        )
+        self.assertEqual(assigned.status_code, 200, assigned.data)
+        self.assertEqual(assigned.data["summary"]["staff_count"], 1)
+        all_staff = client.get(
+            f"/api/v1/monthly-shift-plans/{plan.id}/timeline/"
+            "?date_from=2026-07-01&date_to=2026-07-03&assigned_only=false"
+        )
+        self.assertEqual(all_staff.status_code, 200, all_staff.data)
+        self.assertGreaterEqual(all_staff.data["summary"]["staff_count"], 2)
+        searched = client.get(
+            f"/api/v1/monthly-shift-plans/{plan.id}/timeline/"
+            f"?date_from=2026-07-01&date_to=2026-07-03&assigned_only=false&staff_search={self.staff.employee_code}"
+        )
+        self.assertEqual(searched.data["summary"]["staff_count"], 1)
+
+        large_plan = self.create_plan(month=8)
+        large_staff = [self.create_user(f"timeline_staff_{index}", ROLE_STAFF) for index in range(8)]
+        for staff in large_staff:
+            StaffLocation.objects.create(
+                staff=staff,
+                location=self.location,
+                is_primary=False,
+                valid_from="2026-08-01",
+                valid_until=None,
+            )
+            for day in range(1, 8):
+                self.create_assignment_record(large_plan, staff=staff, work_date=f"2026-08-{day:02d}")
+        with CaptureQueriesContext(connection) as small_queries:
+            small = client.get(
+                f"/api/v1/monthly-shift-plans/{plan.id}/timeline/?date_from=2026-07-01&date_to=2026-07-01"
+            )
+        self.assertEqual(small.status_code, 200, small.data)
+        with CaptureQueriesContext(connection) as large_queries:
+            large = client.get(
+                f"/api/v1/monthly-shift-plans/{large_plan.id}/timeline/?date_from=2026-08-01&date_to=2026-08-07"
+            )
+        self.assertEqual(large.status_code, 200, large.data)
+        self.assertEqual(large.data["summary"]["assignment_count"], 56)
+        self.assertEqual(large.data["summary"]["staff_count"], 8)
+        self.assertLessEqual(len(large_queries) - len(small_queries), 3)
+
+        filtered_large = client.get(
+            f"/api/v1/monthly-shift-plans/{large_plan.id}/timeline/"
+            f"?date_from=2026-08-01&date_to=2026-08-07&work_type={self.gym_work.id}"
+        )
+        self.assertEqual(filtered_large.status_code, 200, filtered_large.data)
+        self.assertEqual(filtered_large.data["summary"]["assignment_count"], 56)
 
     def test_plan_permissions_immutability_deactivate_and_reactivate_conflict(self):
         admin = self.force_client(self.system_admin)

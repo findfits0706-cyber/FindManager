@@ -1,12 +1,12 @@
 from django.db import transaction
-from django.db.models import Case, Count, IntegerField, Prefetch, Q, Value, When
+from django.db.models import Count, Prefetch, Q
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
 from apps.accounts.models import User
-from apps.operations.models import StaffCapability, StaffLocation
+from apps.operations.models import StaffLocation
 
 from .models import MonthlyShiftAssignment, MonthlyShiftPlan, MonthlyShiftSegment, ShiftPattern, WeeklyShiftTemplate
 from .serializers import (
@@ -24,6 +24,7 @@ from .serializers import (
 )
 from .services import (
     apply_template_generation,
+    build_capability_lookup,
     can_manage_shifts,
     can_view_shifts,
     deactivate_instance,
@@ -33,6 +34,7 @@ from .services import (
     ensure_active_monthly_plan,
     month_dates,
     monthly_assignment_metadata,
+    monthly_assignment_warning_count,
     monthly_plan_metadata,
     preview_template_generation,
     record_shift_event,
@@ -43,6 +45,7 @@ from .services import (
     validate_and_reactivate_template,
     weekly_template_metadata,
 )
+from .timeline_services import build_timeline_response
 
 
 class ShiftSettingsPermission(permissions.BasePermission):
@@ -389,57 +392,12 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
             if assigned_only
             else assignment_staff_ids | staff_location_ids | inactive_assignment_staff_ids
         )
-        required_pairs = {
-            (item.staff_id, segment.work_type_id)
-            for item in assignment_list
-            for segment in item.segments.all()
-            if segment.work_type.requires_capability
-        }
-        capabilities_by_staff_work_type: dict[tuple[str, str], list[StaffCapability]] = {}
-        if required_pairs:
-            required_staff_ids = {staff_id for staff_id, _work_type_id in required_pairs}
-            required_work_type_ids = {work_type_id for _staff_id, work_type_id in required_pairs}
-            capabilities = (
-                StaffCapability.objects.filter(
-                    staff_id__in=required_staff_ids,
-                    work_type_id__in=required_work_type_ids,
-                    is_active=True,
-                    valid_from__lte=end_date,
-                )
-                .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=start_date))
-                .filter(Q(location=plan.location) | Q(location__isnull=True))
-                .annotate(
-                    location_priority=Case(
-                        When(location=plan.location, then=Value(0)),
-                        When(location__isnull=True, then=Value(1)),
-                        default=Value(2),
-                        output_field=IntegerField(),
-                    )
-                )
-                .order_by("staff_id", "work_type_id", "location_priority", "display_order", "created_at")
-            )
-            for capability in capabilities:
-                key = (str(capability.staff_id), str(capability.work_type_id))
-                capabilities_by_staff_work_type.setdefault(key, []).append(capability)
-
-        def capability_for(staff_id, work_type_id, work_date):
-            for capability in capabilities_by_staff_work_type.get((str(staff_id), str(work_type_id)), []):
-                if capability.valid_from <= work_date and (
-                    capability.valid_until is None or capability.valid_until >= work_date
-                ):
-                    return capability
-            return None
-
-        def warning_count_for(assignment):
-            warning_levels = {StaffCapability.Level.ASSISTED, StaffCapability.Level.TRAINEE}
-            warning_count = 0
-            for segment in assignment.segments.all():
-                if not segment.work_type.requires_capability:
-                    continue
-                capability = capability_for(assignment.staff_id, segment.work_type_id, assignment.work_date)
-                if capability is not None and capability.level in warning_levels:
-                    warning_count += 1
-            return warning_count
+        capability_lookup = build_capability_lookup(
+            assignments=assignment_list,
+            location=plan.location,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
         staff_queryset = User.objects.filter(id__in=staff_ids)
         if staff_search:
@@ -484,7 +442,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                         ),
                         "source_type": assignment.source_type,
                         "is_customized": assignment.is_customized,
-                        "warning_count": warning_count_for(assignment),
+                        "warning_count": monthly_assignment_warning_count(assignment, capability_lookup),
                     }
                     continue
                 inactive = inactive_by_staff_date.get((str(staff.id), work_date.isoformat()))
@@ -527,6 +485,11 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                 "rows": rows,
             }
         )
+
+    @action(detail=True, methods=["get"])
+    def timeline(self, request, pk=None):
+        plan = self.get_object()
+        return Response(build_timeline_response(plan, request.query_params))
 
     @action(detail=True, methods=["post"], url_path="preview-template-generation")
     def preview_template_generation(self, request, pk=None):

@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
-import { Navigate } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Navigate, useLocation } from "react-router-dom";
 import { api } from "../api/client";
 import { useAuth } from "../features/auth/AuthContext";
 import { buildOffsetOptions, offsetToLabel } from "../lib/timeOffsets";
@@ -67,13 +67,18 @@ function patternSegmentToForm(segment: NonNullable<ShiftPattern["segments"]>[num
 }
 
 export function MonthlyShiftsPage() {
-  const { user } = useAuth();
+  const { user, loading } = useAuth();
+  const routerLocation = useLocation();
+  const searchParams = useMemo(() => new URLSearchParams(routerLocation.search), [routerLocation.search]);
+  const initialYear = Number(searchParams.get("year")) || defaultYear;
+  const initialMonth = Number(searchParams.get("month")) || defaultMonth;
+  const initialLocation = searchParams.get("location") ?? "";
   const roles = user?.roles ?? [];
   const canManage = roles.includes("system_admin") || roles.includes("shift_manager");
   const canView = canManage || roles.includes("supervisor");
-  const [location, setLocation] = useState("");
-  const [year, setYear] = useState(defaultYear);
-  const [month, setMonth] = useState(defaultMonth);
+  const [location, setLocation] = useState(initialLocation);
+  const [year, setYear] = useState(initialYear);
+  const [month, setMonth] = useState(initialMonth);
   const [plan, setPlan] = useState<MonthlyShiftPlan | null>(null);
   const [staffSearch, setStaffSearch] = useState("");
   const [assignedOnly, setAssignedOnly] = useState(false);
@@ -91,6 +96,7 @@ export function MonthlyShiftsPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
+  const processedDeepLinkKey = useRef("");
 
   const locationQuery = useQuery({
     enabled: canView,
@@ -105,47 +111,107 @@ export function MonthlyShiftsPage() {
         `/api/v1/monthly-shift-plans/?page_size=10&location=${location}&year=${year}&month=${month}&is_active=true`,
       ),
   });
+  const deepLinkDate = searchParams.get("date");
+  const deepLinkStaff = searchParams.get("staff");
+  const hasDeepLink = Boolean(deepLinkDate && deepLinkStaff);
+  const activePlan = plan ?? planQuery.data?.results[0] ?? null;
   const matrixQuery = useQuery({
-    enabled: canView && Boolean(plan),
-    queryKey: ["monthly-shift-matrix", plan?.id, staffSearch, assignedOnly],
+    enabled: canView && Boolean(activePlan),
+    queryKey: ["monthly-shift-matrix", activePlan?.id, staffSearch, assignedOnly],
     queryFn: () =>
       api<MonthlyShiftMatrix>(
-        `/api/v1/monthly-shift-plans/${plan?.id}/matrix/?staff_search=${encodeURIComponent(staffSearch)}${
+        `/api/v1/monthly-shift-plans/${activePlan?.id}/matrix/?staff_search=${encodeURIComponent(staffSearch)}${
           assignedOnly ? "&assigned_only=true" : ""
         }`,
       ),
   });
   const patternQuery = useQuery({
-    enabled: canView && Boolean(plan?.location),
-    queryKey: ["shift-patterns", "monthly", plan?.location],
-    queryFn: () => api<Paginated<ShiftPattern>>(`/api/v1/shift-patterns/?page_size=100&is_active=true&location=${plan?.location}`),
+    enabled: canView && Boolean(activePlan?.location),
+    queryKey: ["shift-patterns", "monthly", activePlan?.location],
+    queryFn: () => api<Paginated<ShiftPattern>>(`/api/v1/shift-patterns/?page_size=100&is_active=true&location=${activePlan?.location}`),
   });
   const templateQuery = useQuery({
-    enabled: canView && Boolean(plan?.location),
-    queryKey: ["weekly-shift-templates", "monthly", plan?.location],
+    enabled: canView && Boolean(activePlan?.location),
+    queryKey: ["weekly-shift-templates", "monthly", activePlan?.location],
     queryFn: () =>
-      api<Paginated<WeeklyShiftTemplate>>(`/api/v1/weekly-shift-templates/?page_size=100&is_active=true&location=${plan?.location}`),
+      api<Paginated<WeeklyShiftTemplate>>(`/api/v1/weekly-shift-templates/?page_size=100&is_active=true&location=${activePlan?.location}`),
   });
   const workTypeQuery = useQuery({
-    enabled: canView && Boolean(plan?.location),
-    queryKey: ["work-types", "monthly", plan?.location],
-    queryFn: () => api<Paginated<WorkType>>(`/api/v1/work-types/?page_size=100&is_active=true&location=${plan?.location}`),
+    enabled: canView && Boolean(activePlan?.location),
+    queryKey: ["work-types", "monthly", activePlan?.location],
+    queryFn: () => api<Paginated<WorkType>>(`/api/v1/work-types/?page_size=100&is_active=true&location=${activePlan?.location}`),
   });
   const workAreaQuery = useQuery({
-    enabled: canView && Boolean(plan?.location),
-    queryKey: ["work-areas", "monthly", plan?.location],
-    queryFn: () => api<Paginated<WorkArea>>(`/api/v1/work-areas/?page_size=100&is_active=true&location=${plan?.location}`),
+    enabled: canView && Boolean(activePlan?.location),
+    queryKey: ["work-areas", "monthly", activePlan?.location],
+    queryFn: () => api<Paginated<WorkArea>>(`/api/v1/work-areas/?page_size=100&is_active=true&location=${activePlan?.location}`),
   });
   const availabilityQuery = useQuery({
-    enabled: canView && Boolean(plan?.location),
-    queryKey: ["work-type-availabilities", "monthly", plan?.location],
+    enabled: canView && Boolean(activePlan?.location),
+    queryKey: ["work-type-availabilities", "monthly", activePlan?.location],
     queryFn: () =>
       api<Paginated<WorkTypeAvailability>>(
-        `/api/v1/work-type-availabilities/?page_size=200&is_active=true&location=${plan?.location}`,
+        `/api/v1/work-type-availabilities/?page_size=200&is_active=true&location=${activePlan?.location}`,
       ),
   });
+  useEffect(() => {
+    if (!plan && (initialLocation || (location && hasDeepLink)) && planQuery.data?.results[0]) {
+      setPlan(planQuery.data.results[0]);
+    }
+  }, [hasDeepLink, initialLocation, location, plan, planQuery.data]);
+  useEffect(() => {
+    const targetDate = deepLinkDate;
+    const targetStaff = deepLinkStaff;
+    if (!targetDate || !targetStaff || !matrixQuery.data) return;
+    const key = `${location}|${year}|${month}|${targetDate}|${targetStaff}`;
+    if (processedDeepLinkKey.current === key) return;
+    const row = matrixQuery.data.rows.find((item) => item.staff === targetStaff);
+    if (!row) return;
+    if (!matrixQuery.data.dates.some((item) => item.date === targetDate)) return;
+    processedDeepLinkKey.current = key;
+    const cell = row.assignments[targetDate];
+    const inactive = row.inactive_assignments?.[targetDate];
+    const nextSelection = {
+      staff: row.staff,
+      staffName: row.staff_display_name,
+      workDate: targetDate,
+      assignmentId: cell?.id,
+      inactiveAssignmentId: inactive?.id,
+      inactivePatternShortName: inactive?.pattern_short_name,
+    };
+    let cancelled = false;
+    if (!cell) {
+      setSelected(nextSelection);
+      setAssignment(null);
+      setSelectedPattern("");
+      setSegments([]);
+      setNotes("");
+      setIsDirty(false);
+      return undefined;
+    }
+    setSelected(nextSelection);
+    setError("");
+    setMessage("");
+    void api<MonthlyShiftAssignment>(`/api/v1/monthly-shift-assignments/${cell.id}/`)
+      .then((detail) => {
+        if (cancelled) return;
+        setAssignment(detail);
+        setSelectedPattern(detail.source_shift_pattern ?? "");
+        setSegments((detail.segments ?? []).filter((segment) => segment.is_active).map(toSegmentForm));
+        setNotes(detail.notes);
+        setIsDirty(false);
+      })
+      .catch((deepLinkError) => {
+        if (cancelled) return;
+        setSelected(nextSelection);
+        setError(deepLinkError instanceof Error ? deepLinkError.message : "勤務詳細の取得に失敗しました。");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [deepLinkDate, deepLinkStaff, location, matrixQuery.data, month, year]);
 
-  const currentPreviewKey = `${plan?.id ?? ""}|${templateId}|${existingMode}|${invalidMode}`;
+  const currentPreviewKey = `${activePlan?.id ?? ""}|${templateId}|${existingMode}|${invalidMode}`;
   const availableWorkTypeIds = useMemo(
     () => new Set((availabilityQuery.data?.results ?? []).map((item) => item.work_type)),
     [availabilityQuery.data?.results],
@@ -159,6 +225,7 @@ export function MonthlyShiftsPage() {
       (item) => item.work_type === workType && (item.work_area === null || item.work_area === workArea),
     );
 
+  if (loading) return <section className="card monthly-page">読み込み中...</section>;
   if (!canView) return <Navigate to="/403" replace />;
 
   const changeMonth = (delta: number) => {
@@ -288,7 +355,7 @@ export function MonthlyShiftsPage() {
   };
 
   const saveAssignment = async () => {
-    if (!selected || !plan || isSubmitting) return;
+    if (!selected || !activePlan || isSubmitting) return;
     setIsSubmitting(true);
     setError("");
     try {
@@ -308,7 +375,7 @@ export function MonthlyShiftsPage() {
         const saved = await api<MonthlyShiftAssignment>("/api/v1/monthly-shift-assignments/", {
           method: "POST",
           body: JSON.stringify({
-            monthly_shift_plan: plan.id,
+            monthly_shift_plan: activePlan.id,
             work_date: selected.workDate,
             staff: selected.staff,
             shift_pattern: selectedPattern,
@@ -367,10 +434,10 @@ export function MonthlyShiftsPage() {
   };
 
   const previewTemplate = async () => {
-    if (!plan || !templateId) return;
+    if (!activePlan || !templateId) return;
     setError("");
     try {
-      const result = await api<TemplateGenerationResult>(`/api/v1/monthly-shift-plans/${plan.id}/preview-template-generation/`, {
+      const result = await api<TemplateGenerationResult>(`/api/v1/monthly-shift-plans/${activePlan.id}/preview-template-generation/`, {
         method: "POST",
         body: JSON.stringify({ weekly_shift_template: templateId, existing_mode: existingMode, invalid_mode: invalidMode }),
       });
@@ -382,12 +449,12 @@ export function MonthlyShiftsPage() {
   };
 
   const applyTemplate = async () => {
-    if (!plan || !templateId || isSubmitting) return;
+    if (!activePlan || !templateId || isSubmitting) return;
     if (existingMode === "replace_template_generated" && !window.confirm("テンプレート生成済み勤務を置換します。")) return;
     setIsSubmitting(true);
     setError("");
     try {
-      const result = await api<TemplateGenerationResult>(`/api/v1/monthly-shift-plans/${plan.id}/apply-template/`, {
+      const result = await api<TemplateGenerationResult>(`/api/v1/monthly-shift-plans/${activePlan.id}/apply-template/`, {
         method: "POST",
         body: JSON.stringify({ weekly_shift_template: templateId, existing_mode: existingMode, invalid_mode: invalidMode }),
       });
@@ -415,10 +482,10 @@ export function MonthlyShiftsPage() {
         <button type="button" disabled={!location} onClick={() => void openOrCreatePlan()}>{planQuery.data?.results[0] ? "月間表を開く" : canManage ? "新規作成" : "月間表なし"}</button>
       </div>
       {canManage ? <div className="toolbar field-grid">
-        <label>週間テンプレート<select value={templateId} disabled={!plan} onChange={(event) => { setTemplateId(event.target.value); setPreview(null); setPreviewKey(""); }}><option value="">選択してください</option>{templateQuery.data?.results.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+        <label>週間テンプレート<select value={templateId} disabled={!activePlan} onChange={(event) => { setTemplateId(event.target.value); setPreview(null); setPreviewKey(""); }}><option value="">選択してください</option>{templateQuery.data?.results.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
         <label>既存<select value={existingMode} onChange={(event) => { setExistingMode(event.target.value as typeof existingMode); setPreview(null); setPreviewKey(""); }}><option value="skip_existing">既存を保持</option><option value="replace_template_generated">生成済みを置換</option></select></label>
         <label>不正候補<select value={invalidMode} onChange={(event) => { setInvalidMode(event.target.value as typeof invalidMode); setPreview(null); setPreviewKey(""); }}><option value="strict">strict</option><option value="skip_invalid">skip_invalid</option></select></label>
-        <button type="button" disabled={!templateId || !plan} onClick={() => void previewTemplate()}>生成プレビュー</button>
+        <button type="button" disabled={!templateId || !activePlan} onClick={() => void previewTemplate()}>生成プレビュー</button>
         {canManage ? <button type="button" disabled={!preview || previewKey !== currentPreviewKey || (invalidMode === "strict" && preview.summary.error_count > 0) || isSubmitting} onClick={() => void applyTemplate()}>テンプレート適用</button> : null}
       </div> : null}
       <div className="toolbar field-grid">
@@ -428,8 +495,8 @@ export function MonthlyShiftsPage() {
       {error ? <p className="error">{error}</p> : null}
       {message ? <p className="success">{message}</p> : null}
       {matrixQuery.isError ? <p className="error">月間表の取得に失敗しました。</p> : null}
-      {!plan ? <p className="subtle-text">拠点と年月を選び、月間表を開いてください。</p> : null}
-      {plan && matrixQuery.isLoading ? <p>読み込み中...</p> : null}
+      {!activePlan ? <p className="subtle-text">拠点と年月を選び、月間表を開いてください。</p> : null}
+      {activePlan && matrixQuery.isLoading ? <p>読み込み中...</p> : null}
       <div className="monthly-layout">
         <div className="monthly-grid-wrap">
           <table className="table monthly-grid">

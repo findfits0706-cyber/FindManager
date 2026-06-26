@@ -3,6 +3,9 @@ from rest_framework import serializers
 from .models import (
     MonthlyShiftAssignment,
     MonthlyShiftPlan,
+    MonthlyShiftPublication,
+    MonthlyShiftPublicationAssignment,
+    MonthlyShiftPublicationSegment,
     MonthlyShiftSegment,
     ShiftPattern,
     ShiftPatternSegment,
@@ -285,8 +288,12 @@ class MonthlyShiftSegmentSerializer(serializers.ModelSerializer):
 class MonthlyShiftPlanSerializer(serializers.ModelSerializer):
     location_name = serializers.CharField(source="location.name", read_only=True)
     source_weekly_template_name = serializers.CharField(source="source_weekly_template.name", read_only=True)
+    confirmed_by_display_name = serializers.CharField(source="confirmed_by.display_name", read_only=True)
     assignment_count = serializers.SerializerMethodField()
     staff_count = serializers.SerializerMethodField()
+    is_editable = serializers.SerializerMethodField()
+    current_publication = serializers.SerializerMethodField()
+    publication_count = serializers.SerializerMethodField()
 
     class Meta:
         model = MonthlyShiftPlan
@@ -304,6 +311,14 @@ class MonthlyShiftPlanSerializer(serializers.ModelSerializer):
             "source_weekly_template_name",
             "last_generated_at",
             "last_generated_by",
+            "workflow_status",
+            "confirmed_at",
+            "confirmed_by",
+            "confirmed_by_display_name",
+            "confirmed_content_hash",
+            "is_editable",
+            "current_publication",
+            "publication_count",
             "is_active",
             "created_at",
             "updated_at",
@@ -315,6 +330,14 @@ class MonthlyShiftPlanSerializer(serializers.ModelSerializer):
             "source_weekly_template_name",
             "last_generated_at",
             "last_generated_by",
+            "workflow_status",
+            "confirmed_at",
+            "confirmed_by",
+            "confirmed_by_display_name",
+            "confirmed_content_hash",
+            "is_editable",
+            "current_publication",
+            "publication_count",
             "is_active",
             "created_at",
             "updated_at",
@@ -331,10 +354,40 @@ class MonthlyShiftPlanSerializer(serializers.ModelSerializer):
             return obj.active_staff_count
         return obj.assignments.filter(is_active=True).values("staff_id").distinct().count()
 
+    def get_is_editable(self, obj):
+        return obj.is_active and obj.workflow_status == MonthlyShiftPlan.WorkflowStatus.DRAFT
+
+    def get_current_publication(self, obj):
+        if hasattr(obj, "active_publications"):
+            publication = obj.active_publications[0] if obj.active_publications else None
+        else:
+            publication = obj.publications.filter(is_active=True).order_by("-version").first()
+        if publication is None:
+            return None
+        return {
+            "id": str(publication.id),
+            "version": publication.version,
+            "published_at": publication.published_at,
+            "published_by": str(publication.published_by_id),
+        }
+
+    def get_publication_count(self, obj):
+        if hasattr(obj, "publication_total"):
+            return obj.publication_total
+        return obj.publications.count()
+
     def validate(self, attrs):
-        forbidden = {"is_active", "created_at", "updated_at", "last_generated_at", "last_generated_by"}.intersection(
-            self.initial_data
-        )
+        forbidden = {
+            "is_active",
+            "created_at",
+            "updated_at",
+            "last_generated_at",
+            "last_generated_by",
+            "workflow_status",
+            "confirmed_at",
+            "confirmed_by",
+            "confirmed_content_hash",
+        }.intersection(self.initial_data)
         if forbidden:
             raise serializers.ValidationError({field: "This field is read-only." for field in forbidden})
         if self.instance is not None:
@@ -370,6 +423,10 @@ class MonthlyShiftPlanListSerializer(MonthlyShiftPlanSerializer):
             "last_generated_at",
             "source_weekly_template",
             "source_weekly_template_name",
+            "workflow_status",
+            "is_editable",
+            "current_publication",
+            "publication_count",
             "is_active",
             "created_at",
             "updated_at",
@@ -518,3 +575,172 @@ class TemplateGenerationSerializer(serializers.Serializer):
         choices=["skip_existing", "replace_template_generated"], default="skip_existing"
     )
     invalid_mode = serializers.ChoiceField(choices=["strict", "skip_invalid"], default="strict")
+
+
+class PublicationAcknowledgeSerializer(serializers.Serializer):
+    acknowledge_warnings = serializers.BooleanField(default=False)
+
+
+class PublicationWithdrawSerializer(serializers.Serializer):
+    reason = serializers.CharField(max_length=1000, trim_whitespace=True)
+
+
+class MonthlyShiftPublicationSegmentSerializer(serializers.ModelSerializer):
+    duration_minutes = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MonthlyShiftPublicationSegment
+        fields = [
+            "id",
+            "source_segment",
+            "work_type",
+            "work_area",
+            "work_type_name_snapshot",
+            "work_type_short_name_snapshot",
+            "work_type_color_key_snapshot",
+            "work_type_is_break_snapshot",
+            "work_area_name_snapshot",
+            "start_offset_minutes",
+            "end_offset_minutes",
+            "duration_minutes",
+            "display_order",
+            "notes",
+            "created_at",
+        ]
+
+    def get_duration_minutes(self, obj):
+        return obj.end_offset_minutes - obj.start_offset_minutes
+
+
+class MonthlyShiftPublicationAssignmentSerializer(serializers.ModelSerializer):
+    segments = MonthlyShiftPublicationSegmentSerializer(many=True, read_only=True)
+    start_offset_minutes = serializers.SerializerMethodField()
+    end_offset_minutes = serializers.SerializerMethodField()
+    work_minutes = serializers.SerializerMethodField()
+    break_minutes = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MonthlyShiftPublicationAssignment
+        fields = [
+            "id",
+            "source_assignment",
+            "work_date",
+            "staff",
+            "staff_display_name_snapshot",
+            "employee_code_snapshot",
+            "source_type",
+            "is_customized",
+            "pattern_code_snapshot",
+            "pattern_name_snapshot",
+            "pattern_short_name_snapshot",
+            "notes",
+            "display_order",
+            "warning_count_snapshot",
+            "start_offset_minutes",
+            "end_offset_minutes",
+            "work_minutes",
+            "break_minutes",
+            "segments",
+            "created_at",
+        ]
+
+    def _segments(self, obj):
+        return list(obj.segments.all())
+
+    def get_start_offset_minutes(self, obj):
+        return min((segment.start_offset_minutes for segment in self._segments(obj)), default=None)
+
+    def get_end_offset_minutes(self, obj):
+        return max((segment.end_offset_minutes for segment in self._segments(obj)), default=None)
+
+    def get_work_minutes(self, obj):
+        return sum(
+            segment.end_offset_minutes - segment.start_offset_minutes
+            for segment in self._segments(obj)
+            if not segment.work_type_is_break_snapshot
+        )
+
+    def get_break_minutes(self, obj):
+        return sum(
+            segment.end_offset_minutes - segment.start_offset_minutes
+            for segment in self._segments(obj)
+            if segment.work_type_is_break_snapshot
+        )
+
+
+class MonthlyShiftPublicationSerializer(serializers.ModelSerializer):
+    published_by_display_name = serializers.CharField(source="published_by.display_name", read_only=True)
+    withdrawn_by_display_name = serializers.CharField(source="withdrawn_by.display_name", read_only=True)
+    assignment_count = serializers.SerializerMethodField()
+    staff_count = serializers.SerializerMethodField()
+    segment_count = serializers.SerializerMethodField()
+    assignments = MonthlyShiftPublicationAssignmentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = MonthlyShiftPublication
+        fields = [
+            "id",
+            "monthly_shift_plan",
+            "version",
+            "content_hash",
+            "location",
+            "location_name_snapshot",
+            "location_short_name_snapshot",
+            "year",
+            "month",
+            "plan_name_snapshot",
+            "plan_notes_snapshot",
+            "published_by",
+            "published_by_display_name",
+            "published_at",
+            "withdrawn_by",
+            "withdrawn_by_display_name",
+            "withdrawn_at",
+            "withdrawal_reason",
+            "is_active",
+            "assignment_count",
+            "staff_count",
+            "segment_count",
+            "assignments",
+            "created_at",
+        ]
+
+    def get_assignment_count(self, obj):
+        if hasattr(obj, "assignment_total"):
+            return obj.assignment_total
+        return obj.assignments.count()
+
+    def get_staff_count(self, obj):
+        if hasattr(obj, "staff_total"):
+            return obj.staff_total
+        return obj.assignments.values("staff_id").distinct().count()
+
+    def get_segment_count(self, obj):
+        if hasattr(obj, "segment_total"):
+            return obj.segment_total
+        return MonthlyShiftPublicationSegment.objects.filter(publication_assignment__publication=obj).count()
+
+
+class MonthlyShiftPublicationListSerializer(MonthlyShiftPublicationSerializer):
+    class Meta(MonthlyShiftPublicationSerializer.Meta):
+        fields = [field for field in MonthlyShiftPublicationSerializer.Meta.fields if field != "assignments"]
+
+
+class MyPublishedShiftSerializer(MonthlyShiftPublicationAssignmentSerializer):
+    publication = serializers.SerializerMethodField()
+
+    class Meta(MonthlyShiftPublicationAssignmentSerializer.Meta):
+        fields = MonthlyShiftPublicationAssignmentSerializer.Meta.fields + ["publication"]
+
+    def get_publication(self, obj):
+        publication = obj.publication
+        return {
+            "id": str(publication.id),
+            "version": publication.version,
+            "monthly_shift_plan": str(publication.monthly_shift_plan_id),
+            "location": str(publication.location_id),
+            "location_name": publication.location_name_snapshot,
+            "year": publication.year,
+            "month": publication.month,
+            "published_at": publication.published_at,
+        }

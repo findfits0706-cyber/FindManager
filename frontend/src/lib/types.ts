@@ -175,6 +175,14 @@ export type MonthlyShiftPlan = BaseEntity & {
   source_weekly_template: string | null;
   source_weekly_template_name?: string;
   last_generated_at: string | null;
+  workflow_status: "draft" | "confirmed" | "published";
+  confirmed_at: string | null;
+  confirmed_by: string | null;
+  confirmed_by_display_name?: string;
+  confirmed_content_hash: string;
+  is_editable: boolean;
+  current_publication: { id: string; version: number; published_at: string; published_by: string } | null;
+  publication_count: number;
 };
 
 export type MonthlyMatrixAssignment = {
@@ -296,6 +304,81 @@ export type TemplateGenerationResult = {
     action: string;
     issues: Array<{ severity: "error" | "warning"; code: string; message: string }>;
   }>;
+};
+
+export type PublicationPreview = {
+  content_hash: string;
+  summary: {
+    assignment_count: number;
+    staff_count: number;
+    segment_count: number;
+    work_minutes: number;
+    break_minutes: number;
+    error_count: number;
+    warning_count: number;
+  };
+  items: Array<{
+    scope: string;
+    assignment?: string;
+    work_date?: string;
+    staff?: string;
+    staff_display_name?: string;
+    pattern_short_name?: string;
+    warning_count?: number;
+    segment_count?: number;
+    issues: Array<{ severity: "error" | "warning"; code: string; message: string }>;
+  }>;
+  can_confirm: boolean;
+  can_publish: boolean;
+};
+
+export type MonthlyShiftPublicationSegment = {
+  id: string;
+  source_segment: string;
+  work_type: string;
+  work_area: string | null;
+  work_type_name_snapshot: string;
+  work_type_short_name_snapshot: string;
+  work_type_color_key_snapshot: string;
+  work_type_is_break_snapshot: boolean;
+  work_area_name_snapshot: string;
+  start_offset_minutes: number;
+  end_offset_minutes: number;
+  duration_minutes: number;
+  display_order: number;
+  notes: string;
+};
+
+export type MyPublishedShift = {
+  id: string;
+  source_assignment: string;
+  work_date: string;
+  staff: string;
+  staff_display_name_snapshot: string;
+  employee_code_snapshot: string;
+  source_type: "template" | "manual";
+  is_customized: boolean;
+  pattern_code_snapshot: string;
+  pattern_name_snapshot: string;
+  pattern_short_name_snapshot: string;
+  notes: string;
+  display_order: number;
+  warning_count_snapshot: number;
+  start_offset_minutes: number | null;
+  end_offset_minutes: number | null;
+  work_minutes: number;
+  break_minutes: number;
+  segments: MonthlyShiftPublicationSegment[];
+  publication: {
+    id: string;
+    version: number;
+    monthly_shift_plan: string;
+    location: string;
+    location_name: string;
+    year: number;
+    month: number;
+    published_at: string;
+  };
 };
 
 export type StaffLocation = BaseEntity & {

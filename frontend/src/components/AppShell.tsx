@@ -51,6 +51,7 @@ export function AppShell() {
       : []),
     ...(canViewSelfPages
       ? [
+          { to: "/shifts/my-published", label: "自分の公開シフト" },
           { to: "/operations/my-staff-locations", label: "自分の所属" },
           { to: "/operations/my-capabilities", label: "自分の対応可能業務" },
         ]

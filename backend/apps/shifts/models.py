@@ -212,6 +212,11 @@ class WeeklyShiftTemplateEntry(models.Model):
 
 
 class MonthlyShiftPlan(models.Model):
+    class WorkflowStatus(models.TextChoices):
+        DRAFT = "draft", "draft"
+        CONFIRMED = "confirmed", "confirmed"
+        PUBLISHED = "published", "published"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="monthly_shift_plans")
     year = models.PositiveSmallIntegerField()
@@ -233,6 +238,20 @@ class MonthlyShiftPlan(models.Model):
         null=True,
         blank=True,
     )
+    workflow_status = models.CharField(
+        max_length=20,
+        choices=WorkflowStatus.choices,
+        default=WorkflowStatus.DRAFT,
+    )
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    confirmed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="monthly_shift_plans_confirmed",
+        null=True,
+        blank=True,
+    )
+    confirmed_content_hash = models.CharField(max_length=64, blank=True)
     is_active = models.BooleanField(default=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -445,3 +464,130 @@ class MonthlyShiftSegment(models.Model):
             errors["end_offset_minutes"] = "A segment cannot exceed 24 hours."
         if errors:
             raise ValidationError(errors)
+
+
+class MonthlyShiftPublication(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    monthly_shift_plan = models.ForeignKey(
+        MonthlyShiftPlan,
+        on_delete=models.PROTECT,
+        related_name="publications",
+    )
+    version = models.PositiveIntegerField()
+    content_hash = models.CharField(max_length=64)
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="monthly_shift_publications")
+    location_name_snapshot = models.CharField(max_length=150)
+    location_short_name_snapshot = models.CharField(max_length=100)
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField()
+    plan_name_snapshot = models.CharField(max_length=150)
+    plan_notes_snapshot = models.TextField(blank=True)
+    published_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="monthly_shift_publications_published",
+    )
+    published_at = models.DateTimeField()
+    withdrawn_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="monthly_shift_publications_withdrawn",
+        null=True,
+        blank=True,
+    )
+    withdrawn_at = models.DateTimeField(null=True, blank=True)
+    withdrawal_reason = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-published_at", "-version"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["monthly_shift_plan", "version"],
+                name="unique_monthly_shift_publication_version",
+            ),
+            models.UniqueConstraint(
+                fields=["monthly_shift_plan"],
+                condition=Q(is_active=True),
+                name="unique_active_monthly_shift_publication",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.location_short_name_snapshot} / {self.year}-{self.month:02d} v{self.version}"
+
+
+class MonthlyShiftPublicationAssignment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    publication = models.ForeignKey(
+        MonthlyShiftPublication,
+        on_delete=models.PROTECT,
+        related_name="assignments",
+    )
+    source_assignment = models.ForeignKey(
+        MonthlyShiftAssignment,
+        on_delete=models.PROTECT,
+        related_name="publication_snapshots",
+    )
+    work_date = models.DateField()
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="monthly_shift_publication_assignments",
+    )
+    staff_display_name_snapshot = models.CharField(max_length=150)
+    employee_code_snapshot = models.CharField(max_length=50, blank=True)
+    source_type = models.CharField(max_length=20, choices=MonthlyShiftAssignment.SourceType.choices)
+    is_customized = models.BooleanField(default=False)
+    pattern_code_snapshot = models.CharField(max_length=50, blank=True)
+    pattern_name_snapshot = models.CharField(max_length=150, blank=True)
+    pattern_short_name_snapshot = models.CharField(max_length=100, blank=True)
+    notes = models.TextField(blank=True)
+    display_order = models.PositiveIntegerField(default=0)
+    warning_count_snapshot = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["work_date", "display_order", "employee_code_snapshot", "created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["publication", "work_date", "staff"],
+                name="unique_publication_assignment_cell",
+            ),
+        ]
+
+
+class MonthlyShiftPublicationSegment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    publication_assignment = models.ForeignKey(
+        MonthlyShiftPublicationAssignment,
+        on_delete=models.PROTECT,
+        related_name="segments",
+    )
+    source_segment = models.ForeignKey(
+        MonthlyShiftSegment,
+        on_delete=models.PROTECT,
+        related_name="publication_snapshots",
+    )
+    work_type = models.ForeignKey(WorkType, on_delete=models.PROTECT, related_name="monthly_shift_publication_segments")
+    work_area = models.ForeignKey(
+        WorkArea,
+        on_delete=models.PROTECT,
+        related_name="monthly_shift_publication_segments",
+        null=True,
+        blank=True,
+    )
+    work_type_name_snapshot = models.CharField(max_length=150)
+    work_type_short_name_snapshot = models.CharField(max_length=100)
+    work_type_color_key_snapshot = models.CharField(max_length=20)
+    work_type_is_break_snapshot = models.BooleanField(default=False)
+    work_area_name_snapshot = models.CharField(max_length=150, blank=True)
+    start_offset_minutes = models.IntegerField()
+    end_offset_minutes = models.IntegerField()
+    display_order = models.PositiveIntegerField(default=0)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["start_offset_minutes", "display_order", "created_at"]

@@ -19,6 +19,7 @@ from apps.operations.services import seed_operations
 from ..models import (
     MonthlyShiftAssignment,
     MonthlyShiftPlan,
+    MonthlyShiftPublication,
     MonthlyShiftSegment,
     ShiftPattern,
     ShiftPatternSegment,
@@ -998,6 +999,133 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         first_result = next(item for item in many_response.data["results"] if item["id"] == str(first_plan.id))
         self.assertEqual(first_result["assignment_count"], 2)
         self.assertEqual(first_result["staff_count"], 2)
+
+    def test_publication_workflow_locks_edits_and_exposes_snapshots(self):
+        client = self.force_client(self.system_admin)
+        plan = self.create_plan()
+        assignment = self.create_assignment_record(plan, work_date="2026-07-01")
+
+        preview = self.force_client(self.supervisor).post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/publication-preview/",
+            {},
+            format="json",
+        )
+        self.assertEqual(preview.status_code, 200, preview.data)
+        self.assertTrue(preview.data["can_confirm"])
+        self.assertEqual(preview.data["summary"]["assignment_count"], 1)
+        staff_preview = self.force_client(self.staff).post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/publication-preview/",
+            {},
+        )
+        self.assertEqual(staff_preview.status_code, 403)
+
+        confirmed = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/confirm/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.data)
+        plan.refresh_from_db()
+        self.assertEqual(plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.CONFIRMED)
+        self.assertTrue(plan.confirmed_content_hash)
+
+        locked_plan = client.patch(f"/api/v1/monthly-shift-plans/{plan.id}/", {"notes": "locked"}, format="json")
+        self.assertEqual(locked_plan.status_code, 400)
+        locked_assignment = client.patch(
+            f"/api/v1/monthly-shift-assignments/{assignment.id}/",
+            {"notes": "locked"},
+            format="json",
+        )
+        self.assertEqual(locked_assignment.status_code, 400)
+
+        reopened = client.post(f"/api/v1/monthly-shift-plans/{plan.id}/reopen/", {}, format="json")
+        self.assertEqual(reopened.status_code, 200, reopened.data)
+        self.assertEqual(reopened.data["workflow_status"], "draft")
+        editable_plan = client.patch(
+            f"/api/v1/monthly-shift-plans/{plan.id}/",
+            {"notes": "editable"},
+            format="json",
+        )
+        self.assertEqual(editable_plan.status_code, 200)
+
+        confirmed = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/confirm/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.data)
+        published = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/publish/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(published.status_code, 201, published.data)
+        plan.refresh_from_db()
+        self.assertEqual(plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.PUBLISHED)
+        publication = MonthlyShiftPublication.objects.get(id=published.data["publication"]["id"])
+        self.assertEqual(publication.assignments.count(), 1)
+        snapshot = publication.assignments.get()
+        self.assertEqual(snapshot.staff_display_name_snapshot, self.staff.display_name)
+        self.assertEqual(snapshot.segments.count(), 1)
+
+        assignment.notes = "current changed after publish"
+        assignment.save(update_fields=["notes", "updated_at"])
+        detail = client.get(f"/api/v1/monthly-shift-publications/{publication.id}/")
+        self.assertEqual(detail.status_code, 200, detail.data)
+        self.assertEqual(detail.data["assignments"][0]["notes"], "")
+        listing = client.get(f"/api/v1/monthly-shift-publications/?monthly_shift_plan={plan.id}&is_active=true")
+        self.assertEqual(listing.status_code, 200, listing.data)
+        self.assertEqual(listing.data["count"], 1)
+        self.assertEqual(self.force_client(self.staff).get("/api/v1/monthly-shift-publications/").status_code, 403)
+
+        my_shifts = self.force_client(self.staff).get(
+            "/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-07-31"
+        )
+        self.assertEqual(my_shifts.status_code, 200, my_shifts.data)
+        self.assertEqual(my_shifts.data["count"], 1)
+        self.assertEqual(my_shifts.data["results"][0]["publication"]["id"], str(publication.id))
+        self.assertEqual(
+            self.force_client(self.shift_manager)
+            .get("/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-09-10")
+            .status_code,
+            400,
+        )
+
+        withdrawn = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/withdraw-publication/",
+            {"reason": "再調整"},
+            format="json",
+        )
+        self.assertEqual(withdrawn.status_code, 200, withdrawn.data)
+        plan.refresh_from_db()
+        publication.refresh_from_db()
+        self.assertEqual(plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.CONFIRMED)
+        self.assertFalse(publication.is_active)
+        self.assertEqual(
+            self.force_client(self.staff)
+            .get("/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-07-31")
+            .data["count"],
+            0,
+        )
+
+    def test_publish_rejects_stale_confirmed_hash(self):
+        client = self.force_client(self.system_admin)
+        plan = self.create_plan()
+        self.create_assignment_record(plan, work_date="2026-07-01")
+        confirmed = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/confirm/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.data)
+        MonthlyShiftPlan.objects.filter(id=plan.id).update(name="Changed behind lock")
+        response = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/publish/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("content_hash", response.data)
 
     def test_matrix_capability_query_count_does_not_grow_per_assignment(self):
         client = self.force_client(self.system_admin)

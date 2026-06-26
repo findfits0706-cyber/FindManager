@@ -1,19 +1,36 @@
+from datetime import date
+from uuid import UUID
+
 from django.db import transaction
 from django.db.models import Count, Prefetch, Q
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 
 from apps.accounts.models import User
 from apps.operations.models import StaffLocation
 
-from .models import MonthlyShiftAssignment, MonthlyShiftPlan, MonthlyShiftSegment, ShiftPattern, WeeklyShiftTemplate
+from .models import (
+    MonthlyShiftAssignment,
+    MonthlyShiftPlan,
+    MonthlyShiftPublication,
+    MonthlyShiftPublicationAssignment,
+    MonthlyShiftPublicationSegment,
+    MonthlyShiftSegment,
+    ShiftPattern,
+    WeeklyShiftTemplate,
+)
 from .serializers import (
     MonthlyShiftAssignmentListSerializer,
     MonthlyShiftAssignmentSerializer,
     MonthlyShiftPlanListSerializer,
     MonthlyShiftPlanSerializer,
+    MonthlyShiftPublicationListSerializer,
+    MonthlyShiftPublicationSerializer,
+    MyPublishedShiftSerializer,
+    PublicationAcknowledgeSerializer,
+    PublicationWithdrawSerializer,
     ShiftPatternDuplicateSerializer,
     ShiftPatternListSerializer,
     ShiftPatternSerializer,
@@ -25,25 +42,30 @@ from .serializers import (
 from .services import (
     apply_template_generation,
     build_capability_lookup,
+    build_publication_preview,
     can_manage_shifts,
     can_view_shifts,
+    confirm_monthly_shift_plan,
     deactivate_instance,
     deactivate_monthly_instance,
     duplicate_shift_pattern,
     duplicate_weekly_template,
-    ensure_active_monthly_plan,
+    ensure_monthly_plan_editable,
     month_dates,
     monthly_assignment_metadata,
     monthly_assignment_warning_count,
     monthly_plan_metadata,
     preview_template_generation,
+    publish_monthly_shift_plan,
     record_shift_event,
+    reopen_monthly_shift_plan,
     shift_pattern_metadata,
     validate_and_reactivate_monthly_assignment,
     validate_and_reactivate_monthly_plan,
     validate_and_reactivate_pattern,
     validate_and_reactivate_template,
     weekly_template_metadata,
+    withdraw_monthly_shift_publication,
 )
 from .timeline_services import build_timeline_response
 
@@ -52,6 +74,8 @@ class ShiftSettingsPermission(permissions.BasePermission):
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
             return False
+        if getattr(view, "action", None) == "publication_preview":
+            return can_view_shifts(request.user)
         if request.method in permissions.SAFE_METHODS:
             return can_view_shifts(request.user)
         return can_manage_shifts(request.user)
@@ -275,10 +299,23 @@ class WeeklyShiftTemplateViewSet(ShiftManagementBaseViewSet):
 class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
     serializer_class = MonthlyShiftPlanSerializer
     queryset = (
-        MonthlyShiftPlan.objects.select_related("location", "source_weekly_template", "last_generated_by")
+        MonthlyShiftPlan.objects.select_related(
+            "location",
+            "source_weekly_template",
+            "last_generated_by",
+            "confirmed_by",
+        )
         .annotate(
             active_assignment_count=Count("assignments", filter=Q(assignments__is_active=True), distinct=True),
             active_staff_count=Count("assignments__staff", filter=Q(assignments__is_active=True), distinct=True),
+            publication_total=Count("publications", distinct=True),
+        )
+        .prefetch_related(
+            Prefetch(
+                "publications",
+                queryset=MonthlyShiftPublication.objects.filter(is_active=True).order_by("-version"),
+                to_attr="active_publications",
+            )
         )
         .order_by("-year", "-month", "location__display_order")
     )
@@ -299,6 +336,8 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
             queryset = queryset.filter(month=params["month"])
         if params.get("is_active") in {"true", "false"}:
             queryset = queryset.filter(is_active=params["is_active"] == "true")
+        if params.get("workflow_status"):
+            queryset = queryset.filter(workflow_status=params["workflow_status"])
         if params.get("search"):
             term = params["search"]
             queryset = queryset.filter(Q(name__icontains=term) | Q(notes__icontains=term))
@@ -495,7 +534,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
     def preview_template_generation(self, request, pk=None):
         self._require_manage()
         plan = self.get_object()
-        ensure_active_monthly_plan(plan)
+        ensure_monthly_plan_editable(plan)
         serializer = TemplateGenerationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         result = preview_template_generation(
@@ -510,7 +549,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
     def apply_template(self, request, pk=None):
         self._require_manage()
         plan = self.get_object()
-        ensure_active_monthly_plan(plan)
+        ensure_monthly_plan_editable(plan)
         serializer = TemplateGenerationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         with transaction.atomic():
@@ -546,6 +585,108 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                 },
             )
         return Response(result)
+
+    @action(detail=True, methods=["post"], url_path="publication-preview")
+    def publication_preview(self, request, pk=None):
+        plan = self.get_object()
+        return Response(build_publication_preview(plan))
+
+    @action(detail=True, methods=["post"])
+    def confirm(self, request, pk=None):
+        self._require_manage()
+        plan = self.get_object()
+        serializer = PublicationAcknowledgeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        preview = confirm_monthly_shift_plan(
+            plan=plan,
+            actor=request.user,
+            acknowledge_warnings=serializer.validated_data["acknowledge_warnings"],
+        )
+        plan.refresh_from_db()
+        record_shift_event(
+            entity="monthly_shift_plan",
+            action="confirm",
+            actor=request.user,
+            request=request,
+            metadata={**monthly_plan_metadata(plan), "content_hash": preview["content_hash"]},
+        )
+        return Response({"plan": self.get_serializer(plan).data, "preview": preview})
+
+    @action(detail=True, methods=["post"])
+    def reopen(self, request, pk=None):
+        self._require_manage()
+        plan = reopen_monthly_shift_plan(plan=self.get_object(), actor=request.user)
+        record_shift_event(
+            entity="monthly_shift_plan",
+            action="reopen",
+            actor=request.user,
+            request=request,
+            metadata=monthly_plan_metadata(plan),
+        )
+        return Response(self.get_serializer(plan).data)
+
+    @action(detail=True, methods=["post"])
+    def publish(self, request, pk=None):
+        self._require_manage()
+        plan = self.get_object()
+        serializer = PublicationAcknowledgeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        publication, preview = publish_monthly_shift_plan(
+            plan=plan,
+            actor=request.user,
+            acknowledge_warnings=serializer.validated_data["acknowledge_warnings"],
+        )
+        plan.refresh_from_db()
+        record_shift_event(
+            entity="monthly_shift_plan",
+            action="publish",
+            actor=request.user,
+            request=request,
+            metadata={
+                **monthly_plan_metadata(plan),
+                "publication_id": str(publication.id),
+                "version": publication.version,
+                "content_hash": preview["content_hash"],
+            },
+        )
+        return Response(
+            {
+                "plan": self.get_serializer(plan).data,
+                "publication": MonthlyShiftPublicationSerializer(publication).data,
+                "preview": preview,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["post"], url_path="withdraw-publication")
+    def withdraw_publication(self, request, pk=None):
+        self._require_manage()
+        serializer = PublicationWithdrawSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        plan = self.get_object()
+        publication = withdraw_monthly_shift_publication(
+            plan=plan,
+            actor=request.user,
+            reason=serializer.validated_data["reason"],
+        )
+        plan.refresh_from_db()
+        record_shift_event(
+            entity="monthly_shift_plan",
+            action="withdraw",
+            actor=request.user,
+            request=request,
+            metadata={
+                **monthly_plan_metadata(plan),
+                "publication_id": str(publication.id),
+                "version": publication.version,
+            },
+        )
+        return Response(
+            {
+                "plan": self.get_serializer(plan).data,
+                "publication": MonthlyShiftPublicationSerializer(publication).data,
+            }
+        )
 
 
 class MonthlyShiftAssignmentViewSet(ShiftManagementBaseViewSet):
@@ -640,3 +781,113 @@ class MonthlyShiftAssignmentViewSet(ShiftManagementBaseViewSet):
                 metadata=monthly_assignment_metadata(instance),
             )
         return Response(self.get_serializer(instance).data)
+
+
+class MonthlyShiftPublicationViewSet(viewsets.ReadOnlyModelViewSet):
+    http_method_names = ["get", "head", "options"]
+    permission_classes = [ShiftSettingsPermission]
+    queryset = (
+        MonthlyShiftPublication.objects.select_related(
+            "monthly_shift_plan",
+            "location",
+            "published_by",
+            "withdrawn_by",
+        )
+        .annotate(
+            assignment_total=Count("assignments", distinct=True),
+            staff_total=Count("assignments__staff", distinct=True),
+            segment_total=Count("assignments__segments", distinct=True),
+        )
+        .order_by("-published_at", "-version")
+    )
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return MonthlyShiftPublicationListSerializer
+        return MonthlyShiftPublicationSerializer
+
+    def get_queryset(self):
+        queryset = self.queryset
+        params = self.request.query_params
+        if params.get("monthly_shift_plan"):
+            queryset = queryset.filter(monthly_shift_plan_id=params["monthly_shift_plan"])
+        if params.get("location"):
+            queryset = queryset.filter(location_id=params["location"])
+        if params.get("year"):
+            queryset = queryset.filter(year=params["year"])
+        if params.get("month"):
+            queryset = queryset.filter(month=params["month"])
+        if params.get("is_active") in {"true", "false"}:
+            queryset = queryset.filter(is_active=params["is_active"] == "true")
+        if self.action == "retrieve":
+            queryset = queryset.prefetch_related(
+                Prefetch(
+                    "assignments",
+                    queryset=MonthlyShiftPublicationAssignment.objects.select_related("staff").prefetch_related(
+                        Prefetch(
+                            "segments",
+                            queryset=MonthlyShiftPublicationSegment.objects.select_related("work_type", "work_area"),
+                        )
+                    ),
+                )
+            )
+        return queryset
+
+
+class MyPublishedShiftsPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_authenticated)
+
+
+class MyPublishedShiftViewSet(viewsets.ReadOnlyModelViewSet):
+    http_method_names = ["get", "head", "options"]
+    permission_classes = [MyPublishedShiftsPermission]
+    serializer_class = MyPublishedShiftSerializer
+
+    def _parse_date(self, value: str | None, field: str) -> date:
+        if not value:
+            raise ValidationError({field: "必須です。"})
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValidationError({field: "YYYY-MM-DD形式で指定してください。"}) from exc
+
+    def _location_id(self) -> str | None:
+        location_id = self.request.query_params.get("location")
+        if not location_id:
+            return None
+        try:
+            UUID(location_id)
+        except ValueError as exc:
+            raise ValidationError({"location": "有効なUUIDを指定してください。"}) from exc
+        return location_id
+
+    def get_queryset(self):
+        params = self.request.query_params
+        date_from = self._parse_date(params.get("date_from"), "date_from")
+        date_to = self._parse_date(params.get("date_to"), "date_to")
+        if date_from > date_to:
+            raise ValidationError({"date_to": "date_from以降の日付を指定してください。"})
+        if (date_to - date_from).days > 61:
+            raise ValidationError({"date_to": "検索範囲は最大62日です。"})
+        queryset = (
+            MonthlyShiftPublicationAssignment.objects.select_related("publication", "publication__monthly_shift_plan")
+            .filter(
+                staff=self.request.user,
+                work_date__gte=date_from,
+                work_date__lte=date_to,
+                publication__is_active=True,
+                publication__withdrawn_at__isnull=True,
+            )
+            .prefetch_related(
+                Prefetch(
+                    "segments",
+                    queryset=MonthlyShiftPublicationSegment.objects.select_related("work_type", "work_area"),
+                )
+            )
+            .order_by("work_date", "display_order", "created_at")
+        )
+        location_id = self._location_id()
+        if location_id:
+            queryset = queryset.filter(publication__location_id=location_id)
+        return queryset

@@ -12,6 +12,7 @@ import { labelToOffset, offsetToLabel } from "../lib/timeOffsets";
 import { clampSegmentToRange, durationToWidth, offsetToPosition, type TimelineRange } from "../lib/timeline";
 import { chunkRowsForPrint, estimatePrintRowHeight, printSlotWidthForRange } from "../lib/timelinePrint";
 import { MonthlyShiftsPage } from "./MonthlyShiftsPage";
+import { MyPublishedShiftsPage } from "./MyPublishedShiftsPage";
 import { ShiftTimelinePage } from "./ShiftTimelinePage";
 import { ShiftPatternsPage } from "./ShiftPatternsPage";
 import { WeeklyTemplatesPage } from "./WeeklyTemplatesPage";
@@ -101,6 +102,13 @@ const monthlyPlan = {
   staff_count: 1,
   source_weekly_template: null,
   last_generated_at: null,
+  workflow_status: "draft" as const,
+  confirmed_at: null,
+  confirmed_by: null,
+  confirmed_content_hash: "",
+  is_editable: true,
+  current_publication: null,
+  publication_count: 0,
   is_active: true,
 };
 const monthlyMatrix = {
@@ -416,7 +424,74 @@ describe("shift settings pages", () => {
     expect(await screen.findByRole("link", { name: "勤務パターン" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "月間シフト" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "日別・週別シフト" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "自分の公開シフト" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "週間テンプレート" })).toBeInTheDocument();
+  });
+
+  it("shows my published shifts from snapshot API", async () => {
+    mockAuthAndApi(["staff"], {
+      "/api/v1/my-published-shifts/": {
+        count: 1,
+        next: null,
+        previous: null,
+        results: [
+          {
+            id: "pub-a1",
+            source_assignment: "ma1",
+            work_date: "2028-02-01",
+            staff: "u1",
+            staff_display_name_snapshot: "表示ユーザー",
+            employee_code_snapshot: "EMP-1",
+            source_type: "manual",
+            is_customized: false,
+            pattern_code_snapshot: "early",
+            pattern_name_snapshot: "早番",
+            pattern_short_name_snapshot: "早",
+            notes: "公開備考",
+            display_order: 0,
+            warning_count_snapshot: 0,
+            start_offset_minutes: 510,
+            end_offset_minutes: 1020,
+            work_minutes: 450,
+            break_minutes: 60,
+            segments: [
+              {
+                id: "pub-s1",
+                source_segment: "seg1",
+                work_type: "w1",
+                work_area: "a1",
+                work_type_name_snapshot: "ジム業務",
+                work_type_short_name_snapshot: "ジム",
+                work_type_color_key_snapshot: "blue",
+                work_type_is_break_snapshot: false,
+                work_area_name_snapshot: "ジム",
+                start_offset_minutes: 510,
+                end_offset_minutes: 960,
+                duration_minutes: 450,
+                display_order: 10,
+                notes: "",
+              },
+            ],
+            publication: {
+              id: "pub1",
+              version: 1,
+              monthly_shift_plan: "m1",
+              location: "l1",
+              location_name: "本館",
+              year: 2028,
+              month: 2,
+              published_at: "2028-01-25T00:00:00+09:00",
+            },
+          },
+        ],
+      },
+    });
+    renderWithAuth(<MyPublishedShiftsPage />);
+    expect(await screen.findByText("自分の公開シフト")).toBeInTheDocument();
+    expect(await screen.findByText("2028-02-01")).toBeInTheDocument();
+    expect(screen.getByText("本館")).toBeInTheDocument();
+    expect(screen.getByText("08:30~17:00")).toBeInTheDocument();
+    expect(screen.getByText("公開備考")).toBeInTheDocument();
   });
 
   it("calculates timeline positions and clamps next-day segments", () => {

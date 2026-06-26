@@ -1,10 +1,12 @@
 import calendar
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import date
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
-from django.db.models import Case, IntegerField, Q, Value, When
+from django.db.models import Case, IntegerField, Max, Q, Value, When
 from django.utils import timezone
 from rest_framework.serializers import ValidationError as DRFValidationError
 
@@ -16,6 +18,9 @@ from apps.operations.models import Location, StaffCapability, StaffLocation, Wor
 from .models import (
     MonthlyShiftAssignment,
     MonthlyShiftPlan,
+    MonthlyShiftPublication,
+    MonthlyShiftPublicationAssignment,
+    MonthlyShiftPublicationSegment,
     MonthlyShiftSegment,
     ShiftPattern,
     ShiftPatternSegment,
@@ -33,6 +38,11 @@ IMMUTABLE_ASSIGNMENT_CELL_MESSAGE = (
     "月間表・日付・スタッフは作成後変更できません。勤務を解除して新しく作成してください。"
 )
 INACTIVE_MONTHLY_PLAN_MESSAGE = "無効な月間表には書き込みできません。"
+MONTHLY_PLAN_EDIT_LOCK_MESSAGE = "確定または公開済みの月間シフトは編集できません。確定解除してから編集してください。"
+MONTHLY_PLAN_CONFIRM_WARNING_MESSAGE = "警告があるため確定できません。警告を確認してから実行してください。"
+MONTHLY_PLAN_PUBLISH_WARNING_MESSAGE = "警告があるため公開できません。警告を確認してから実行してください。"
+MONTHLY_PLAN_STALE_HASH_MESSAGE = "確定後に月間シフトの内容が変更されています。確定解除して再確定してください。"
+MONTHLY_PLAN_ACTIVE_PUBLICATION_MESSAGE = "公開中の月間シフトがあるため操作できません。"
 DEFAULT_INTEGRITY_MESSAGE = "重複または不正なデータです。"
 SHIFT_PATTERN_DUPLICATE_MESSAGE = "同じ拠点・コードの勤務パターンが既に存在します。"
 WEEKLY_TEMPLATE_DUPLICATE_MESSAGE = "同じ拠点・コードの週間テンプレートが既に存在します。"
@@ -72,6 +82,10 @@ EVENT_MAP = {
         "update": "monthly_shift_plan_updated",
         "deactivate": "monthly_shift_plan_deactivated",
         "reactivate": "monthly_shift_plan_reactivated",
+        "confirm": "monthly_shift_plan_confirmed",
+        "reopen": "monthly_shift_plan_reopened",
+        "publish": "monthly_shift_plan_published",
+        "withdraw": "monthly_shift_plan_publication_withdrawn",
     },
     "monthly_shift_assignment": {
         "create": "monthly_shift_assignment_created",
@@ -644,6 +658,12 @@ def ensure_active_monthly_plan(plan: MonthlyShiftPlan):
         raise DRFValidationError({"monthly_shift_plan": INACTIVE_MONTHLY_PLAN_MESSAGE})
 
 
+def ensure_monthly_plan_editable(plan: MonthlyShiftPlan):
+    ensure_active_monthly_plan(plan)
+    if plan.workflow_status != MonthlyShiftPlan.WorkflowStatus.DRAFT:
+        raise DRFValidationError({"monthly_shift_plan": MONTHLY_PLAN_EDIT_LOCK_MESSAGE})
+
+
 def _ordered_capabilities(queryset, location: Location):
     return queryset.annotate(
         location_priority=Case(
@@ -815,6 +835,8 @@ def _validate_active_monthly_assignment_unique(assignment: MonthlyShiftAssignmen
 
 def save_monthly_plan(*, instance: MonthlyShiftPlan | None, validated_data: dict, actor: User):
     try:
+        if instance is not None:
+            ensure_monthly_plan_editable(instance)
         _validate_plan_immutable(instance, validated_data)
         plan = instance or MonthlyShiftPlan(created_by=actor)
         for field, value in validated_data.items():
@@ -1050,6 +1072,350 @@ def validate_monthly_assignment(
     return issues
 
 
+def _prefetched_active_assignments(plan: MonthlyShiftPlan) -> list[MonthlyShiftAssignment]:
+    assignments = (
+        MonthlyShiftAssignment.objects.filter(monthly_shift_plan=plan, is_active=True)
+        .select_related("staff", "source_shift_pattern")
+        .prefetch_related(
+            "segments__work_type",
+            "segments__work_area",
+        )
+        .order_by("work_date", "display_order", "staff__employee_code", "created_at")
+    )
+    result = list(assignments)
+    for assignment in result:
+        assignment.active_segments = [segment for segment in assignment.segments.all() if segment.is_active]
+    return result
+
+
+def build_monthly_plan_content_hash(plan: MonthlyShiftPlan) -> str:
+    assignments = _prefetched_active_assignments(plan)
+    payload = {
+        "plan": {
+            "id": str(plan.id),
+            "location": str(plan.location_id),
+            "year": plan.year,
+            "month": plan.month,
+            "name": plan.name,
+            "notes": plan.notes,
+        },
+        "assignments": [
+            {
+                "id": str(assignment.id),
+                "work_date": assignment.work_date.isoformat(),
+                "staff": str(assignment.staff_id),
+                "source_type": assignment.source_type,
+                "pattern_code_snapshot": assignment.pattern_code_snapshot,
+                "pattern_name_snapshot": assignment.pattern_name_snapshot,
+                "pattern_short_name_snapshot": assignment.pattern_short_name_snapshot,
+                "notes": assignment.notes,
+                "is_customized": assignment.is_customized,
+                "display_order": assignment.display_order,
+                "segments": [
+                    {
+                        "id": str(segment.id),
+                        "work_type": str(segment.work_type_id),
+                        "work_area": str(segment.work_area_id) if segment.work_area_id else None,
+                        "work_type_name_snapshot": segment.work_type_name_snapshot,
+                        "work_type_short_name_snapshot": segment.work_type_short_name_snapshot,
+                        "work_type_color_key_snapshot": segment.work_type_color_key_snapshot,
+                        "work_type_is_break_snapshot": segment.work_type_is_break_snapshot,
+                        "work_area_name_snapshot": segment.work_area_name_snapshot,
+                        "start_offset_minutes": segment.start_offset_minutes,
+                        "end_offset_minutes": segment.end_offset_minutes,
+                        "display_order": segment.display_order,
+                        "notes": segment.notes,
+                    }
+                    for segment in sorted(
+                        assignment.active_segments,
+                        key=lambda item: (item.start_offset_minutes, item.display_order, str(item.id)),
+                    )
+                ],
+            }
+            for assignment in assignments
+        ],
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validation_error_issue(exc: DRFValidationError, *, code: str = "validation_error") -> dict:
+    return {"severity": "error", "code": code, "message": str(exc.detail)}
+
+
+def build_publication_preview(plan: MonthlyShiftPlan) -> dict:
+    ensure_active_monthly_plan(plan)
+    assignments = _prefetched_active_assignments(plan)
+    start_date, end_date = _plan_bounds(plan)
+    capability_lookup = build_capability_lookup(
+        assignments=assignments,
+        location=plan.location,
+        start_date=start_date,
+        end_date=end_date,
+        segments_attr="active_segments",
+    )
+    items = []
+    summary = {
+        "assignment_count": len(assignments),
+        "staff_count": len({assignment.staff_id for assignment in assignments}),
+        "segment_count": 0,
+        "work_minutes": 0,
+        "break_minutes": 0,
+        "error_count": 0,
+        "warning_count": 0,
+    }
+    if not assignments:
+        summary["error_count"] = 1
+        return {
+            "content_hash": build_monthly_plan_content_hash(plan),
+            "summary": summary,
+            "items": [
+                {
+                    "scope": "plan",
+                    "issues": [
+                        {
+                            "severity": "error",
+                            "code": "empty_plan",
+                            "message": "公開対象の勤務がありません。",
+                        }
+                    ],
+                }
+            ],
+            "can_confirm": False,
+            "can_publish": False,
+        }
+
+    for assignment in assignments:
+        active_segments = assignment.active_segments
+        issues = []
+        try:
+            issues.extend(validate_monthly_assignment(assignment, active_segments, validate_current_masters=True))
+        except DRFValidationError as exc:
+            issues.append(_validation_error_issue(exc))
+        warning_count = monthly_assignment_warning_count(
+            assignment,
+            capability_lookup,
+            segments_attr="active_segments",
+        )
+        segment_count = len(active_segments)
+        work_minutes = sum(
+            segment.duration_minutes for segment in active_segments if not segment.work_type_is_break_snapshot
+        )
+        break_minutes = sum(
+            segment.duration_minutes for segment in active_segments if segment.work_type_is_break_snapshot
+        )
+        summary["segment_count"] += segment_count
+        summary["work_minutes"] += work_minutes
+        summary["break_minutes"] += break_minutes
+        summary["error_count"] += sum(1 for issue in issues if issue["severity"] == "error")
+        summary["warning_count"] += sum(1 for issue in issues if issue["severity"] == "warning")
+        if issues:
+            items.append(
+                {
+                    "scope": "assignment",
+                    "assignment": str(assignment.id),
+                    "work_date": assignment.work_date.isoformat(),
+                    "staff": str(assignment.staff_id),
+                    "staff_display_name": assignment.staff.display_name,
+                    "pattern_short_name": assignment.pattern_short_name_snapshot,
+                    "warning_count": warning_count,
+                    "segment_count": segment_count,
+                    "issues": issues,
+                }
+            )
+    return {
+        "content_hash": build_monthly_plan_content_hash(plan),
+        "summary": summary,
+        "items": items,
+        "can_confirm": summary["error_count"] == 0,
+        "can_publish": (
+            plan.workflow_status == MonthlyShiftPlan.WorkflowStatus.CONFIRMED and summary["error_count"] == 0
+        ),
+    }
+
+
+def confirm_monthly_shift_plan(*, plan: MonthlyShiftPlan, actor: User, acknowledge_warnings: bool = False) -> dict:
+    with transaction.atomic():
+        plan = MonthlyShiftPlan.objects.select_for_update().select_related("location").get(pk=plan.pk)
+        ensure_monthly_plan_editable(plan)
+        preview = build_publication_preview(plan)
+        if preview["summary"]["error_count"]:
+            raise DRFValidationError({"items": preview["items"]})
+        if preview["summary"]["warning_count"] and not acknowledge_warnings:
+            raise DRFValidationError({"warnings": MONTHLY_PLAN_CONFIRM_WARNING_MESSAGE})
+        now = timezone.now()
+        plan.workflow_status = MonthlyShiftPlan.WorkflowStatus.CONFIRMED
+        plan.confirmed_at = now
+        plan.confirmed_by = actor
+        plan.confirmed_content_hash = preview["content_hash"]
+        plan.updated_by = actor
+        plan.save(
+            update_fields=[
+                "workflow_status",
+                "confirmed_at",
+                "confirmed_by",
+                "confirmed_content_hash",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+    return preview
+
+
+def reopen_monthly_shift_plan(*, plan: MonthlyShiftPlan, actor: User):
+    with transaction.atomic():
+        plan = MonthlyShiftPlan.objects.select_for_update().get(pk=plan.pk)
+        ensure_active_monthly_plan(plan)
+        if plan.workflow_status != MonthlyShiftPlan.WorkflowStatus.CONFIRMED:
+            raise DRFValidationError({"workflow_status": "確定済みの月間シフトのみ確定解除できます。"})
+        if plan.publications.filter(is_active=True).exists():
+            raise DRFValidationError({"monthly_shift_plan": MONTHLY_PLAN_ACTIVE_PUBLICATION_MESSAGE})
+        plan.workflow_status = MonthlyShiftPlan.WorkflowStatus.DRAFT
+        plan.confirmed_at = None
+        plan.confirmed_by = None
+        plan.confirmed_content_hash = ""
+        plan.updated_by = actor
+        plan.save(
+            update_fields=[
+                "workflow_status",
+                "confirmed_at",
+                "confirmed_by",
+                "confirmed_content_hash",
+                "updated_by",
+                "updated_at",
+            ]
+        )
+    return plan
+
+
+def _create_publication_snapshot(*, plan: MonthlyShiftPlan, actor: User, preview: dict) -> MonthlyShiftPublication:
+    assignments = _prefetched_active_assignments(plan)
+    start_date, end_date = _plan_bounds(plan)
+    capability_lookup = build_capability_lookup(
+        assignments=assignments,
+        location=plan.location,
+        start_date=start_date,
+        end_date=end_date,
+        segments_attr="active_segments",
+    )
+    latest_version = (
+        MonthlyShiftPublication.objects.filter(monthly_shift_plan=plan).aggregate(max_version=Max("version"))[
+            "max_version"
+        ]
+        or 0
+    )
+    publication = MonthlyShiftPublication.objects.create(
+        monthly_shift_plan=plan,
+        version=latest_version + 1,
+        content_hash=preview["content_hash"],
+        location=plan.location,
+        location_name_snapshot=plan.location.name,
+        location_short_name_snapshot=plan.location.short_name,
+        year=plan.year,
+        month=plan.month,
+        plan_name_snapshot=plan.name,
+        plan_notes_snapshot=plan.notes,
+        published_by=actor,
+        published_at=timezone.now(),
+        is_active=True,
+    )
+    for assignment in assignments:
+        publication_assignment = MonthlyShiftPublicationAssignment.objects.create(
+            publication=publication,
+            source_assignment=assignment,
+            work_date=assignment.work_date,
+            staff=assignment.staff,
+            staff_display_name_snapshot=assignment.staff.display_name,
+            employee_code_snapshot=assignment.staff.employee_code,
+            source_type=assignment.source_type,
+            is_customized=assignment.is_customized,
+            pattern_code_snapshot=assignment.pattern_code_snapshot,
+            pattern_name_snapshot=assignment.pattern_name_snapshot,
+            pattern_short_name_snapshot=assignment.pattern_short_name_snapshot,
+            notes=assignment.notes,
+            display_order=assignment.display_order,
+            warning_count_snapshot=monthly_assignment_warning_count(
+                assignment,
+                capability_lookup,
+                segments_attr="active_segments",
+            ),
+        )
+        for segment in assignment.active_segments:
+            MonthlyShiftPublicationSegment.objects.create(
+                publication_assignment=publication_assignment,
+                source_segment=segment,
+                work_type=segment.work_type,
+                work_area=segment.work_area,
+                work_type_name_snapshot=segment.work_type_name_snapshot,
+                work_type_short_name_snapshot=segment.work_type_short_name_snapshot,
+                work_type_color_key_snapshot=segment.work_type_color_key_snapshot,
+                work_type_is_break_snapshot=segment.work_type_is_break_snapshot,
+                work_area_name_snapshot=segment.work_area_name_snapshot,
+                start_offset_minutes=segment.start_offset_minutes,
+                end_offset_minutes=segment.end_offset_minutes,
+                display_order=segment.display_order,
+                notes=segment.notes,
+            )
+    return publication
+
+
+def publish_monthly_shift_plan(*, plan: MonthlyShiftPlan, actor: User, acknowledge_warnings: bool = False):
+    try:
+        with transaction.atomic():
+            plan = MonthlyShiftPlan.objects.select_for_update().select_related("location").get(pk=plan.pk)
+            ensure_active_monthly_plan(plan)
+            if plan.workflow_status != MonthlyShiftPlan.WorkflowStatus.CONFIRMED:
+                raise DRFValidationError({"workflow_status": "確定済みの月間シフトのみ公開できます。"})
+            if plan.publications.filter(is_active=True).select_for_update().exists():
+                raise DRFValidationError({"monthly_shift_plan": MONTHLY_PLAN_ACTIVE_PUBLICATION_MESSAGE})
+            preview = build_publication_preview(plan)
+            if preview["content_hash"] != plan.confirmed_content_hash:
+                raise DRFValidationError({"content_hash": MONTHLY_PLAN_STALE_HASH_MESSAGE})
+            if preview["summary"]["error_count"]:
+                raise DRFValidationError({"items": preview["items"]})
+            if preview["summary"]["warning_count"] and not acknowledge_warnings:
+                raise DRFValidationError({"warnings": MONTHLY_PLAN_PUBLISH_WARNING_MESSAGE})
+            publication = _create_publication_snapshot(plan=plan, actor=actor, preview=preview)
+            plan.workflow_status = MonthlyShiftPlan.WorkflowStatus.PUBLISHED
+            plan.updated_by = actor
+            plan.save(update_fields=["workflow_status", "updated_by", "updated_at"])
+    except IntegrityError as exc:
+        raise _drf_validation(
+            exc,
+            integrity_message="公開処理が競合しました。再読み込みしてから再実行してください。",
+        ) from exc
+    return publication, preview
+
+
+def withdraw_monthly_shift_publication(*, plan: MonthlyShiftPlan, actor: User, reason: str):
+    if not reason.strip():
+        raise DRFValidationError({"reason": "公開取り下げ理由を入力してください。"})
+    with transaction.atomic():
+        plan = MonthlyShiftPlan.objects.select_for_update().get(pk=plan.pk)
+        ensure_active_monthly_plan(plan)
+        if plan.workflow_status != MonthlyShiftPlan.WorkflowStatus.PUBLISHED:
+            raise DRFValidationError({"workflow_status": "公開済みの月間シフトのみ取り下げできます。"})
+        publication = plan.publications.select_for_update().filter(is_active=True).first()
+        if publication is None:
+            raise DRFValidationError({"monthly_shift_plan": "公開中のスナップショットが見つかりません。"})
+        publication.is_active = False
+        publication.withdrawn_by = actor
+        publication.withdrawn_at = timezone.now()
+        publication.withdrawal_reason = reason.strip()
+        publication.save(
+            update_fields=[
+                "is_active",
+                "withdrawn_by",
+                "withdrawn_at",
+                "withdrawal_reason",
+            ]
+        )
+        plan.workflow_status = MonthlyShiftPlan.WorkflowStatus.CONFIRMED
+        plan.updated_by = actor
+        plan.save(update_fields=["workflow_status", "updated_by", "updated_at"])
+    return publication
+
+
 def save_monthly_assignment(
     *,
     instance: MonthlyShiftAssignment | None,
@@ -1072,7 +1438,7 @@ def save_monthly_assignment(
             if instance is None:
                 assignment.is_active = True
                 assignment.source_type = MonthlyShiftAssignment.SourceType.MANUAL
-            ensure_active_monthly_plan(assignment.monthly_shift_plan)
+            ensure_monthly_plan_editable(assignment.monthly_shift_plan)
 
             save_segments: list[MonthlyShiftSegment]
             validation_segments: list[MonthlyShiftSegment]
@@ -1167,6 +1533,8 @@ def validate_and_reactivate_monthly_plan(plan: MonthlyShiftPlan):
     original_is_active = plan.is_active
     try:
         with transaction.atomic():
+            if plan.workflow_status != MonthlyShiftPlan.WorkflowStatus.DRAFT:
+                raise DRFValidationError({"monthly_shift_plan": MONTHLY_PLAN_EDIT_LOCK_MESSAGE})
             plan.is_active = True
             _validate_active_monthly_plan_unique(plan)
             plan.full_clean()
@@ -1181,7 +1549,7 @@ def validate_and_reactivate_monthly_assignment(assignment: MonthlyShiftAssignmen
     original_is_active = assignment.is_active
     try:
         with transaction.atomic():
-            ensure_active_monthly_plan(assignment.monthly_shift_plan)
+            ensure_monthly_plan_editable(assignment.monthly_shift_plan)
             assignment.is_active = True
             warnings = validate_monthly_assignment(
                 assignment, list(assignment.segments.select_related("work_type", "work_area"))
@@ -1199,6 +1567,8 @@ def validate_and_reactivate_monthly_assignment(assignment: MonthlyShiftAssignmen
 
 
 def deactivate_monthly_instance(instance):
+    plan = getattr(instance, "monthly_shift_plan", instance)
+    ensure_monthly_plan_editable(plan)
     instance.is_active = False
     instance.save(update_fields=["is_active", "updated_at"])
 
@@ -1227,7 +1597,7 @@ def preview_template_generation(
     existing_mode: str,
     invalid_mode: str,
 ) -> dict:
-    ensure_active_monthly_plan(plan)
+    ensure_monthly_plan_editable(plan)
     if existing_mode not in {"skip_existing", "replace_template_generated"}:
         raise DRFValidationError({"existing_mode": "Invalid existing_mode."})
     if invalid_mode not in {"strict", "skip_invalid"}:
@@ -1320,7 +1690,7 @@ def apply_template_generation(
 ):
     with transaction.atomic():
         plan = MonthlyShiftPlan.objects.select_for_update().get(pk=plan.pk)
-        ensure_active_monthly_plan(plan)
+        ensure_monthly_plan_editable(plan)
         list(plan.assignments.select_for_update().filter(is_active=True))
         preview = preview_template_generation(
             plan=plan,

@@ -6,6 +6,7 @@ import { ChangePasswordPage } from "./pages/ChangePasswordPage";
 import { ForbiddenPage } from "./pages/ForbiddenPage";
 import { LoginPage } from "./pages/LoginPage";
 import { MyCapabilitiesPage } from "./pages/MyCapabilitiesPage";
+import { MyPublishedShiftsPage } from "./pages/MyPublishedShiftsPage";
 import { NotFoundPage } from "./pages/NotFoundPage";
 import { OperationsMasterPage } from "./pages/OperationsMasterPage";
 import { StaffAssignmentsPage } from "./pages/StaffAssignmentsPage";
@@ -50,6 +51,7 @@ export function App() {
           <Route path="operations/staff-capabilities" element={<StaffAssignmentsPage resource="staff-capabilities" />} />
           <Route path="operations/my-staff-locations" element={<MyCapabilitiesPage section="locations" />} />
           <Route path="operations/my-capabilities" element={<MyCapabilitiesPage />} />
+          <Route path="shifts/my-published" element={<MyPublishedShiftsPage />} />
           <Route path="shifts/monthly" element={<MonthlyShiftsPage />} />
           <Route path="shifts/timeline" element={<ShiftTimelinePage />} />
           <Route path="shifts/patterns" element={<ShiftPatternsPage />} />

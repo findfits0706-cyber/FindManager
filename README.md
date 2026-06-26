@@ -92,4 +92,12 @@ Phase 5 adds daily and weekly timeline viewing and browser printing for saved mo
 - Next-day work display up to 2880 minutes
 - Lane placement for overlapping segments
 - Detail panel with a deep link back to the monthly shift screen
+
+Phase 6 adds shift confirmation, publication, and staff self-service viewing:
+
+- Monthly shift workflow statuses: draft, confirmed, published
+- Immutable publication snapshots for assignments and segments
+- Publication preview, confirm, reopen, publish, and withdraw actions
+- Staff self-service screen at `/shifts/my-published`
+- Self-service API at `/api/v1/my-published-shifts/`, scoped to the authenticated user
 - Browser printing with print-specific CSS

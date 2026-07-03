@@ -758,12 +758,13 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         self.gym_work.name = "Changed Gym"
         self.gym_work.requires_capability = True
         self.gym_work.save(update_fields=["name", "requires_capability", "updated_at"])
-        StaffCapability.objects.create(
+        StaffCapability.objects.update_or_create(
             staff=self.staff,
             work_type=self.gym_work,
             location=self.location,
-            level=StaffCapability.Level.TRAINEE,
             valid_from="2026-01-01",
+            valid_until=None,
+            defaults={"level": StaffCapability.Level.TRAINEE},
         )
 
         response = self.force_client(self.system_admin).get(
@@ -1293,14 +1294,17 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         client = self.force_client(self.system_admin)
         self.gym_work.requires_capability = True
         self.gym_work.save(update_fields=["requires_capability", "updated_at"])
-        StaffCapability.objects.create(
+        StaffCapability.objects.update_or_create(
             staff=self.staff,
             work_type=self.gym_work,
             location=self.location,
-            level=StaffCapability.Level.INDEPENDENT,
             valid_from="2026-01-01",
-            approved_by=self.system_admin,
-            approved_at=timezone.now(),
+            valid_until=None,
+            defaults={
+                "level": StaffCapability.Level.INDEPENDENT,
+                "approved_by": self.system_admin,
+                "approved_at": timezone.now(),
+            },
         )
         small_plan = self.create_plan(month=7)
         self.create_assignment_record(small_plan, work_date="2026-07-01", work_type=self.gym_work)

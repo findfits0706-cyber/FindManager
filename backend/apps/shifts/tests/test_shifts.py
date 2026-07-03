@@ -47,6 +47,8 @@ class ShiftsBaseTestCase(BaseAPITestCase):
         self.gym_work = WorkType.objects.get(code="gym_duty")
         self.front_work = WorkType.objects.get(code="front_duty")
         self.break_work = WorkType.objects.get(code="break")
+        StaffLocation.objects.filter(staff__in=self.dev_users.values()).update(valid_from="2026-01-01")
+        StaffCapability.objects.filter(staff__in=self.dev_users.values()).update(valid_from="2026-01-01")
 
     def pattern_payload(self, code="api_pattern"):
         return {
@@ -1864,7 +1866,7 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
             staff=self.staff,
             work_type=WorkType.objects.get(code="front_duty"),
             location=self.location,
-            valid_from=timezone.localdate(),
+            valid_from="2026-01-01",
             valid_until=None,
             defaults={
                 "level": StaffCapability.Level.INDEPENDENT,
@@ -1928,7 +1930,7 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
             staff=self.staff,
             work_type=required_work_type,
             location=self.location,
-            valid_from=timezone.localdate(),
+            valid_from="2026-01-01",
             valid_until=None,
             defaults={
                 "level": StaffCapability.Level.ASSISTED,

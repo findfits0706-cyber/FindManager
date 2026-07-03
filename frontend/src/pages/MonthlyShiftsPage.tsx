@@ -68,6 +68,55 @@ function patternSegmentToForm(segment: NonNullable<ShiftPattern["segments"]>[num
   };
 }
 
+type PublicationWarningFingerprintEntry = {
+  assignment: string;
+  work_date: string;
+  staff: string;
+  severity: string;
+  code: string;
+  message: string;
+};
+
+const WARNING_UPDATED_MESSAGE = "警告内容が更新されました。最新の警告を確認して、再度チェックしてください。";
+const WARNING_REQUIRED_MESSAGE = "警告内容を確認してください。";
+
+function compareText(left: string, right: string) {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+function comparePublicationWarning(left: PublicationWarningFingerprintEntry, right: PublicationWarningFingerprintEntry) {
+  return (
+    compareText(left.assignment, right.assignment) ||
+    compareText(left.work_date, right.work_date) ||
+    compareText(left.staff, right.staff) ||
+    compareText(left.severity, right.severity) ||
+    compareText(left.code, right.code) ||
+    compareText(left.message, right.message)
+  );
+}
+
+function publicationWarningFingerprint(preview: PublicationPreview | null): string {
+  if (!preview) return "";
+  return JSON.stringify(
+    preview.items
+      .flatMap((item) =>
+        item.issues
+          .filter((issue) => issue.severity === "warning")
+          .map((issue) => ({
+            assignment: item.assignment ?? "",
+            work_date: item.work_date ?? "",
+            staff: item.staff ?? "",
+            severity: issue.severity,
+            code: issue.code,
+            message: issue.message,
+          })),
+      )
+      .sort(comparePublicationWarning),
+  );
+}
+
 export function MonthlyShiftsPage() {
   const { user, loading } = useAuth();
   const queryClient = useQueryClient();
@@ -96,7 +145,7 @@ export function MonthlyShiftsPage() {
   const [preview, setPreview] = useState<TemplateGenerationResult | null>(null);
   const [previewKey, setPreviewKey] = useState("");
   const [publicationPreview, setPublicationPreview] = useState<PublicationPreview | null>(null);
-  const [acknowledgedValidationFingerprint, setAcknowledgedValidationFingerprint] = useState("");
+  const [acknowledgedWarningFingerprint, setAcknowledgedWarningFingerprint] = useState("");
   const [selectedPublicationId, setSelectedPublicationId] = useState("");
   const [isDirty, setIsDirty] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -229,12 +278,25 @@ export function MonthlyShiftsPage() {
 
   const currentPreviewKey = `${activePlan?.id ?? ""}|${templateId}|${existingMode}|${invalidMode}`;
   const planStatus = activePlan?.workflow_status ?? "draft";
+  const currentWarningFingerprint = publicationWarningFingerprint(publicationPreview);
   const publicationPreviewKey = publicationPreview
-    ? `${publicationPreview.plan}|${publicationPreview.workflow_status}|${publicationPreview.content_hash}|${publicationPreview.confirmed_content_hash}|${publicationPreview.validation_fingerprint}`
+    ? JSON.stringify({
+        plan: publicationPreview.plan,
+        content_hash: publicationPreview.content_hash,
+        confirmed_content_hash: publicationPreview.confirmed_content_hash,
+        workflow_status: publicationPreview.workflow_status,
+        warning_fingerprint: currentWarningFingerprint,
+        error_count: publicationPreview.summary.error_count,
+        warning_count: publicationPreview.summary.warning_count,
+      })
     : "";
   const warningAcknowledged =
-    Boolean(publicationPreview) &&
-    acknowledgedValidationFingerprint === publicationPreview?.validation_fingerprint;
+    publicationPreview !== null &&
+    publicationPreview.summary.warning_count > 0 &&
+    acknowledgedWarningFingerprint === currentWarningFingerprint;
+  const warningRequirementSatisfied =
+    publicationPreview !== null &&
+    (publicationPreview.summary.warning_count === 0 || warningAcknowledged);
   const isPlanEditable =
     canManage && Boolean(activePlan) && (activePlan?.is_editable ?? !["confirmed", "published"].includes(planStatus));
   const lockMessage =
@@ -247,17 +309,17 @@ export function MonthlyShiftsPage() {
     canManage &&
     Boolean(publicationPreview) &&
     publicationPreview?.can_confirm === true &&
-    (publicationPreview.summary.warning_count === 0 || warningAcknowledged) &&
+    warningRequirementSatisfied &&
     !isSubmitting;
   const canPublishPlan =
     canManage &&
     Boolean(publicationPreview) &&
     publicationPreview?.can_publish === true &&
-    (publicationPreview.summary.warning_count === 0 || warningAcknowledged) &&
+    warningRequirementSatisfied &&
     !isSubmitting;
   useEffect(() => {
-    setAcknowledgedValidationFingerprint("");
-  }, [publicationPreviewKey, activePlan?.id, planStatus]);
+    setAcknowledgedWarningFingerprint("");
+  }, [publicationPreviewKey, activePlan?.id, location, month, planStatus, year]);
   const availableWorkTypeIds = useMemo(
     () => new Set((availabilityQuery.data?.results ?? []).map((item) => item.work_type)),
     [availabilityQuery.data?.results],
@@ -536,30 +598,40 @@ export function MonthlyShiftsPage() {
   };
 
   const loadLatestPublicationPreviewForAction = async () => {
-    if (!activePlan || !publicationPreview) return null;
+    if (!activePlan) return null;
     const latestPreview = await api<PublicationPreview>(`/api/v1/monthly-shift-plans/${activePlan.id}/publication-preview/`, {
       method: "POST",
       body: JSON.stringify({}),
     });
     setPublicationPreview(latestPreview);
-    if (latestPreview.validation_fingerprint !== publicationPreview.validation_fingerprint) {
-      setAcknowledgedValidationFingerprint("");
-      setError("検証結果が更新されました。最新の内容を確認してください。");
-      return null;
-    }
     return latestPreview;
   };
 
   const confirmPlan = async () => {
-    if (!activePlan || !canConfirmPlan) return;
+    if (!activePlan || !publicationPreview || isSubmitting) return;
+    const acknowledgedFingerprint = acknowledgedWarningFingerprint;
     setIsSubmitting(true);
     setError("");
     try {
       const latestPreview = await loadLatestPublicationPreviewForAction();
       if (!latestPreview) return;
+      const latestWarningFingerprint = publicationWarningFingerprint(latestPreview);
+      if (!latestPreview.can_confirm && latestPreview.summary.error_count === 0) {
+        setError("確定できる状態ではありません。公開プレビューを確認してください。");
+        return;
+      }
+      if (latestPreview.summary.error_count > 0) {
+        setError("公開プレビューにエラーがあります。エラーを解消してから確定してください。");
+        return;
+      }
+      if (latestPreview.summary.warning_count > 0 && acknowledgedFingerprint !== latestWarningFingerprint) {
+        setAcknowledgedWarningFingerprint("");
+        setError(acknowledgedFingerprint ? WARNING_UPDATED_MESSAGE : WARNING_REQUIRED_MESSAGE);
+        return;
+      }
       const result = await api<{ plan: MonthlyShiftPlan; preview: PublicationPreview }>(`/api/v1/monthly-shift-plans/${activePlan.id}/confirm/`, {
         method: "POST",
-        body: JSON.stringify({ acknowledge_warnings: warningAcknowledged }),
+        body: JSON.stringify({ acknowledge_warnings: latestPreview.summary.warning_count > 0 }),
       });
       setPlan(result.plan);
       setPublicationPreview(result.preview);
@@ -593,26 +665,39 @@ export function MonthlyShiftsPage() {
 
   const publishPlan = async () => {
     if (!activePlan || !publicationPreview || isSubmitting) return;
+    const displayedWarningFingerprint = currentWarningFingerprint;
+    const acknowledgedFingerprint = acknowledgedWarningFingerprint;
     setIsSubmitting(true);
     setError("");
     try {
       const latestPreview = await loadLatestPublicationPreviewForAction();
       if (!latestPreview) return;
+      const latestWarningFingerprint = publicationWarningFingerprint(latestPreview);
+      if (displayedWarningFingerprint !== latestWarningFingerprint) {
+        setAcknowledgedWarningFingerprint("");
+        setError(WARNING_UPDATED_MESSAGE);
+        return;
+      }
       if (latestPreview.confirmation_stale) {
         setError("確定後にシフト内容が変更されています。確定解除して再度確定してください。");
+        return;
+      }
+      if (latestPreview.summary.error_count > 0) {
+        setError("公開プレビューにエラーがあります。エラーを解消してから公開してください。");
         return;
       }
       if (!latestPreview.can_publish) {
         setError("公開できる状態ではありません。公開プレビューを確認してください。");
         return;
       }
-      if (latestPreview.summary.warning_count > 0 && !warningAcknowledged) {
-        setError("警告内容を確認してください。");
+      if (latestPreview.summary.warning_count > 0 && acknowledgedFingerprint !== latestWarningFingerprint) {
+        setAcknowledgedWarningFingerprint("");
+        setError(acknowledgedFingerprint ? WARNING_UPDATED_MESSAGE : WARNING_REQUIRED_MESSAGE);
         return;
       }
       const result = await api<{ plan: MonthlyShiftPlan; preview: PublicationPreview }>(`/api/v1/monthly-shift-plans/${activePlan.id}/publish/`, {
         method: "POST",
-        body: JSON.stringify({ acknowledge_warnings: warningAcknowledged }),
+        body: JSON.stringify({ acknowledge_warnings: latestPreview.summary.warning_count > 0 }),
       });
       setPlan(result.plan);
       setPublicationPreview(result.preview);
@@ -762,7 +847,7 @@ export function MonthlyShiftsPage() {
           <p>確定時ハッシュ {publicationPreview.confirmed_content_hash || "-"} / 現在ハッシュ {publicationPreview.content_hash} / 内容変更：{publicationPreview.confirmation_stale ? "あり" : "なし"} / 公開予定Version {publicationPreview.next_publication_version}</p>
           {publicationPreview.confirmation_stale ? <p className="error">確定後にシフト内容が変更されています。確定解除して再度確定してください。</p> : null}
           <p>勤務 {publicationPreview.summary.assignment_count} / スタッフ {publicationPreview.summary.staff_count} / セグメント {publicationPreview.summary.segment_count} / 勤務時間 {publicationPreview.summary.work_minutes}分 / 休憩 {publicationPreview.summary.break_minutes}分 / エラー {publicationPreview.summary.error_count} / 警告 {publicationPreview.summary.warning_count}</p>
-          <label><input type="checkbox" checked={warningAcknowledged} onChange={(event) => setAcknowledgedValidationFingerprint(event.target.checked ? publicationPreview.validation_fingerprint : "")} /> 警告内容を確認しました。</label>
+          <label><input type="checkbox" checked={warningAcknowledged} onChange={(event) => setAcknowledgedWarningFingerprint(event.target.checked ? currentWarningFingerprint : "")} /> 警告内容を確認しました。</label>
           <table className="table"><thead><tr><th>日付</th><th>スタッフ</th><th>勤務</th><th>issue</th></tr></thead><tbody>{publicationPreview.items.slice(0, 80).map((item, index) => <tr key={`${item.assignment ?? item.scope}-${index}`}><td>{item.work_date ?? "-"}</td><td>{item.staff_display_name ?? "-"}</td><td>{item.pattern_short_name ?? "-"}</td><td>{item.issues.map((issue) => `${issue.severity}:${issue.message}`).join(" / ")}</td></tr>)}</tbody></table>
         </section>
       ) : null}

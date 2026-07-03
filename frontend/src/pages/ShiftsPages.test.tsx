@@ -153,6 +153,79 @@ function publicationPreview(overrides: Partial<PublicationPreview> = {}): Public
     ...overrides,
   };
 }
+function publicationPreviewWarning(code: string, message = "warning", overrides: Partial<PublicationPreview> = {}): PublicationPreview {
+  return publicationPreview({
+    validation_fingerprint: "server-validation-unchanged",
+    items: [
+      {
+        scope: "assignment",
+        assignment: "ma1",
+        work_date: "2028-02-01",
+        staff: "staff1",
+        staff_display_name: "スタッフA",
+        pattern_short_name: "早",
+        warning_count: 1,
+        segment_count: 1,
+        issues: [{ severity: "warning", code, message }],
+      },
+    ],
+    ...overrides,
+  });
+}
+function publicationPreviewWithoutWarnings(overrides: Partial<PublicationPreview> = {}): PublicationPreview {
+  return publicationPreview({
+    summary: {
+      assignment_count: 1,
+      staff_count: 1,
+      segment_count: 1,
+      work_minutes: 450,
+      break_minutes: 60,
+      error_count: 0,
+      warning_count: 0,
+    },
+    items: [],
+    ...overrides,
+  });
+}
+function publicationPreviewWithError(overrides: Partial<PublicationPreview> = {}): PublicationPreview {
+  return publicationPreview({
+    validation_fingerprint: "server-validation-error",
+    summary: {
+      assignment_count: 1,
+      staff_count: 1,
+      segment_count: 1,
+      work_minutes: 450,
+      break_minutes: 60,
+      error_count: 1,
+      warning_count: 0,
+    },
+    items: [
+      {
+        scope: "assignment",
+        assignment: "ma1",
+        work_date: "2028-02-01",
+        staff: "staff1",
+        staff_display_name: "スタッフA",
+        pattern_short_name: "早",
+        warning_count: 0,
+        segment_count: 1,
+        issues: [{ severity: "error", code: "missing_capability", message: "error" }],
+      },
+    ],
+    can_confirm: false,
+    can_publish: false,
+    ...overrides,
+  });
+}
+function fetchCallsIncluding(fragment: string) {
+  return fetchMock.mock.calls.filter(([input]) => String(input).includes(fragment));
+}
+async function openMonthlyPublicationPreview() {
+  await screen.findByRole("option", { name: "本館" });
+  await userEvent.selectOptions(screen.getByLabelText("拠点"), "l1");
+  await userEvent.click(await screen.findByRole("button", { name: "月間表を開く" }));
+  await userEvent.click(await screen.findByRole("button", { name: "公開プレビュー" }));
+}
 const monthlyMatrix = {
   plan: { id: "m1", location: "l1", location_name: "本館", year: 2028, month: 2, name: "2028年2月 本館シフト" },
   dates: Array.from({ length: 29 }, (_, index) => {
@@ -445,6 +518,26 @@ const patterns = {
     },
   ],
 };
+
+function monthlyPublicationApiHandlers(
+  planResult: typeof monthlyPlan | typeof confirmedMonthlyPlan,
+  previewHandler: unknown,
+  extraHandlers: Record<string, unknown> = {},
+) {
+  return {
+    "/api/v1/monthly-shift-plans/m1/matrix/": monthlyMatrix,
+    "/api/v1/monthly-shift-plans/m1/publication-preview/": previewHandler,
+    "/api/v1/monthly-shift-plans/m1/publications/": [],
+    ...extraHandlers,
+    "/api/v1/monthly-shift-plans/": { count: 1, next: null, previous: null, results: [planResult] },
+    "/api/v1/locations/": locations,
+    "/api/v1/shift-patterns/": patterns,
+    "/api/v1/weekly-shift-templates/": { count: 0, next: null, previous: null, results: [] },
+    "/api/v1/work-types/": workTypes,
+    "/api/v1/work-areas/": workAreas,
+    "/api/v1/work-type-availabilities/": { count: 0, next: null, previous: null, results: [] },
+  };
+}
 
 describe("shift settings pages", () => {
   beforeEach(() => {
@@ -1151,28 +1244,13 @@ describe("shift settings pages", () => {
     expect(await screen.findByText("warning")).toBeInTheDocument();
   });
 
-  it("requires rechecking warnings when confirm preview fingerprint changes", async () => {
+  it("requires rechecking warnings when confirm warning fingerprint changes", async () => {
     let previewCalls = 0;
     mockAuthAndApi(["system_admin"], {
       "/api/v1/monthly-shift-plans/m1/matrix/": monthlyMatrix,
       "/api/v1/monthly-shift-plans/m1/publication-preview/": () => {
         previewCalls += 1;
-        return publicationPreview({
-          validation_fingerprint: previewCalls === 1 ? "fingerprint-1" : "fingerprint-2",
-          items: [
-            {
-              scope: "assignment",
-              assignment: "ma1",
-              work_date: "2028-02-01",
-              staff: "staff1",
-              staff_display_name: "スタッフA",
-              pattern_short_name: "早",
-              warning_count: 1,
-              segment_count: 1,
-              issues: [{ severity: "warning", code: previewCalls === 1 ? "assisted_capability" : "trainee_capability", message: "warning" }],
-            },
-          ],
-        });
+        return publicationPreviewWarning(previewCalls === 1 ? "assisted_capability" : "trainee_capability");
       },
       "/api/v1/monthly-shift-plans/": { count: 1, next: null, previous: null, results: [monthlyPlan] },
       "/api/v1/locations/": locations,
@@ -1189,35 +1267,22 @@ describe("shift settings pages", () => {
     await userEvent.click(await screen.findByRole("button", { name: "公開プレビュー" }));
     await userEvent.click(await screen.findByLabelText("警告内容を確認しました。"));
     await userEvent.click(screen.getByRole("button", { name: "確定" }));
-    expect(await screen.findByText("検証結果が更新されました。最新の内容を確認してください。")).toBeInTheDocument();
-    expect(fetchMock).not.toHaveBeenCalledWith(expect.stringContaining("/confirm/"), expect.anything());
+    expect(await screen.findByText("警告内容が更新されました。最新の警告を確認して、再度チェックしてください。")).toBeInTheDocument();
+    expect(screen.getByLabelText("警告内容を確認しました。")).not.toBeChecked();
+    expect(fetchCallsIncluding("/confirm/")).toHaveLength(0);
   });
 
-  it("does not publish when latest preview fingerprint changes with same warning count", async () => {
+  it("does not publish when latest preview warning fingerprint changes with same warning count", async () => {
     let previewCalls = 0;
     mockAuthAndApi(["system_admin"], {
       "/api/v1/monthly-shift-plans/m1/matrix/": monthlyMatrix,
       "/api/v1/monthly-shift-plans/m1/publication-preview/": () => {
         previewCalls += 1;
-        return publicationPreview({
+        return publicationPreviewWarning(previewCalls === 1 ? "assisted_capability" : "trainee_capability", "warning", {
           workflow_status: "confirmed",
           confirmed_content_hash: "hash-current",
           can_confirm: false,
           can_publish: true,
-          validation_fingerprint: previewCalls === 1 ? "fingerprint-1" : "fingerprint-2",
-          items: [
-            {
-              scope: "assignment",
-              assignment: "ma1",
-              work_date: "2028-02-01",
-              staff: "staff1",
-              staff_display_name: "スタッフA",
-              pattern_short_name: "早",
-              warning_count: 1,
-              segment_count: 1,
-              issues: [{ severity: "warning", code: previewCalls === 1 ? "assisted_capability" : "trainee_capability", message: "warning" }],
-            },
-          ],
         });
       },
       "/api/v1/monthly-shift-plans/": { count: 1, next: null, previous: null, results: [confirmedMonthlyPlan] },
@@ -1235,8 +1300,184 @@ describe("shift settings pages", () => {
     await userEvent.click(await screen.findByRole("button", { name: "公開プレビュー" }));
     await userEvent.click(await screen.findByLabelText("警告内容を確認しました。"));
     await userEvent.click(screen.getByRole("button", { name: "公開" }));
-    expect(await screen.findByText("検証結果が更新されました。最新の内容を確認してください。")).toBeInTheDocument();
-    expect(fetchMock).not.toHaveBeenCalledWith(expect.stringContaining("/publish/"), expect.anything());
+    expect(await screen.findByText("警告内容が更新されました。最新の警告を確認して、再度チェックしてください。")).toBeInTheDocument();
+    expect(screen.getByLabelText("警告内容を確認しました。")).not.toBeChecked();
+    expect(fetchCallsIncluding("/publish/")).toHaveLength(0);
+  });
+
+  it("blocks confirm when acknowledged warnings are updated by the latest preview", async () => {
+    let previewCalls = 0;
+    mockAuthAndApi(
+      ["system_admin"],
+      monthlyPublicationApiHandlers(monthlyPlan, () => {
+        previewCalls += 1;
+        return publicationPreviewWarning(previewCalls === 1 ? "assisted_capability" : "trainee_capability");
+      }),
+    );
+    renderWithAuth(<MonthlyShiftsPage />);
+    await openMonthlyPublicationPreview();
+    await userEvent.click(await screen.findByLabelText("警告内容を確認しました。"));
+    expect(screen.getByLabelText("警告内容を確認しました。")).toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "確定" }));
+    expect(await screen.findByText("警告内容が更新されました。最新の警告を確認して、再度チェックしてください。")).toBeInTheDocument();
+    expect(screen.getByLabelText("警告内容を確認しました。")).not.toBeChecked();
+    expect(fetchCallsIncluding("/confirm/")).toHaveLength(0);
+    expect(previewCalls).toBe(2);
+  });
+
+  it("blocks publish when displayed warnings are updated by the latest preview", async () => {
+    let previewCalls = 0;
+    mockAuthAndApi(
+      ["system_admin"],
+      monthlyPublicationApiHandlers(confirmedMonthlyPlan, () => {
+        previewCalls += 1;
+        return publicationPreviewWarning(previewCalls === 1 ? "assisted_capability" : "trainee_capability", "warning", {
+          workflow_status: "confirmed",
+          confirmed_content_hash: "hash-current",
+          can_confirm: false,
+          can_publish: true,
+        });
+      }),
+    );
+    renderWithAuth(<MonthlyShiftsPage />);
+    await openMonthlyPublicationPreview();
+    await userEvent.click(await screen.findByLabelText("警告内容を確認しました。"));
+    expect(screen.getByLabelText("警告内容を確認しました。")).toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "公開" }));
+    expect(await screen.findByText("警告内容が更新されました。最新の警告を確認して、再度チェックしてください。")).toBeInTheDocument();
+    expect(screen.getByLabelText("警告内容を確認しました。")).not.toBeChecked();
+    expect(fetchCallsIncluding("/publish/")).toHaveLength(0);
+    expect(previewCalls).toBe(2);
+  });
+
+  it("confirms exactly once after the latest preview has the same warnings", async () => {
+    let previewCalls = 0;
+    const warningA = {
+      scope: "assignment",
+      assignment: "ma1",
+      work_date: "2028-02-01",
+      staff: "staff1",
+      staff_display_name: "スタッフA",
+      pattern_short_name: "早",
+      warning_count: 1,
+      segment_count: 1,
+      issues: [{ severity: "warning" as const, code: "assisted_capability", message: "warning A" }],
+    };
+    const warningB = {
+      scope: "assignment",
+      assignment: "ma2",
+      work_date: "2028-02-02",
+      staff: "staff2",
+      staff_display_name: "スタッフB",
+      pattern_short_name: "遅",
+      warning_count: 1,
+      segment_count: 1,
+      issues: [{ severity: "warning" as const, code: "trainee_capability", message: "warning B" }],
+    };
+    mockAuthAndApi(
+      ["system_admin"],
+      monthlyPublicationApiHandlers(
+        monthlyPlan,
+        () => {
+          previewCalls += 1;
+          return publicationPreview({
+            validation_fingerprint: previewCalls === 1 ? "server-validation-1" : "server-validation-2",
+            summary: {
+              assignment_count: 2,
+              staff_count: 2,
+              segment_count: 2,
+              work_minutes: 900,
+              break_minutes: 120,
+              error_count: 0,
+              warning_count: 2,
+            },
+            items: previewCalls === 1 ? [warningA, warningB] : [warningB, warningA],
+          });
+        },
+        {
+          "/api/v1/monthly-shift-plans/m1/confirm/": {
+            plan: confirmedMonthlyPlan,
+            preview: publicationPreviewWithoutWarnings({
+              workflow_status: "confirmed",
+              confirmed_content_hash: "hash-current",
+              can_confirm: false,
+              can_publish: true,
+            }),
+          },
+        },
+      ),
+    );
+    renderWithAuth(<MonthlyShiftsPage />);
+    await openMonthlyPublicationPreview();
+    await userEvent.click(await screen.findByLabelText("警告内容を確認しました。"));
+    await userEvent.click(screen.getByRole("button", { name: "確定" }));
+    await waitFor(() => expect(fetchCallsIncluding("/confirm/")).toHaveLength(1));
+    expect(previewCalls).toBe(2);
+  });
+
+  it("does not confirm when the latest preview has errors", async () => {
+    let previewCalls = 0;
+    mockAuthAndApi(
+      ["system_admin"],
+      monthlyPublicationApiHandlers(monthlyPlan, () => {
+        previewCalls += 1;
+        return previewCalls === 1 ? publicationPreviewWithoutWarnings() : publicationPreviewWithError();
+      }),
+    );
+    renderWithAuth(<MonthlyShiftsPage />);
+    await openMonthlyPublicationPreview();
+    await userEvent.click(screen.getByRole("button", { name: "確定" }));
+    expect(await screen.findByText("公開プレビューにエラーがあります。エラーを解消してから確定してください。")).toBeInTheDocument();
+    expect(fetchCallsIncluding("/confirm/")).toHaveLength(0);
+  });
+
+  it("does not publish when the latest preview has errors", async () => {
+    let previewCalls = 0;
+    mockAuthAndApi(
+      ["system_admin"],
+      monthlyPublicationApiHandlers(confirmedMonthlyPlan, () => {
+        previewCalls += 1;
+        return previewCalls === 1
+          ? publicationPreviewWithoutWarnings({
+              workflow_status: "confirmed",
+              confirmed_content_hash: "hash-current",
+              can_confirm: false,
+              can_publish: true,
+            })
+          : publicationPreviewWithError({
+              workflow_status: "confirmed",
+              confirmed_content_hash: "hash-current",
+            });
+      }),
+    );
+    renderWithAuth(<MonthlyShiftsPage />);
+    await openMonthlyPublicationPreview();
+    await userEvent.click(screen.getByRole("button", { name: "公開" }));
+    expect(await screen.findByText("公開プレビューにエラーがあります。エラーを解消してから公開してください。")).toBeInTheDocument();
+    expect(fetchCallsIncluding("/publish/")).toHaveLength(0);
+  });
+
+  it("does not publish when the latest preview is confirmation stale", async () => {
+    let previewCalls = 0;
+    mockAuthAndApi(
+      ["system_admin"],
+      monthlyPublicationApiHandlers(confirmedMonthlyPlan, () => {
+        previewCalls += 1;
+        return publicationPreviewWithoutWarnings({
+          workflow_status: "confirmed",
+          content_hash: previewCalls === 1 ? "hash-current" : "hash-updated",
+          confirmed_content_hash: "hash-current",
+          confirmation_stale: previewCalls > 1,
+          can_confirm: false,
+          can_publish: previewCalls === 1,
+        });
+      }),
+    );
+    renderWithAuth(<MonthlyShiftsPage />);
+    await openMonthlyPublicationPreview();
+    await userEvent.click(screen.getByRole("button", { name: "公開" }));
+    expect((await screen.findAllByText("確定後にシフト内容が変更されています。確定解除して再度確定してください。")).length).toBeGreaterThan(0);
+    expect(fetchCallsIncluding("/publish/")).toHaveLength(0);
   });
 
   it("keeps supervisor monthly UI read only", async () => {

@@ -1,4 +1,5 @@
 import uuid
+from datetime import date
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
@@ -28,6 +29,12 @@ from ..models import (
 )
 from ..services import build_monthly_plan_content_hash, build_publication_preview, seed_shifts
 
+TEST_SHIFT_VALID_FROM = date(2026, 1, 1)
+
+
+def stable_test_valid_from():
+    return min(timezone.localdate(), TEST_SHIFT_VALID_FROM)
+
 
 class ShiftsBaseTestCase(BaseAPITestCase):
     def setUp(self):
@@ -47,8 +54,10 @@ class ShiftsBaseTestCase(BaseAPITestCase):
         self.gym_work = WorkType.objects.get(code="gym_duty")
         self.front_work = WorkType.objects.get(code="front_duty")
         self.break_work = WorkType.objects.get(code="break")
-        StaffLocation.objects.filter(staff__in=self.dev_users.values()).update(valid_from="2026-01-01")
-        StaffCapability.objects.filter(staff__in=self.dev_users.values()).update(valid_from="2026-01-01")
+        today = timezone.localdate()
+        if today > TEST_SHIFT_VALID_FROM:
+            StaffLocation.objects.filter(staff__in=self.dev_users.values()).update(valid_from=TEST_SHIFT_VALID_FROM)
+            StaffCapability.objects.filter(staff__in=self.dev_users.values()).update(valid_from=TEST_SHIFT_VALID_FROM)
 
     def pattern_payload(self, code="api_pattern"):
         return {
@@ -1866,7 +1875,7 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
             staff=self.staff,
             work_type=WorkType.objects.get(code="front_duty"),
             location=self.location,
-            valid_from="2026-01-01",
+            valid_from=stable_test_valid_from(),
             valid_until=None,
             defaults={
                 "level": StaffCapability.Level.INDEPENDENT,
@@ -1930,7 +1939,7 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
             staff=self.staff,
             work_type=required_work_type,
             location=self.location,
-            valid_from="2026-01-01",
+            valid_from=stable_test_valid_from(),
             valid_until=None,
             defaults={
                 "level": StaffCapability.Level.ASSISTED,

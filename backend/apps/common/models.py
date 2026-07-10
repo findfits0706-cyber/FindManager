@@ -58,6 +58,13 @@ class AuditEvent(models.Model):
         MONTHLY_SHIFT_PLAN_UPDATED = "monthly_shift_plan_updated", "Monthly shift plan updated"
         MONTHLY_SHIFT_PLAN_DEACTIVATED = "monthly_shift_plan_deactivated", "Monthly shift plan deactivated"
         MONTHLY_SHIFT_PLAN_REACTIVATED = "monthly_shift_plan_reactivated", "Monthly shift plan reactivated"
+        MONTHLY_SHIFT_PLAN_CONFIRMED = "monthly_shift_plan_confirmed", "Monthly shift plan confirmed"
+        MONTHLY_SHIFT_PLAN_REOPENED = "monthly_shift_plan_reopened", "Monthly shift plan reopened"
+        MONTHLY_SHIFT_PUBLICATION_CREATED = "monthly_shift_publication_created", "Monthly shift publication created"
+        MONTHLY_SHIFT_PUBLICATION_WITHDRAWN = (
+            "monthly_shift_publication_withdrawn",
+            "Monthly shift publication withdrawn",
+        )
         MONTHLY_SHIFT_ASSIGNMENT_CREATED = "monthly_shift_assignment_created", "Monthly shift assignment created"
         MONTHLY_SHIFT_ASSIGNMENT_UPDATED = "monthly_shift_assignment_updated", "Monthly shift assignment updated"
         MONTHLY_SHIFT_ASSIGNMENT_DEACTIVATED = (

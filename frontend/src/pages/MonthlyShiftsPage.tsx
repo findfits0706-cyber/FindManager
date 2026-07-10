@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 import { api } from "../api/client";
@@ -9,8 +9,10 @@ import type {
   MonthlyShiftAssignment,
   MonthlyShiftMatrix,
   MonthlyShiftPlan,
+  MonthlyShiftPublication,
   MonthlyShiftSegment,
   Paginated,
+  PublicationPreview,
   ShiftPattern,
   TemplateGenerationResult,
   WeeklyShiftTemplate,
@@ -66,8 +68,58 @@ function patternSegmentToForm(segment: NonNullable<ShiftPattern["segments"]>[num
   };
 }
 
+type PublicationWarningFingerprintEntry = {
+  assignment: string;
+  work_date: string;
+  staff: string;
+  severity: string;
+  code: string;
+  message: string;
+};
+
+const WARNING_UPDATED_MESSAGE = "警告内容が更新されました。最新の警告を確認して、再度チェックしてください。";
+const WARNING_REQUIRED_MESSAGE = "警告内容を確認してください。";
+
+function compareText(left: string, right: string) {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+function comparePublicationWarning(left: PublicationWarningFingerprintEntry, right: PublicationWarningFingerprintEntry) {
+  return (
+    compareText(left.assignment, right.assignment) ||
+    compareText(left.work_date, right.work_date) ||
+    compareText(left.staff, right.staff) ||
+    compareText(left.severity, right.severity) ||
+    compareText(left.code, right.code) ||
+    compareText(left.message, right.message)
+  );
+}
+
+function publicationWarningFingerprint(preview: PublicationPreview | null): string {
+  if (!preview) return "";
+  return JSON.stringify(
+    preview.items
+      .flatMap((item) =>
+        item.issues
+          .filter((issue) => issue.severity === "warning")
+          .map((issue) => ({
+            assignment: item.assignment ?? "",
+            work_date: item.work_date ?? "",
+            staff: item.staff ?? "",
+            severity: issue.severity,
+            code: issue.code,
+            message: issue.message,
+          })),
+      )
+      .sort(comparePublicationWarning),
+  );
+}
+
 export function MonthlyShiftsPage() {
   const { user, loading } = useAuth();
+  const queryClient = useQueryClient();
   const routerLocation = useLocation();
   const searchParams = useMemo(() => new URLSearchParams(routerLocation.search), [routerLocation.search]);
   const initialYear = Number(searchParams.get("year")) || defaultYear;
@@ -92,6 +144,9 @@ export function MonthlyShiftsPage() {
   const [invalidMode, setInvalidMode] = useState<"strict" | "skip_invalid">("strict");
   const [preview, setPreview] = useState<TemplateGenerationResult | null>(null);
   const [previewKey, setPreviewKey] = useState("");
+  const [publicationPreview, setPublicationPreview] = useState<PublicationPreview | null>(null);
+  const [acknowledgedWarningFingerprint, setAcknowledgedWarningFingerprint] = useState("");
+  const [selectedPublicationId, setSelectedPublicationId] = useState("");
   const [isDirty, setIsDirty] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState("");
@@ -154,6 +209,16 @@ export function MonthlyShiftsPage() {
         `/api/v1/work-type-availabilities/?page_size=200&is_active=true&location=${activePlan?.location}`,
       ),
   });
+  const publicationHistoryQuery = useQuery({
+    enabled: canView && Boolean(activePlan),
+    queryKey: ["monthly-shift-publications", activePlan?.id],
+    queryFn: () => api<MonthlyShiftPublication[]>(`/api/v1/monthly-shift-plans/${activePlan?.id}/publications/`),
+  });
+  const publicationDetailQuery = useQuery({
+    enabled: canView && Boolean(selectedPublicationId),
+    queryKey: ["monthly-shift-publication", selectedPublicationId],
+    queryFn: () => api<MonthlyShiftPublication>(`/api/v1/monthly-shift-publications/${selectedPublicationId}/`),
+  });
   useEffect(() => {
     if (!plan && (initialLocation || (location && hasDeepLink)) && planQuery.data?.results[0]) {
       setPlan(planQuery.data.results[0]);
@@ -212,6 +277,49 @@ export function MonthlyShiftsPage() {
   }, [deepLinkDate, deepLinkStaff, location, matrixQuery.data, month, year]);
 
   const currentPreviewKey = `${activePlan?.id ?? ""}|${templateId}|${existingMode}|${invalidMode}`;
+  const planStatus = activePlan?.workflow_status ?? "draft";
+  const currentWarningFingerprint = publicationWarningFingerprint(publicationPreview);
+  const publicationPreviewKey = publicationPreview
+    ? JSON.stringify({
+        plan: publicationPreview.plan,
+        content_hash: publicationPreview.content_hash,
+        confirmed_content_hash: publicationPreview.confirmed_content_hash,
+        workflow_status: publicationPreview.workflow_status,
+        warning_fingerprint: currentWarningFingerprint,
+        error_count: publicationPreview.summary.error_count,
+        warning_count: publicationPreview.summary.warning_count,
+      })
+    : "";
+  const warningAcknowledged =
+    publicationPreview !== null &&
+    publicationPreview.summary.warning_count > 0 &&
+    acknowledgedWarningFingerprint === currentWarningFingerprint;
+  const warningRequirementSatisfied =
+    publicationPreview !== null &&
+    (publicationPreview.summary.warning_count === 0 || warningAcknowledged);
+  const isPlanEditable =
+    canManage && Boolean(activePlan) && (activePlan?.is_editable ?? !["confirmed", "published"].includes(planStatus));
+  const lockMessage =
+    planStatus === "confirmed"
+      ? "この月間シフトは確定済みのため編集できません。"
+      : planStatus === "published"
+        ? "この月間シフトは公開中のため編集できません。公開停止後に確定解除してください。"
+        : "";
+  const canConfirmPlan =
+    canManage &&
+    Boolean(publicationPreview) &&
+    publicationPreview?.can_confirm === true &&
+    warningRequirementSatisfied &&
+    !isSubmitting;
+  const canPublishPlan =
+    canManage &&
+    Boolean(publicationPreview) &&
+    publicationPreview?.can_publish === true &&
+    warningRequirementSatisfied &&
+    !isSubmitting;
+  useEffect(() => {
+    setAcknowledgedWarningFingerprint("");
+  }, [publicationPreviewKey, activePlan?.id, location, month, planStatus, year]);
   const availableWorkTypeIds = useMemo(
     () => new Set((availabilityQuery.data?.results ?? []).map((item) => item.work_type)),
     [availabilityQuery.data?.results],
@@ -220,6 +328,7 @@ export function MonthlyShiftsPage() {
     () => (workTypeQuery.data?.results ?? []).filter((item) => availableWorkTypeIds.has(item.id)),
     [availableWorkTypeIds, workTypeQuery.data?.results],
   );
+  const publicationHistory = Array.isArray(publicationHistoryQuery.data) ? publicationHistoryQuery.data : [];
   const isWorkTypeAvailableForArea = (workType: string, workArea: string | null) =>
     (availabilityQuery.data?.results ?? []).some(
       (item) => item.work_type === workType && (item.work_area === null || item.work_area === workArea),
@@ -236,6 +345,8 @@ export function MonthlyShiftsPage() {
     setSelected(null);
     setPreview(null);
     setPreviewKey("");
+    setPublicationPreview(null);
+    setSelectedPublicationId("");
   };
 
   const openOrCreatePlan = async () => {
@@ -246,6 +357,8 @@ export function MonthlyShiftsPage() {
       setPlan(existing);
       setPreview(null);
       setPreviewKey("");
+      setPublicationPreview(null);
+      setSelectedPublicationId("");
       return;
     }
     if (!canManage) {
@@ -355,7 +468,7 @@ export function MonthlyShiftsPage() {
   };
 
   const saveAssignment = async () => {
-    if (!selected || !activePlan || isSubmitting) return;
+    if (!selected || !activePlan || !isPlanEditable || isSubmitting) return;
     setIsSubmitting(true);
     setError("");
     try {
@@ -395,7 +508,7 @@ export function MonthlyShiftsPage() {
   };
 
   const deactivateAssignment = async () => {
-    if (!assignment || !window.confirm("勤務を解除しますか？")) return;
+    if (!assignment || !isPlanEditable || !window.confirm("勤務を解除しますか？")) return;
     setIsSubmitting(true);
     try {
       await api(`/api/v1/monthly-shift-assignments/${assignment.id}/deactivate/`, { method: "POST", body: JSON.stringify({}) });
@@ -411,7 +524,7 @@ export function MonthlyShiftsPage() {
   };
 
   const reactivateAssignment = async () => {
-    if (!selected?.inactiveAssignmentId || isSubmitting || !window.confirm("解除済み勤務を復元しますか？")) return;
+    if (!selected?.inactiveAssignmentId || !isPlanEditable || isSubmitting || !window.confirm("解除済み勤務を復元しますか？")) return;
     setIsSubmitting(true);
     setError("");
     try {
@@ -434,7 +547,7 @@ export function MonthlyShiftsPage() {
   };
 
   const previewTemplate = async () => {
-    if (!activePlan || !templateId) return;
+    if (!activePlan || !templateId || !isPlanEditable) return;
     setError("");
     try {
       const result = await api<TemplateGenerationResult>(`/api/v1/monthly-shift-plans/${activePlan.id}/preview-template-generation/`, {
@@ -449,7 +562,7 @@ export function MonthlyShiftsPage() {
   };
 
   const applyTemplate = async () => {
-    if (!activePlan || !templateId || isSubmitting) return;
+    if (!activePlan || !templateId || !isPlanEditable || isSubmitting) return;
     if (existingMode === "replace_template_generated" && !window.confirm("テンプレート生成済み勤務を置換します。")) return;
     setIsSubmitting(true);
     setError("");
@@ -468,25 +581,200 @@ export function MonthlyShiftsPage() {
     }
   };
 
+  const loadPublicationPreview = async () => {
+    if (!activePlan) return null;
+    setError("");
+    try {
+      const result = await api<PublicationPreview>(`/api/v1/monthly-shift-plans/${activePlan.id}/publication-preview/`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      setPublicationPreview(result);
+      return result;
+    } catch (previewError) {
+      setError(previewError instanceof Error ? previewError.message : "公開プレビューに失敗しました。");
+      return null;
+    }
+  };
+
+  const loadLatestPublicationPreviewForAction = async () => {
+    if (!activePlan) return null;
+    const latestPreview = await api<PublicationPreview>(`/api/v1/monthly-shift-plans/${activePlan.id}/publication-preview/`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    setPublicationPreview(latestPreview);
+    return latestPreview;
+  };
+
+  const confirmPlan = async () => {
+    if (!activePlan || !publicationPreview || isSubmitting) return;
+    const acknowledgedFingerprint = acknowledgedWarningFingerprint;
+    setIsSubmitting(true);
+    setError("");
+    try {
+      const latestPreview = await loadLatestPublicationPreviewForAction();
+      if (!latestPreview) return;
+      const latestWarningFingerprint = publicationWarningFingerprint(latestPreview);
+      if (!latestPreview.can_confirm && latestPreview.summary.error_count === 0) {
+        setError("確定できる状態ではありません。公開プレビューを確認してください。");
+        return;
+      }
+      if (latestPreview.summary.error_count > 0) {
+        setError("公開プレビューにエラーがあります。エラーを解消してから確定してください。");
+        return;
+      }
+      if (latestPreview.summary.warning_count > 0 && acknowledgedFingerprint !== latestWarningFingerprint) {
+        setAcknowledgedWarningFingerprint("");
+        setError(acknowledgedFingerprint ? WARNING_UPDATED_MESSAGE : WARNING_REQUIRED_MESSAGE);
+        return;
+      }
+      const result = await api<{ plan: MonthlyShiftPlan; preview: PublicationPreview }>(`/api/v1/monthly-shift-plans/${activePlan.id}/confirm/`, {
+        method: "POST",
+        body: JSON.stringify({ acknowledge_warnings: latestPreview.summary.warning_count > 0 }),
+      });
+      setPlan(result.plan);
+      setPublicationPreview(result.preview);
+      setMessage("月間シフトを確定しました。");
+      await publicationHistoryQuery.refetch();
+    } catch (confirmError) {
+      setError(confirmError instanceof Error ? confirmError.message : "確定に失敗しました。");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const reopenPlan = async () => {
+    if (!activePlan || isSubmitting || !window.confirm("確定を解除しますか？")) return;
+    setIsSubmitting(true);
+    setError("");
+    try {
+      const result = await api<MonthlyShiftPlan>(`/api/v1/monthly-shift-plans/${activePlan.id}/reopen/`, {
+        method: "POST",
+        body: JSON.stringify({ reason: "" }),
+      });
+      setPlan(result);
+      setPublicationPreview(null);
+      setMessage("確定を解除しました。");
+    } catch (reopenError) {
+      setError(reopenError instanceof Error ? reopenError.message : "確定解除に失敗しました。");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const publishPlan = async () => {
+    if (!activePlan || !publicationPreview || isSubmitting) return;
+    const displayedWarningFingerprint = currentWarningFingerprint;
+    const acknowledgedFingerprint = acknowledgedWarningFingerprint;
+    setIsSubmitting(true);
+    setError("");
+    try {
+      const latestPreview = await loadLatestPublicationPreviewForAction();
+      if (!latestPreview) return;
+      const latestWarningFingerprint = publicationWarningFingerprint(latestPreview);
+      if (displayedWarningFingerprint !== latestWarningFingerprint) {
+        setAcknowledgedWarningFingerprint("");
+        setError(WARNING_UPDATED_MESSAGE);
+        return;
+      }
+      if (latestPreview.confirmation_stale) {
+        setError("確定後にシフト内容が変更されています。確定解除して再度確定してください。");
+        return;
+      }
+      if (latestPreview.summary.error_count > 0) {
+        setError("公開プレビューにエラーがあります。エラーを解消してから公開してください。");
+        return;
+      }
+      if (!latestPreview.can_publish) {
+        setError("公開できる状態ではありません。公開プレビューを確認してください。");
+        return;
+      }
+      if (latestPreview.summary.warning_count > 0 && acknowledgedFingerprint !== latestWarningFingerprint) {
+        setAcknowledgedWarningFingerprint("");
+        setError(acknowledgedFingerprint ? WARNING_UPDATED_MESSAGE : WARNING_REQUIRED_MESSAGE);
+        return;
+      }
+      const result = await api<{ plan: MonthlyShiftPlan; preview: PublicationPreview }>(`/api/v1/monthly-shift-plans/${activePlan.id}/publish/`, {
+        method: "POST",
+        body: JSON.stringify({ acknowledge_warnings: latestPreview.summary.warning_count > 0 }),
+      });
+      setPlan(result.plan);
+      setPublicationPreview(result.preview);
+      setMessage("月間シフトを公開しました。");
+      await matrixQuery.refetch();
+      await publicationHistoryQuery.refetch();
+    } catch (publishError) {
+      setError(publishError instanceof Error ? publishError.message : "公開に失敗しました。");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const withdrawPublication = async () => {
+    if (!activePlan || isSubmitting) return;
+    const reason = window.prompt("公開取り下げ理由を入力してください。");
+    if (!reason) return;
+    setIsSubmitting(true);
+    setError("");
+    try {
+      const publicationId = activePlan.current_publication?.id;
+      const result = await api<{ plan: MonthlyShiftPlan }>(`/api/v1/monthly-shift-plans/${activePlan.id}/withdraw-publication/`, {
+        method: "POST",
+        body: JSON.stringify({ reason }),
+      });
+      setPlan(result.plan);
+      setPublicationPreview(null);
+      setSelectedPublicationId("");
+      setMessage("公開を取り下げました。");
+      await queryClient.invalidateQueries({ queryKey: ["monthly-shift-plans"] });
+      await queryClient.invalidateQueries({ queryKey: ["monthly-shift-matrix"] });
+      await queryClient.invalidateQueries({ queryKey: ["monthly-shift-publications", activePlan.id] });
+      if (publicationId) {
+        await queryClient.invalidateQueries({ queryKey: ["monthly-shift-publication", publicationId] });
+      }
+      await queryClient.invalidateQueries({ queryKey: ["my-published-shifts"] });
+    } catch (withdrawError) {
+      setError(withdrawError instanceof Error ? withdrawError.message : "公開取り下げに失敗しました。");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   return (
     <section className="card monthly-page">
       <div className="section-header">
         <div><p className="eyebrow">Shift planning</p><h2>月間シフト</h2></div>
       </div>
       <div className="toolbar field-grid">
-        <label>拠点<select value={location} onChange={(event) => { setLocation(event.target.value); setPlan(null); setPreview(null); setPreviewKey(""); }}><option value="">選択してください</option>{locationQuery.data?.results.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-        <label>年<input type="number" value={year} onChange={(event) => { setYear(Number(event.target.value)); setPlan(null); setPreview(null); setPreviewKey(""); }} /></label>
-        <label>月<input type="number" min={1} max={12} value={month} onChange={(event) => { setMonth(Number(event.target.value)); setPlan(null); setPreview(null); setPreviewKey(""); }} /></label>
+        <label>拠点<select value={location} onChange={(event) => { setLocation(event.target.value); setPlan(null); setPreview(null); setPreviewKey(""); setPublicationPreview(null); }}><option value="">選択してください</option>{locationQuery.data?.results.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+        <label>年<input type="number" value={year} onChange={(event) => { setYear(Number(event.target.value)); setPlan(null); setPreview(null); setPreviewKey(""); setPublicationPreview(null); }} /></label>
+        <label>月<input type="number" min={1} max={12} value={month} onChange={(event) => { setMonth(Number(event.target.value)); setPlan(null); setPreview(null); setPreviewKey(""); setPublicationPreview(null); }} /></label>
         <button type="button" onClick={() => changeMonth(-1)}>前月</button>
         <button type="button" onClick={() => changeMonth(1)}>次月</button>
         <button type="button" disabled={!location} onClick={() => void openOrCreatePlan()}>{planQuery.data?.results[0] ? "月間表を開く" : canManage ? "新規作成" : "月間表なし"}</button>
       </div>
+      {activePlan ? (
+        <div className="toolbar field-grid">
+          <div>
+            <strong>状態: {planStatus === "draft" ? "下書き" : planStatus === "confirmed" ? "確定済み" : "公開済み"}</strong>
+            {activePlan.current_publication ? <div className="subtle-text">公開 v{activePlan.current_publication.version}</div> : null}
+            {lockMessage ? <div className="subtle-text">{lockMessage}</div> : null}
+          </div>
+          <button type="button" disabled={!activePlan} onClick={() => void loadPublicationPreview()}>公開プレビュー</button>
+          {canManage && planStatus === "draft" ? <button type="button" disabled={!canConfirmPlan} onClick={() => void confirmPlan()}>確定</button> : null}
+          {canManage && planStatus === "confirmed" ? <button type="button" disabled={isSubmitting} onClick={() => void reopenPlan()}>確定解除</button> : null}
+          {canManage && planStatus === "confirmed" ? <button type="button" disabled={!canPublishPlan} onClick={() => void publishPlan()}>公開</button> : null}
+          {planStatus === "published" && activePlan.current_publication ? <button type="button" onClick={() => setSelectedPublicationId(activePlan.current_publication?.id ?? "")}>公開内容を確認</button> : null}
+          {canManage && planStatus === "published" ? <button type="button" disabled={isSubmitting} onClick={() => void withdrawPublication()}>公開取り下げ</button> : null}
+        </div>
+      ) : null}
       {canManage ? <div className="toolbar field-grid">
-        <label>週間テンプレート<select value={templateId} disabled={!activePlan} onChange={(event) => { setTemplateId(event.target.value); setPreview(null); setPreviewKey(""); }}><option value="">選択してください</option>{templateQuery.data?.results.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-        <label>既存<select value={existingMode} onChange={(event) => { setExistingMode(event.target.value as typeof existingMode); setPreview(null); setPreviewKey(""); }}><option value="skip_existing">既存を保持</option><option value="replace_template_generated">生成済みを置換</option></select></label>
-        <label>不正候補<select value={invalidMode} onChange={(event) => { setInvalidMode(event.target.value as typeof invalidMode); setPreview(null); setPreviewKey(""); }}><option value="strict">strict</option><option value="skip_invalid">skip_invalid</option></select></label>
-        <button type="button" disabled={!templateId || !activePlan} onClick={() => void previewTemplate()}>生成プレビュー</button>
-        {canManage ? <button type="button" disabled={!preview || previewKey !== currentPreviewKey || (invalidMode === "strict" && preview.summary.error_count > 0) || isSubmitting} onClick={() => void applyTemplate()}>テンプレート適用</button> : null}
+        <label>週間テンプレート<select value={templateId} disabled={!isPlanEditable} onChange={(event) => { setTemplateId(event.target.value); setPreview(null); setPreviewKey(""); }}><option value="">選択してください</option>{templateQuery.data?.results.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+        <label>既存<select disabled={!isPlanEditable} value={existingMode} onChange={(event) => { setExistingMode(event.target.value as typeof existingMode); setPreview(null); setPreviewKey(""); }}><option value="skip_existing">既存を保持</option><option value="replace_template_generated">生成済みを置換</option></select></label>
+        <label>不正候補<select disabled={!isPlanEditable} value={invalidMode} onChange={(event) => { setInvalidMode(event.target.value as typeof invalidMode); setPreview(null); setPreviewKey(""); }}><option value="strict">strict</option><option value="skip_invalid">skip_invalid</option></select></label>
+        <button type="button" disabled={!templateId || !activePlan || !isPlanEditable} onClick={() => void previewTemplate()}>生成プレビュー</button>
+        {canManage ? <button type="button" disabled={!preview || previewKey !== currentPreviewKey || (invalidMode === "strict" && preview.summary.error_count > 0) || isSubmitting || !isPlanEditable} onClick={() => void applyTemplate()}>テンプレート適用</button> : null}
       </div> : null}
       <div className="toolbar field-grid">
         <label>スタッフ検索<input value={staffSearch} onChange={(event) => setStaffSearch(event.target.value)} /></label>
@@ -512,7 +800,7 @@ export function MonthlyShiftsPage() {
                     const inactive = row.inactive_assignments?.[item.date];
                     return (
                       <td key={`${row.staff}-${item.date}`} className={item.is_saturday ? "saturday" : item.is_sunday ? "sunday" : ""}>
-                        <button type="button" className="shift-cell" disabled={!canManage && !cell && !inactive} onClick={() => void loadAssignment({ staff: row.staff, staffName: row.staff_display_name, workDate: item.date, assignmentId: cell?.id, inactiveAssignmentId: inactive?.id, inactivePatternShortName: inactive?.pattern_short_name })}>
+                        <button type="button" className="shift-cell" disabled={!cell && !inactive && !isPlanEditable} onClick={() => void loadAssignment({ staff: row.staff, staffName: row.staff_display_name, workDate: item.date, assignmentId: cell?.id, inactiveAssignmentId: inactive?.id, inactivePatternShortName: inactive?.pattern_short_name })}>
                           {cell ? <><strong>{cell.pattern_short_name}</strong><span>{cell.start_offset_minutes != null ? offsetToLabel(cell.start_offset_minutes) : ""}~{cell.end_offset_minutes != null ? offsetToLabel(cell.end_offset_minutes) : ""}</span>{cell.is_customized ? <em>調整</em> : null}{cell.warning_count ? <em>警告</em> : null}</> : inactive ? <span className="subtle-text">解除済み {inactive.pattern_short_name}</span> : <span className="subtle-text">+</span>}
                         </button>
                       </td>
@@ -530,29 +818,90 @@ export function MonthlyShiftsPage() {
             {!assignment && selected.inactiveAssignmentId ? (
               <div className="inline-alert">
                 <p>解除済み勤務：{selected.inactivePatternShortName}</p>
-                {canManage ? <button type="button" disabled={isSubmitting} onClick={() => void reactivateAssignment()}>再有効化</button> : null}
+                {isPlanEditable ? <button type="button" disabled={isSubmitting} onClick={() => void reactivateAssignment()}>再有効化</button> : null}
               </div>
             ) : null}
-            <label>勤務パターン<select disabled={!canManage} value={selectedPattern} onChange={(event) => void choosePatternWithPreview(event.target.value)}><option value="">選択してください</option>{patternQuery.data?.results.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+            <label>勤務パターン<select disabled={!isPlanEditable} value={selectedPattern} onChange={(event) => void choosePatternWithPreview(event.target.value)}><option value="">選択してください</option>{patternQuery.data?.results.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
             {selectedPattern && segments.length ? <p className="subtle-text">選択パターン: {segments.length} セグメント</p> : null}
-            <label>備考<input readOnly={!canManage} value={notes} onChange={(event) => { setNotes(event.target.value); setIsDirty(true); }} /></label>
-            <div className="section-header"><h3>勤務内訳</h3>{canManage ? <button type="button" onClick={addSegment}>追加</button> : null}</div>
+            <label>備考<input readOnly={!isPlanEditable} value={notes} onChange={(event) => { setNotes(event.target.value); setIsDirty(true); }} /></label>
+            <div className="section-header"><h3>勤務内訳</h3>{isPlanEditable ? <button type="button" onClick={addSegment}>追加</button> : null}</div>
             {segments.map((segment, index) => (
               <div className="segment-editor" key={segment.id ?? index}>
-                <label>開始<select disabled={!canManage} value={segment.start_offset_minutes} onChange={(event) => updateSegment(index, { start_offset_minutes: Number(event.target.value) })}>{timeOptions.filter((item) => item.value < 2880).map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>
-                <label>終了<select disabled={!canManage} value={segment.end_offset_minutes} onChange={(event) => updateSegment(index, { end_offset_minutes: Number(event.target.value) })}>{timeOptions.filter((item) => item.value > 0).map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>
-                <label>業務<select disabled={!canManage} value={segment.work_type} onChange={(event) => updateSegment(index, { work_type: event.target.value })}><option value="">選択</option>{workTypeOptions.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-                <label>エリア<select disabled={!canManage} value={segment.work_area ?? ""} onChange={(event) => updateSegment(index, { work_area: event.target.value || null })}><option value="">全体</option>{workAreaQuery.data?.results.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-                <label>備考<input readOnly={!canManage} value={segment.notes} onChange={(event) => updateSegment(index, { notes: event.target.value })} /></label>
-                {canManage ? <button type="button" disabled={index === 0} onClick={() => moveSegment(index, -1)}>↑</button> : null}
-                {canManage ? <button type="button" disabled={index === segments.length - 1} onClick={() => moveSegment(index, 1)}>↓</button> : null}
-                {canManage ? <button type="button" onClick={() => removeSegment(index)}>削除</button> : null}
+                <label>開始<select disabled={!isPlanEditable} value={segment.start_offset_minutes} onChange={(event) => updateSegment(index, { start_offset_minutes: Number(event.target.value) })}>{timeOptions.filter((item) => item.value < 2880).map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>
+                <label>終了<select disabled={!isPlanEditable} value={segment.end_offset_minutes} onChange={(event) => updateSegment(index, { end_offset_minutes: Number(event.target.value) })}>{timeOptions.filter((item) => item.value > 0).map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>
+                <label>業務<select disabled={!isPlanEditable} value={segment.work_type} onChange={(event) => updateSegment(index, { work_type: event.target.value })}><option value="">選択</option>{workTypeOptions.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+                <label>エリア<select disabled={!isPlanEditable} value={segment.work_area ?? ""} onChange={(event) => updateSegment(index, { work_area: event.target.value || null })}><option value="">全体</option>{workAreaQuery.data?.results.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+                <label>備考<input readOnly={!isPlanEditable} value={segment.notes} onChange={(event) => updateSegment(index, { notes: event.target.value })} /></label>
+                {isPlanEditable ? <button type="button" disabled={index === 0} onClick={() => moveSegment(index, -1)}>↑</button> : null}
+                {isPlanEditable ? <button type="button" disabled={index === segments.length - 1} onClick={() => moveSegment(index, 1)}>↓</button> : null}
+                {isPlanEditable ? <button type="button" onClick={() => removeSegment(index)}>削除</button> : null}
               </div>
             ))}
-            {canManage ? <div className="actions"><button type="button" disabled={isSubmitting || (!assignment && !selectedPattern)} onClick={() => void saveAssignment()}>{isSubmitting ? "保存中..." : "保存"}</button>{assignment ? <button type="button" disabled={isSubmitting} onClick={() => void deactivateAssignment()}>勤務解除</button> : null}</div> : null}
+            {isPlanEditable ? <div className="actions"><button type="button" disabled={isSubmitting || (!assignment && !selectedPattern)} onClick={() => void saveAssignment()}>{isSubmitting ? "保存中..." : "保存"}</button>{assignment ? <button type="button" disabled={isSubmitting} onClick={() => void deactivateAssignment()}>勤務解除</button> : null}</div> : null}
           </aside>
         ) : null}
       </div>
+      {publicationPreview ? (
+        <section className="preview-panel">
+          <h3>公開プレビュー</h3>
+          <p>確定時ハッシュ {publicationPreview.confirmed_content_hash || "-"} / 現在ハッシュ {publicationPreview.content_hash} / 内容変更：{publicationPreview.confirmation_stale ? "あり" : "なし"} / 公開予定Version {publicationPreview.next_publication_version}</p>
+          {publicationPreview.confirmation_stale ? <p className="error">確定後にシフト内容が変更されています。確定解除して再度確定してください。</p> : null}
+          <p>勤務 {publicationPreview.summary.assignment_count} / スタッフ {publicationPreview.summary.staff_count} / セグメント {publicationPreview.summary.segment_count} / 勤務時間 {publicationPreview.summary.work_minutes}分 / 休憩 {publicationPreview.summary.break_minutes}分 / エラー {publicationPreview.summary.error_count} / 警告 {publicationPreview.summary.warning_count}</p>
+          <label><input type="checkbox" checked={warningAcknowledged} onChange={(event) => setAcknowledgedWarningFingerprint(event.target.checked ? currentWarningFingerprint : "")} /> 警告内容を確認しました。</label>
+          <table className="table"><thead><tr><th>日付</th><th>スタッフ</th><th>勤務</th><th>issue</th></tr></thead><tbody>{publicationPreview.items.slice(0, 80).map((item, index) => <tr key={`${item.assignment ?? item.scope}-${index}`}><td>{item.work_date ?? "-"}</td><td>{item.staff_display_name ?? "-"}</td><td>{item.pattern_short_name ?? "-"}</td><td>{item.issues.map((issue) => `${issue.severity}:${issue.message}`).join(" / ")}</td></tr>)}</tbody></table>
+        </section>
+      ) : null}
+      {activePlan ? (
+        <section className="preview-panel">
+          <h3>公開履歴</h3>
+          {publicationHistoryQuery.isLoading ? <p>読み込み中...</p> : null}
+          {publicationHistoryQuery.isError ? <p className="error">公開履歴の取得に失敗しました。</p> : null}
+          {!publicationHistoryQuery.isLoading && !publicationHistoryQuery.isError && publicationHistory.length === 0 ? <p className="subtle-text">公開履歴はありません。</p> : null}
+          <table className="table">
+            <thead><tr><th>Version</th><th>公開日時</th><th>公開者</th><th>状態</th><th>停止日時</th><th>停止者</th><th>停止理由</th><th>Assignment数</th><th>スタッフ数</th><th>Segment数</th><th></th></tr></thead>
+            <tbody>
+              {publicationHistory.map((item) => (
+                <tr key={item.id}>
+                  <td>v{item.version}</td>
+                  <td>{item.published_at}</td>
+                  <td>{item.published_by_display_name}</td>
+                  <td>{item.is_active ? "公開中" : "停止済み"}</td>
+                  <td>{item.withdrawn_at ?? ""}</td>
+                  <td>{item.withdrawn_by_display_name ?? ""}</td>
+                  <td>{item.withdrawal_reason}</td>
+                  <td>{item.assignment_count}</td>
+                  <td>{item.staff_count}</td>
+                  <td>{item.segment_count}</td>
+                  <td><button type="button" onClick={() => setSelectedPublicationId(item.id)}>詳細</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      ) : null}
+      {selectedPublicationId && publicationDetailQuery.isLoading ? <section className="preview-panel"><h3>公開詳細</h3><p>読み込み中...</p></section> : null}
+      {selectedPublicationId && publicationDetailQuery.isError ? <section className="preview-panel"><h3>公開詳細</h3><p className="error">公開詳細の取得に失敗しました。</p></section> : null}
+      {publicationDetailQuery.data ? (
+        <section className="preview-panel">
+          <h3>公開詳細 v{publicationDetailQuery.data.version}</h3>
+          <p>{publicationDetailQuery.data.location_name_snapshot} / {publicationDetailQuery.data.published_at} / {publicationDetailQuery.data.published_by_display_name}</p>
+          <table className="table">
+            <thead><tr><th>日付</th><th>スタッフ</th><th>勤務</th><th>時間</th><th>内訳</th><th>備考</th></tr></thead>
+            <tbody>
+              {(publicationDetailQuery.data.assignments ?? []).map((item) => (
+                <tr key={item.id}>
+                  <td>{item.work_date}</td>
+                  <td>{item.staff_display_name_snapshot}</td>
+                  <td>{item.pattern_short_name_snapshot || item.pattern_name_snapshot}</td>
+                  <td>{item.start_offset_minutes == null || item.end_offset_minutes == null ? "-" : `${offsetToLabel(item.start_offset_minutes)}~${offsetToLabel(item.end_offset_minutes)}`}</td>
+                  <td>{item.segments.map((segment) => `${offsetToLabel(segment.start_offset_minutes)}~${offsetToLabel(segment.end_offset_minutes)} ${segment.work_type_name_snapshot}${segment.work_area_name_snapshot ? `（${segment.work_area_name_snapshot}）` : ""}`).join(" / ")}</td>
+                  <td>{item.notes}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      ) : null}
       {preview ? (
         <section className="preview-panel">
           <h3>生成プレビュー</h3>

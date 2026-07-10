@@ -1,4 +1,5 @@
 import uuid
+from datetime import date
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
@@ -19,13 +20,20 @@ from apps.operations.services import seed_operations
 from ..models import (
     MonthlyShiftAssignment,
     MonthlyShiftPlan,
+    MonthlyShiftPublication,
     MonthlyShiftSegment,
     ShiftPattern,
     ShiftPatternSegment,
     WeeklyShiftTemplate,
     WeeklyShiftTemplateEntry,
 )
-from ..services import seed_shifts
+from ..services import build_monthly_plan_content_hash, build_publication_preview, seed_shifts
+
+TEST_SHIFT_VALID_FROM = date(2026, 1, 1)
+
+
+def stable_test_valid_from():
+    return min(timezone.localdate(), TEST_SHIFT_VALID_FROM)
 
 
 class ShiftsBaseTestCase(BaseAPITestCase):
@@ -46,6 +54,10 @@ class ShiftsBaseTestCase(BaseAPITestCase):
         self.gym_work = WorkType.objects.get(code="gym_duty")
         self.front_work = WorkType.objects.get(code="front_duty")
         self.break_work = WorkType.objects.get(code="break")
+        today = timezone.localdate()
+        if today > TEST_SHIFT_VALID_FROM:
+            StaffLocation.objects.filter(staff__in=self.dev_users.values()).update(valid_from=TEST_SHIFT_VALID_FROM)
+            StaffCapability.objects.filter(staff__in=self.dev_users.values()).update(valid_from=TEST_SHIFT_VALID_FROM)
 
     def pattern_payload(self, code="api_pattern"):
         return {
@@ -591,6 +603,74 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         )
         return assignment
 
+    def create_plan_for_location(self, location, *, year=2026, month=7):
+        return MonthlyShiftPlan.objects.create(
+            location=location,
+            year=year,
+            month=month,
+            name=f"{year}年{month}月 {location.short_name}シフト",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+
+    def create_assignment_for_location(
+        self,
+        plan,
+        *,
+        staff=None,
+        work_date="2026-07-01",
+        work_type=None,
+        work_area=None,
+        start_offset_minutes=540,
+        end_offset_minutes=600,
+        display_order=0,
+    ):
+        work_type = work_type or self.gym_work
+        assignment = MonthlyShiftAssignment.objects.create(
+            monthly_shift_plan=plan,
+            work_date=work_date,
+            staff=staff or self.staff,
+            source_type=MonthlyShiftAssignment.SourceType.MANUAL,
+            pattern_code_snapshot="manual",
+            pattern_name_snapshot="Manual",
+            pattern_short_name_snapshot="MAN",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=work_type,
+            work_area=work_area,
+            work_type_name_snapshot=work_type.name,
+            work_type_short_name_snapshot=work_type.short_name,
+            work_type_color_key_snapshot=work_type.color_key,
+            work_type_is_break_snapshot=work_type.is_break,
+            work_area_name_snapshot=work_area.name if work_area else "",
+            start_offset_minutes=start_offset_minutes,
+            end_offset_minutes=end_offset_minutes,
+            display_order=display_order,
+        )
+        return assignment
+
+    def publish_plan(self, plan):
+        client = self.force_client(self.system_admin)
+        confirmed = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/confirm/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.data)
+        published = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/publish/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(published.status_code, 201, published.data)
+        return MonthlyShiftPublication.objects.get(id=published.data["publication"]["id"])
+
+    def select_query_count(self, queries):
+        return sum(1 for query in queries if query["sql"].lstrip().upper().startswith("SELECT"))
+
     def test_timeline_parameter_validation_and_permissions(self):
         plan = self.create_plan()
         url = f"/api/v1/monthly-shift-plans/{plan.id}/timeline/"
@@ -678,12 +758,13 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         self.gym_work.name = "Changed Gym"
         self.gym_work.requires_capability = True
         self.gym_work.save(update_fields=["name", "requires_capability", "updated_at"])
-        StaffCapability.objects.create(
+        StaffCapability.objects.update_or_create(
             staff=self.staff,
             work_type=self.gym_work,
             location=self.location,
-            level=StaffCapability.Level.TRAINEE,
             valid_from="2026-01-01",
+            valid_until=None,
+            defaults={"level": StaffCapability.Level.TRAINEE},
         )
 
         response = self.force_client(self.system_admin).get(
@@ -999,6 +1080,573 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         self.assertEqual(first_result["assignment_count"], 2)
         self.assertEqual(first_result["staff_count"], 2)
 
+    def test_publication_workflow_locks_edits_and_exposes_snapshots(self):
+        client = self.force_client(self.system_admin)
+        plan = self.create_plan()
+        assignment = self.create_assignment_record(plan, work_date="2026-07-01")
+
+        preview = self.force_client(self.supervisor).post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/publication-preview/",
+            {},
+            format="json",
+        )
+        self.assertEqual(preview.status_code, 200, preview.data)
+        self.assertTrue(preview.data["can_confirm"])
+        self.assertEqual(preview.data["summary"]["assignment_count"], 1)
+        staff_preview = self.force_client(self.staff).post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/publication-preview/",
+            {},
+        )
+        self.assertEqual(staff_preview.status_code, 403)
+
+        confirmed = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/confirm/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.data)
+        plan.refresh_from_db()
+        self.assertEqual(plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.CONFIRMED)
+        self.assertTrue(plan.confirmed_content_hash)
+
+        locked_plan = client.patch(f"/api/v1/monthly-shift-plans/{plan.id}/", {"notes": "locked"}, format="json")
+        self.assertEqual(locked_plan.status_code, 400)
+        locked_assignment = client.patch(
+            f"/api/v1/monthly-shift-assignments/{assignment.id}/",
+            {"notes": "locked"},
+            format="json",
+        )
+        self.assertEqual(locked_assignment.status_code, 400)
+
+        reopened = client.post(f"/api/v1/monthly-shift-plans/{plan.id}/reopen/", {}, format="json")
+        self.assertEqual(reopened.status_code, 200, reopened.data)
+        self.assertEqual(reopened.data["workflow_status"], "draft")
+        editable_plan = client.patch(
+            f"/api/v1/monthly-shift-plans/{plan.id}/",
+            {"notes": "editable"},
+            format="json",
+        )
+        self.assertEqual(editable_plan.status_code, 200)
+
+        confirmed = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/confirm/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.data)
+        published = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/publish/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(published.status_code, 201, published.data)
+        plan.refresh_from_db()
+        self.assertEqual(plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.PUBLISHED)
+        publication = MonthlyShiftPublication.objects.get(id=published.data["publication"]["id"])
+        self.assertEqual(publication.assignments.count(), 1)
+        snapshot = publication.assignments.get()
+        self.assertEqual(snapshot.staff_display_name_snapshot, self.staff.display_name)
+        self.assertEqual(snapshot.segments.count(), 1)
+
+        assignment.notes = "current changed after publish"
+        assignment.save(update_fields=["notes", "updated_at"])
+        detail = client.get(f"/api/v1/monthly-shift-publications/{publication.id}/")
+        self.assertEqual(detail.status_code, 200, detail.data)
+        self.assertEqual(detail.data["assignments"][0]["notes"], "")
+        listing = client.get(f"/api/v1/monthly-shift-publications/?monthly_shift_plan={plan.id}&is_active=true")
+        self.assertEqual(listing.status_code, 200, listing.data)
+        self.assertEqual(listing.data["count"], 1)
+        self.assertEqual(self.force_client(self.staff).get("/api/v1/monthly-shift-publications/").status_code, 403)
+
+        my_shifts = self.force_client(self.staff).get(
+            "/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-07-31"
+        )
+        self.assertEqual(my_shifts.status_code, 200, my_shifts.data)
+        self.assertEqual(len(my_shifts.data["shifts"]), 1)
+        self.assertEqual(my_shifts.data["shifts"][0]["publication"]["id"], str(publication.id))
+        history = client.get(f"/api/v1/monthly-shift-plans/{plan.id}/publications/")
+        self.assertEqual(history.status_code, 200, history.data)
+        self.assertEqual(history.data[0]["assignment_count"], 1)
+        self.assertEqual(history.data[0]["segment_count"], 1)
+        staff_history = self.force_client(self.staff).get(f"/api/v1/monthly-shift-plans/{plan.id}/publications/")
+        self.assertEqual(staff_history.status_code, 403)
+        self.assertEqual(
+            self.force_client(self.shift_manager)
+            .get("/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-09-10")
+            .status_code,
+            400,
+        )
+
+        withdrawn = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/withdraw-publication/",
+            {"reason": "再調整"},
+            format="json",
+        )
+        self.assertEqual(withdrawn.status_code, 200, withdrawn.data)
+        plan.refresh_from_db()
+        publication.refresh_from_db()
+        self.assertEqual(plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.CONFIRMED)
+        self.assertFalse(publication.is_active)
+        self.assertEqual(
+            len(
+                self.force_client(self.staff)
+                .get("/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-07-31")
+                .data["shifts"]
+            ),
+            0,
+        )
+        self.assertTrue(AuditEvent.objects.filter(event_type="monthly_shift_publication_created").exists())
+        self.assertTrue(AuditEvent.objects.filter(event_type="monthly_shift_publication_withdrawn").exists())
+
+    def test_publish_rejects_stale_confirmed_hash(self):
+        client = self.force_client(self.system_admin)
+        plan = self.create_plan()
+        self.create_assignment_record(plan, work_date="2026-07-01")
+        confirmed = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/confirm/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.data)
+        MonthlyShiftPlan.objects.filter(id=plan.id).update(name="Changed behind lock")
+        response = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/publish/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("content_hash", response.data)
+
+    def test_content_hash_is_deterministic_and_ignores_staff_employee_code(self):
+        plan = self.create_plan()
+        assignment = self.create_assignment_record(plan, work_date="2026-07-01")
+        MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=self.front_work,
+            work_area=self.front_area,
+            work_type_name_snapshot=self.front_work.name,
+            work_type_short_name_snapshot=self.front_work.short_name,
+            work_type_color_key_snapshot=self.front_work.color_key,
+            work_type_is_break_snapshot=self.front_work.is_break,
+            work_area_name_snapshot=self.front_area.name,
+            start_offset_minutes=600,
+            end_offset_minutes=660,
+            display_order=20,
+        )
+        other_staff = self.create_user("hash_order_staff", ROLE_STAFF)
+        self.create_assignment_record(plan, staff=other_staff, work_date="2026-07-02")
+
+        original_hash = build_monthly_plan_content_hash(plan)
+        assignments = list(
+            MonthlyShiftAssignment.objects.filter(monthly_shift_plan=plan, is_active=True)
+            .select_related("staff", "source_shift_pattern")
+            .prefetch_related("segments__work_type", "segments__work_area")
+        )
+        for item in assignments:
+            item.active_segments = list(reversed([segment for segment in item.segments.all() if segment.is_active]))
+        self.assertEqual(build_monthly_plan_content_hash(plan, assignments=list(reversed(assignments))), original_hash)
+
+        self.staff.employee_code = "HASH-CHANGED"
+        self.staff.save(update_fields=["employee_code", "updated_at"])
+        self.assertEqual(build_monthly_plan_content_hash(plan), original_hash)
+        assignment.save(update_fields=["updated_at"])
+        self.assertEqual(build_monthly_plan_content_hash(plan), original_hash)
+
+        inactive_assignment = self.create_assignment_record(plan, staff=self.staff, work_date="2026-07-03")
+        inactive_assignment.is_active = False
+        inactive_assignment.save(update_fields=["is_active", "updated_at"])
+        inactive_segment = MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=self.front_work,
+            work_area=self.front_area,
+            work_type_name_snapshot=self.front_work.name,
+            work_type_short_name_snapshot=self.front_work.short_name,
+            work_type_color_key_snapshot=self.front_work.color_key,
+            work_type_is_break_snapshot=self.front_work.is_break,
+            work_area_name_snapshot=self.front_area.name,
+            start_offset_minutes=660,
+            end_offset_minutes=720,
+            is_active=False,
+        )
+        self.assertEqual(build_monthly_plan_content_hash(plan), original_hash)
+
+        assignment.notes = "hash changes"
+        assignment.save(update_fields=["notes", "updated_at"])
+        notes_hash = build_monthly_plan_content_hash(plan)
+        self.assertNotEqual(notes_hash, original_hash)
+        assignment.notes = ""
+        assignment.save(update_fields=["notes", "updated_at"])
+
+        active_segment = assignment.segments.filter(is_active=True).first()
+        active_segment.end_offset_minutes = 615
+        active_segment.save(update_fields=["end_offset_minutes", "updated_at"])
+        self.assertNotEqual(build_monthly_plan_content_hash(plan), original_hash)
+        active_segment.end_offset_minutes = 600
+        active_segment.work_type_name_snapshot = "Snapshot Changed"
+        active_segment.save(update_fields=["end_offset_minutes", "work_type_name_snapshot", "updated_at"])
+        self.assertNotEqual(build_monthly_plan_content_hash(plan), original_hash)
+
+        inactive_segment.notes = "ignored"
+        inactive_segment.save(update_fields=["notes", "updated_at"])
+        self.assertNotEqual(build_monthly_plan_content_hash(plan), original_hash)
+
+    def test_publication_preview_bulk_validation_sql_and_fingerprint(self):
+        client = self.force_client(self.system_admin)
+        self.gym_work.requires_capability = True
+        self.gym_work.save(update_fields=["requires_capability", "updated_at"])
+        StaffCapability.objects.update_or_create(
+            staff=self.staff,
+            work_type=self.gym_work,
+            location=self.location,
+            valid_from="2026-01-01",
+            valid_until=None,
+            defaults={
+                "level": StaffCapability.Level.INDEPENDENT,
+                "approved_by": self.system_admin,
+                "approved_at": timezone.now(),
+            },
+        )
+        small_plan = self.create_plan(month=7)
+        self.create_assignment_record(small_plan, work_date="2026-07-01", work_type=self.gym_work)
+
+        large_plan = self.create_plan(month=8)
+        large_staff = [self.create_user(f"preview_staff_{index}", ROLE_STAFF) for index in range(10)]
+        for staff in large_staff:
+            StaffLocation.objects.create(
+                staff=staff,
+                location=self.location,
+                is_primary=False,
+                valid_from="2026-08-01",
+            )
+            StaffCapability.objects.create(
+                staff=staff,
+                work_type=self.gym_work,
+                location=self.location,
+                level=StaffCapability.Level.INDEPENDENT,
+                valid_from="2026-08-01",
+                approved_by=self.system_admin,
+                approved_at=timezone.now(),
+            )
+        for staff_index, staff in enumerate(large_staff):
+            for day in range(1, 6):
+                assignment = self.create_assignment_record(
+                    large_plan,
+                    staff=staff,
+                    work_date=f"2026-08-{day:02d}",
+                    work_type=self.gym_work,
+                )
+                MonthlyShiftSegment.objects.create(
+                    monthly_shift_assignment=assignment,
+                    work_type=self.front_work,
+                    work_area=self.front_area,
+                    work_type_name_snapshot=self.front_work.name,
+                    work_type_short_name_snapshot=self.front_work.short_name,
+                    work_type_color_key_snapshot=self.front_work.color_key,
+                    work_type_is_break_snapshot=self.front_work.is_break,
+                    work_area_name_snapshot=self.front_area.name,
+                    start_offset_minutes=600,
+                    end_offset_minutes=660,
+                    display_order=staff_index + 20,
+                )
+
+        with CaptureQueriesContext(connection) as small_queries:
+            small = client.post(f"/api/v1/monthly-shift-plans/{small_plan.id}/publication-preview/", {}, format="json")
+        self.assertEqual(small.status_code, 200, small.data)
+        with CaptureQueriesContext(connection) as large_queries:
+            large = client.post(f"/api/v1/monthly-shift-plans/{large_plan.id}/publication-preview/", {}, format="json")
+        self.assertEqual(large.status_code, 200, large.data)
+        self.assertEqual(large.data["summary"]["assignment_count"], 50)
+        self.assertEqual(large.data["summary"]["segment_count"], 100)
+        self.assertLessEqual(self.select_query_count(large_queries) - self.select_query_count(small_queries), 3)
+        self.assertEqual(
+            large.data["validation_fingerprint"],
+            build_publication_preview(large_plan)["validation_fingerprint"],
+        )
+
+        capability = StaffCapability.objects.get(staff=large_staff[0], work_type=self.gym_work)
+        capability.is_active = False
+        capability.save(update_fields=["is_active", "updated_at"])
+        with CaptureQueriesContext(connection) as missing_capability_queries:
+            missing = client.post(
+                f"/api/v1/monthly-shift-plans/{large_plan.id}/publication-preview/",
+                {},
+                format="json",
+            )
+        self.assertEqual(missing.status_code, 200, missing.data)
+        self.assertLessEqual(
+            self.select_query_count(missing_capability_queries) - self.select_query_count(large_queries),
+            1,
+        )
+        missing_items = [
+            item
+            for item in missing.data["items"]
+            if item.get("staff") == str(large_staff[0].id)
+            and any(issue["code"] == "missing_capability" for issue in item["issues"])
+        ]
+        self.assertTrue(missing_items)
+        self.assertNotEqual(missing.data["validation_fingerprint"], large.data["validation_fingerprint"])
+
+        capability.is_active = True
+        capability.level = StaffCapability.Level.ASSISTED
+        capability.save(update_fields=["is_active", "level", "updated_at"])
+        assisted = client.post(f"/api/v1/monthly-shift-plans/{large_plan.id}/publication-preview/", {}, format="json")
+        self.assertEqual(assisted.status_code, 200, assisted.data)
+        self.assertTrue(
+            any(issue["code"] == "assisted_capability" for item in assisted.data["items"] for issue in item["issues"])
+        )
+        capability.level = StaffCapability.Level.TRAINEE
+        capability.save(update_fields=["level", "updated_at"])
+        trainee = client.post(f"/api/v1/monthly-shift-plans/{large_plan.id}/publication-preview/", {}, format="json")
+        self.assertEqual(trainee.status_code, 200, trainee.data)
+        self.assertTrue(
+            any(issue["code"] == "trainee_capability" for item in trainee.data["items"] for issue in item["issues"])
+        )
+
+    def test_publication_detail_publish_and_withdraw_response_select_counts_are_bounded(self):
+        client = self.force_client(self.system_admin)
+        small_plan = self.create_plan(month=7)
+        self.create_assignment_record(small_plan, work_date="2026-07-01")
+        small_confirm = client.post(
+            f"/api/v1/monthly-shift-plans/{small_plan.id}/confirm/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(small_confirm.status_code, 200, small_confirm.data)
+        with CaptureQueriesContext(connection) as small_publish_queries:
+            small_publish = client.post(
+                f"/api/v1/monthly-shift-plans/{small_plan.id}/publish/",
+                {"acknowledge_warnings": True},
+                format="json",
+            )
+        self.assertEqual(small_publish.status_code, 201, small_publish.data)
+        small_publication = MonthlyShiftPublication.objects.get(id=small_publish.data["publication"]["id"])
+
+        large_plan = self.create_plan(month=8)
+        large_staff = [self.create_user(f"publication_staff_{index}", ROLE_STAFF) for index in range(10)]
+        for staff in large_staff:
+            StaffLocation.objects.create(staff=staff, location=self.location, valid_from="2026-08-01")
+        for staff in large_staff:
+            for day in range(1, 6):
+                self.create_assignment_record(large_plan, staff=staff, work_date=f"2026-08-{day:02d}")
+        large_confirm = client.post(
+            f"/api/v1/monthly-shift-plans/{large_plan.id}/confirm/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(large_confirm.status_code, 200, large_confirm.data)
+        with CaptureQueriesContext(connection) as large_publish_queries:
+            large_publish = client.post(
+                f"/api/v1/monthly-shift-plans/{large_plan.id}/publish/",
+                {"acknowledge_warnings": True},
+                format="json",
+            )
+        self.assertEqual(large_publish.status_code, 201, large_publish.data)
+        self.assertLessEqual(
+            self.select_query_count(large_publish_queries) - self.select_query_count(small_publish_queries),
+            4,
+        )
+        large_publication = MonthlyShiftPublication.objects.get(id=large_publish.data["publication"]["id"])
+
+        with CaptureQueriesContext(connection) as small_detail_queries:
+            small_detail = client.get(f"/api/v1/monthly-shift-publications/{small_publication.id}/")
+        self.assertEqual(small_detail.status_code, 200, small_detail.data)
+        with CaptureQueriesContext(connection) as large_detail_queries:
+            large_detail = client.get(f"/api/v1/monthly-shift-publications/{large_publication.id}/")
+        self.assertEqual(large_detail.status_code, 200, large_detail.data)
+        self.assertEqual(len(large_detail.data["assignments"]), 50)
+        self.assertLessEqual(
+            self.select_query_count(large_detail_queries) - self.select_query_count(small_detail_queries),
+            3,
+        )
+
+        with CaptureQueriesContext(connection) as small_withdraw_queries:
+            small_withdraw = client.post(
+                f"/api/v1/monthly-shift-plans/{small_plan.id}/withdraw-publication/",
+                {"reason": "small"},
+                format="json",
+            )
+        self.assertEqual(small_withdraw.status_code, 200, small_withdraw.data)
+        with CaptureQueriesContext(connection) as large_withdraw_queries:
+            large_withdraw = client.post(
+                f"/api/v1/monthly-shift-plans/{large_plan.id}/withdraw-publication/",
+                {"reason": "large"},
+                format="json",
+            )
+        self.assertEqual(large_withdraw.status_code, 200, large_withdraw.data)
+        self.assertLessEqual(
+            self.select_query_count(large_withdraw_queries) - self.select_query_count(small_withdraw_queries),
+            3,
+        )
+
+    def test_my_published_shifts_returns_101_plus_without_pagination_and_bounded_selects(self):
+        client = self.force_client(self.system_admin)
+        other_location = Location.objects.get(code="findfits")
+        WorkTypeAvailability.objects.get_or_create(
+            work_type=self.gym_work,
+            location=other_location,
+            work_area=None,
+        )
+        StaffLocation.objects.create(
+            staff=self.staff,
+            location=other_location,
+            is_primary=False,
+            valid_from="2026-07-01",
+        )
+        other_staff = self.create_user("my_api_other_staff", ROLE_STAFF)
+        StaffLocation.objects.create(staff=other_staff, location=self.location, valid_from="2026-07-01")
+
+        plans = [
+            self.create_plan_for_location(self.location, month=7),
+            self.create_plan_for_location(self.location, month=8),
+            self.create_plan_for_location(other_location, month=7),
+            self.create_plan_for_location(other_location, month=8),
+        ]
+        for plan in plans:
+            month_days = range(1, 32) if plan.month == 7 else range(1, 21)
+            for day in month_days:
+                self.create_assignment_for_location(
+                    plan,
+                    staff=self.staff,
+                    work_date=f"2026-{plan.month:02d}-{day:02d}",
+                    work_area=self.gym_area if plan.location_id == self.location.id else None,
+                )
+        self.create_assignment_record(plans[0], staff=other_staff, work_date="2026-07-01")
+        publications = [self.publish_plan(plan) for plan in plans]
+
+        staff_client = self.force_client(self.staff)
+        with CaptureQueriesContext(connection) as large_queries:
+            large = staff_client.get("/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-08-20")
+        self.assertEqual(large.status_code, 200, large.data)
+        self.assertEqual(len(large.data["shifts"]), 102)
+        self.assertTrue(all(str(item["staff"]) == str(self.staff.id) for item in large.data["shifts"]))
+        self.assertEqual(
+            staff_client.get(
+                "/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-08-20&staff=x"
+            ).status_code,
+            400,
+        )
+
+        with CaptureQueriesContext(connection) as small_queries:
+            small = staff_client.get("/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-07-01")
+        self.assertEqual(small.status_code, 200, small.data)
+        self.assertLessEqual(self.select_query_count(large_queries) - self.select_query_count(small_queries), 3)
+
+        filtered = staff_client.get(
+            f"/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-08-20&location={other_location.id}"
+        )
+        self.assertEqual(filtered.status_code, 200, filtered.data)
+        self.assertEqual(len(filtered.data["shifts"]), 51)
+        self.assertTrue(
+            all(item["publication"]["location"] == str(other_location.id) for item in filtered.data["shifts"])
+        )
+
+        withdrawn = client.post(
+            f"/api/v1/monthly-shift-plans/{plans[0].id}/withdraw-publication/",
+            {"reason": "非表示確認"},
+            format="json",
+        )
+        self.assertEqual(withdrawn.status_code, 200, withdrawn.data)
+        after_withdraw = staff_client.get("/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-08-20")
+        self.assertEqual(after_withdraw.status_code, 200, after_withdraw.data)
+        self.assertEqual(len(after_withdraw.data["shifts"]), 71)
+        self.assertFalse(
+            any(item["publication"]["id"] == str(publications[0].id) for item in after_withdraw.data["shifts"])
+        )
+
+    def test_publication_audit_failure_rolls_back_state_changes(self):
+        client = self.force_client(self.system_admin)
+        client.raise_request_exception = False
+
+        confirm_plan = self.create_plan(month=8)
+        self.create_assignment_record(confirm_plan, work_date="2026-08-01")
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = client.post(
+                f"/api/v1/monthly-shift-plans/{confirm_plan.id}/confirm/",
+                {"acknowledge_warnings": True},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 500)
+        confirm_plan.refresh_from_db()
+        self.assertEqual(confirm_plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.DRAFT)
+        self.assertIsNone(confirm_plan.confirmed_at)
+        self.assertIsNone(confirm_plan.confirmed_by)
+        self.assertEqual(confirm_plan.confirmed_content_hash, "")
+
+        reopen_plan = self.create_plan(month=9)
+        self.create_assignment_record(reopen_plan, work_date="2026-09-01")
+        self.assertEqual(
+            client.post(
+                f"/api/v1/monthly-shift-plans/{reopen_plan.id}/confirm/",
+                {"acknowledge_warnings": True},
+                format="json",
+            ).status_code,
+            200,
+        )
+        reopen_plan.refresh_from_db()
+        previous_hash = reopen_plan.confirmed_content_hash
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = client.post(
+                f"/api/v1/monthly-shift-plans/{reopen_plan.id}/reopen/",
+                {"reason": "audit rollback"},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 500)
+        reopen_plan.refresh_from_db()
+        self.assertEqual(reopen_plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.CONFIRMED)
+        self.assertEqual(reopen_plan.confirmed_content_hash, previous_hash)
+
+        publish_plan = self.create_plan(month=10)
+        self.create_assignment_record(publish_plan, work_date="2026-10-01")
+        self.assertEqual(
+            client.post(
+                f"/api/v1/monthly-shift-plans/{publish_plan.id}/confirm/",
+                {"acknowledge_warnings": True},
+                format="json",
+            ).status_code,
+            200,
+        )
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = client.post(
+                f"/api/v1/monthly-shift-plans/{publish_plan.id}/publish/",
+                {"acknowledge_warnings": True},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 500)
+        publish_plan.refresh_from_db()
+        self.assertEqual(publish_plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.CONFIRMED)
+        self.assertFalse(MonthlyShiftPublication.objects.filter(monthly_shift_plan=publish_plan).exists())
+
+        withdraw_plan = self.create_plan(month=11)
+        self.create_assignment_record(withdraw_plan, work_date="2026-11-01")
+        self.assertEqual(
+            client.post(
+                f"/api/v1/monthly-shift-plans/{withdraw_plan.id}/confirm/",
+                {"acknowledge_warnings": True},
+                format="json",
+            ).status_code,
+            200,
+        )
+        published = client.post(
+            f"/api/v1/monthly-shift-plans/{withdraw_plan.id}/publish/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(published.status_code, 201, published.data)
+        publication = MonthlyShiftPublication.objects.get(id=published.data["publication"]["id"])
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = client.post(
+                f"/api/v1/monthly-shift-plans/{withdraw_plan.id}/withdraw-publication/",
+                {"reason": "audit rollback"},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 500)
+        withdraw_plan.refresh_from_db()
+        publication.refresh_from_db()
+        self.assertEqual(withdraw_plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.PUBLISHED)
+        self.assertTrue(publication.is_active)
+        self.assertIsNone(publication.withdrawn_at)
+        self.assertEqual(publication.withdrawal_reason, "")
+
     def test_matrix_capability_query_count_does_not_grow_per_assignment(self):
         client = self.force_client(self.system_admin)
         self.gym_work.requires_capability = True
@@ -1231,7 +1879,7 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
             staff=self.staff,
             work_type=WorkType.objects.get(code="front_duty"),
             location=self.location,
-            valid_from=timezone.localdate(),
+            valid_from=stable_test_valid_from(),
             valid_until=None,
             defaults={
                 "level": StaffCapability.Level.INDEPENDENT,
@@ -1295,7 +1943,7 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
             staff=self.staff,
             work_type=required_work_type,
             location=self.location,
-            valid_from=timezone.localdate(),
+            valid_from=stable_test_valid_from(),
             valid_until=None,
             defaults={
                 "level": StaffCapability.Level.ASSISTED,

@@ -39,6 +39,7 @@
   - Monthly shift plans
   - Monthly shift assignments
   - Monthly shift segments
+  - Monthly shift publications and staff self-service snapshots
 
 ## Phase 2 Domain Rules
 
@@ -89,6 +90,13 @@
 - The frontend draws 15-minute and hourly grid lines with CSS backgrounds instead of rendering cells for every staff/day/slot.
 - Printing uses the browser print dialog and print CSS; server-side PDF generation is outside the phase.
 - Timeline bars open detail only. Editing remains in the monthly shift screen.
+
+## Shift Publication
+
+- Monthly shift plans move through `draft`, `confirmed`, and `published`.
+- Confirmed and published plans are locked against monthly plan, assignment, segment, and template-generation edits.
+- Publishing creates immutable assignment and segment snapshots under `MonthlyShiftPublication`.
+- Staff self-service uses `/api/v1/my-published-shifts/` and is scoped to the authenticated user.
 
 ## Quality Gates
 

@@ -101,3 +101,13 @@ Phase 6 adds shift confirmation, publication, and staff self-service viewing:
 - Staff self-service screen at `/shifts/my-published`
 - Self-service API at `/api/v1/my-published-shifts/`, scoped to the authenticated user
 - Browser printing with print-specific CSS
+
+Phase 7 adds shift request collection before monthly shift creation:
+
+- Request periods by active location, year, and month
+- Staff self-service request submission at `/my/shift-requests`
+- Manager request period and submission review at `/shifts/request-periods`
+- Draft, submitted, returned, and locked submission states
+- Day-off, unavailable, preferred-work, preferred-time, and note request items
+- Monthly matrix, assignment save, and template preview warnings for submitted or locked requests
+- Self-service APIs scoped to the authenticated user under `/api/v1/my-shift-request-periods/`

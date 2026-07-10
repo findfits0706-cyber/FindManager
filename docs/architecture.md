@@ -40,6 +40,7 @@
   - Monthly shift assignments
   - Monthly shift segments
   - Monthly shift publications and staff self-service snapshots
+  - Shift request periods, submissions, and request items
 
 ## Phase 2 Domain Rules
 
@@ -97,6 +98,15 @@
 - Confirmed and published plans are locked against monthly plan, assignment, segment, and template-generation edits.
 - Publishing creates immutable assignment and segment snapshots under `MonthlyShiftPublication`.
 - Staff self-service uses `/api/v1/my-published-shifts/` and is scoped to the authenticated user.
+
+## Shift Requests
+
+- Shift request periods are unique for active location/year/month combinations.
+- Staff request submissions move through `draft`, `submitted`, `returned`, and `locked`.
+- Staff self-service uses `/api/v1/my-shift-request-periods/` and never accepts another staff identifier.
+- Managers review request periods and submissions through `/api/v1/shift-request-periods/` and `/api/v1/shift-request-submissions/`.
+- Returned submissions can be edited and resubmitted while the period is open; submitted and locked submissions are read-only to staff.
+- Submitted and locked request items are used as warnings during monthly assignment validation, monthly matrix display, and template generation preview. Requests are advisory and do not block shift creation.
 
 ## Quality Gates
 

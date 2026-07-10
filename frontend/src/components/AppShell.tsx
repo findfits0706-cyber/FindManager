@@ -45,12 +45,14 @@ export function AppShell() {
       ? [
           { to: "/shifts/monthly", label: "月間シフト" },
           { to: "/shifts/timeline", label: "日別・週別シフト" },
+          { to: "/shifts/request-periods", label: "希望提出管理" },
           { to: "/shifts/patterns", label: "勤務パターン" },
           { to: "/shifts/templates", label: "週間テンプレート" },
         ]
       : []),
     ...(canViewSelfPages
       ? [
+          { to: "/my/shift-requests", label: "希望提出" },
           { to: "/shifts/my-published", label: "自分のシフト" },
           { to: "/operations/my-staff-locations", label: "自分の所属" },
           { to: "/operations/my-capabilities", label: "自分の対応可能業務" },

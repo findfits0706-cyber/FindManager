@@ -19,6 +19,9 @@ from .models import (
     MonthlyShiftPublicationSegment,
     MonthlyShiftSegment,
     ShiftPattern,
+    ShiftRequestItem,
+    ShiftRequestPeriod,
+    ShiftRequestSubmission,
     WeeklyShiftTemplate,
 )
 from .serializers import (
@@ -35,6 +38,10 @@ from .serializers import (
     ShiftPatternDuplicateSerializer,
     ShiftPatternListSerializer,
     ShiftPatternSerializer,
+    ShiftRequestPeriodSerializer,
+    ShiftRequestReturnSerializer,
+    ShiftRequestSubmissionSaveSerializer,
+    ShiftRequestSubmissionSerializer,
     TemplateGenerationSerializer,
     WeeklyShiftTemplateDuplicateSerializer,
     WeeklyShiftTemplateListSerializer,
@@ -52,6 +59,10 @@ from .services import (
     duplicate_shift_pattern,
     duplicate_weekly_template,
     ensure_monthly_plan_editable,
+    get_or_create_shift_request_submission,
+    get_shift_request_info_lookup,
+    get_shift_request_lookup,
+    lock_shift_request_submission,
     month_dates,
     monthly_assignment_metadata,
     monthly_assignment_warning_count,
@@ -60,11 +71,23 @@ from .services import (
     publish_monthly_shift_plan,
     record_shift_event,
     reopen_monthly_shift_plan,
+    return_shift_request_submission,
+    save_shift_request_period,
+    save_shift_request_submission,
+    set_shift_request_period_active,
+    set_shift_request_period_status,
     shift_pattern_metadata,
+    shift_request_items_for_display,
+    shift_request_period_metadata,
+    shift_request_submission_metadata,
+    submit_shift_request_submission,
+    unlock_shift_request_submission,
+    unsubmit_shift_request_submission,
     validate_and_reactivate_monthly_assignment,
     validate_and_reactivate_monthly_plan,
     validate_and_reactivate_pattern,
     validate_and_reactivate_template,
+    validate_assignment_against_shift_requests,
     weekly_template_metadata,
     withdraw_monthly_shift_publication,
 )
@@ -468,6 +491,8 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
             start_date=start_date,
             end_date=end_date,
         )
+        request_lookup = get_shift_request_lookup(plan.location, plan.year, plan.month, staff_ids)
+        request_info_lookup = get_shift_request_info_lookup(plan.location, plan.year, plan.month, staff_ids)
 
         staff_queryset = User.objects.filter(id__in=staff_ids)
         if staff_search:
@@ -499,8 +524,13 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
             inactive_assignments = {}
             for work_date in dates:
                 assignment = assignments_by_staff_date.get((str(staff.id), work_date.isoformat()))
+                request_items = request_info_lookup.get((str(staff.id), work_date.isoformat()), [])
                 if assignment is not None:
                     active_segments = list(assignment.segments.all())
+                    request_issues = validate_assignment_against_shift_requests(
+                        assignment, active_segments, request_lookup
+                    )
+                    capability_warning_count = monthly_assignment_warning_count(assignment, capability_lookup)
                     assignments[work_date.isoformat()] = {
                         "id": str(assignment.id),
                         "pattern_short_name": assignment.pattern_short_name_snapshot,
@@ -512,15 +542,42 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                         ),
                         "source_type": assignment.source_type,
                         "is_customized": assignment.is_customized,
-                        "warning_count": monthly_assignment_warning_count(assignment, capability_lookup),
+                        "warning_count": capability_warning_count
+                        + sum(1 for issue in request_issues if issue["severity"] == "warning"),
+                        "issues": request_issues,
+                        "shift_requests": shift_request_items_for_display(request_items),
                     }
                     continue
+                prefer_issues = [
+                    {
+                        "severity": "info",
+                        "code": "preferred_work_day",
+                        "message": "勤務希望日です。",
+                    }
+                    for item in request_items
+                    if item.request_type == ShiftRequestItem.RequestType.PREFER_WORK
+                ]
                 inactive = inactive_by_staff_date.get((str(staff.id), work_date.isoformat()))
                 if inactive is not None:
                     inactive_assignments[work_date.isoformat()] = {
                         "id": str(inactive.id),
                         "pattern_short_name": inactive.pattern_short_name_snapshot,
                     }
+                if request_items or prefer_issues:
+                    assignments.setdefault(
+                        work_date.isoformat(),
+                        {
+                            "id": None,
+                            "pattern_short_name": "",
+                            "start_offset_minutes": None,
+                            "end_offset_minutes": None,
+                            "source_type": "",
+                            "is_customized": False,
+                            "warning_count": 0,
+                            "issues": prefer_issues,
+                            "shift_requests": shift_request_items_for_display(request_items),
+                        },
+                    )
             rows.append(
                 {
                     "staff": str(staff.id),
@@ -888,6 +945,384 @@ class MonthlyShiftPublicationViewSet(viewsets.ReadOnlyModelViewSet):
         if params.get("is_active") in {"true", "false"}:
             queryset = queryset.filter(is_active=params["is_active"] == "true")
         return queryset
+
+
+class ShiftRequestPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if getattr(view, "basename", "") in {"my-shift-request-period"}:
+            return True
+        if request.method in permissions.SAFE_METHODS or getattr(view, "action", None) in {"submissions"}:
+            return can_view_shifts(request.user)
+        return can_manage_shifts(request.user)
+
+
+def shift_request_submission_queryset():
+    return (
+        ShiftRequestSubmission.objects.select_related(
+            "request_period",
+            "request_period__location",
+            "staff",
+            "submitted_by",
+            "returned_by",
+        )
+        .annotate(
+            item_count=Count("items", filter=Q(items__is_active=True), distinct=True),
+            day_off_count=Count(
+                "items",
+                filter=Q(items__is_active=True, items__request_type=ShiftRequestItem.RequestType.DAY_OFF),
+                distinct=True,
+            ),
+            unavailable_count=Count(
+                "items",
+                filter=Q(items__is_active=True, items__request_type=ShiftRequestItem.RequestType.UNAVAILABLE),
+                distinct=True,
+            ),
+            prefer_count=Count(
+                "items",
+                filter=Q(
+                    items__is_active=True,
+                    items__request_type__in=[
+                        ShiftRequestItem.RequestType.PREFER_WORK,
+                        ShiftRequestItem.RequestType.PREFER_TIME,
+                    ],
+                ),
+                distinct=True,
+            ),
+            has_note=Count(
+                "items",
+                filter=Q(items__is_active=True, items__request_type=ShiftRequestItem.RequestType.NOTE),
+                distinct=True,
+            ),
+        )
+        .prefetch_related(
+            Prefetch(
+                "items",
+                queryset=ShiftRequestItem.objects.filter(is_active=True).select_related("work_type", "work_area"),
+            )
+        )
+    )
+
+
+class ShiftRequestPeriodViewSet(viewsets.ModelViewSet):
+    permission_classes = [ShiftRequestPermission]
+    serializer_class = ShiftRequestPeriodSerializer
+    http_method_names = ["get", "post", "put", "patch", "head", "options"]
+
+    def get_queryset(self):
+        queryset = (
+            ShiftRequestPeriod.objects.select_related("location")
+            .annotate(
+                submission_count=Count("submissions", distinct=True),
+                draft_count=Count(
+                    "submissions",
+                    filter=Q(submissions__status=ShiftRequestSubmission.Status.DRAFT),
+                    distinct=True,
+                ),
+                submitted_count=Count(
+                    "submissions",
+                    filter=Q(submissions__status=ShiftRequestSubmission.Status.SUBMITTED),
+                    distinct=True,
+                ),
+                returned_count=Count(
+                    "submissions",
+                    filter=Q(submissions__status=ShiftRequestSubmission.Status.RETURNED),
+                    distinct=True,
+                ),
+                locked_count=Count(
+                    "submissions",
+                    filter=Q(submissions__status=ShiftRequestSubmission.Status.LOCKED),
+                    distinct=True,
+                ),
+                item_count=Count("submissions__items", filter=Q(submissions__items__is_active=True), distinct=True),
+            )
+            .order_by("-year", "-month", "location__display_order", "created_at")
+        )
+        params = self.request.query_params
+        if params.get("location"):
+            queryset = queryset.filter(location_id=params["location"])
+        if params.get("year"):
+            queryset = queryset.filter(year=params["year"])
+        if params.get("month"):
+            queryset = queryset.filter(month=params["month"])
+        if params.get("status"):
+            queryset = queryset.filter(status=params["status"])
+        if params.get("is_active") in {"true", "false"}:
+            queryset = queryset.filter(is_active=params["is_active"] == "true")
+        return queryset
+
+    def update(self, request, *args, **kwargs):
+        if "status" in request.data:
+            raise ValidationError({"status": "statusはaction endpointで変更してください。"})
+        if self.get_object().status == ShiftRequestPeriod.Status.ARCHIVED:
+            raise ValidationError({"status": "Archived periods cannot be edited."})
+        return super().update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        if "status" in request.data:
+            raise ValidationError({"status": "statusはaction endpointで変更してください。"})
+        if self.get_object().status == ShiftRequestPeriod.Status.ARCHIVED:
+            raise ValidationError({"status": "Archived periods cannot be edited."})
+        return super().partial_update(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        with transaction.atomic():
+            period = save_shift_request_period(
+                instance=None, validated_data=serializer.validated_data, actor=self.request.user
+            )
+            record_shift_event(
+                entity="shift_request_period",
+                action="create",
+                actor=self.request.user,
+                request=self.request,
+                metadata=shift_request_period_metadata(period),
+            )
+            serializer.instance = period
+
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            period = save_shift_request_period(
+                instance=self.get_object(),
+                validated_data=serializer.validated_data,
+                actor=self.request.user,
+            )
+            record_shift_event(
+                entity="shift_request_period",
+                action="update",
+                actor=self.request.user,
+                request=self.request,
+                metadata=shift_request_period_metadata(period),
+            )
+            serializer.instance = period
+
+    def _status_action(self, request, status_value: str, action_name: str, pk=None):
+        self._require_manage()
+        with transaction.atomic():
+            period = set_shift_request_period_status(self.get_object(), status_value, actor=request.user)
+            record_shift_event(
+                entity="shift_request_period",
+                action=action_name,
+                actor=request.user,
+                request=request,
+                metadata=shift_request_period_metadata(period),
+            )
+        return Response(self.get_serializer(period).data)
+
+    def _require_manage(self):
+        if not can_manage_shifts(self.request.user):
+            raise PermissionDenied("権限がありません。")
+
+    @action(detail=True, methods=["post"])
+    def open(self, request, pk=None):
+        return self._status_action(request, ShiftRequestPeriod.Status.OPEN, "open", pk)
+
+    @action(detail=True, methods=["post"])
+    def close(self, request, pk=None):
+        return self._status_action(request, ShiftRequestPeriod.Status.CLOSED, "close", pk)
+
+    @action(detail=True, methods=["post"])
+    def reopen(self, request, pk=None):
+        return self._status_action(request, ShiftRequestPeriod.Status.OPEN, "reopen", pk)
+
+    @action(detail=True, methods=["post"])
+    def archive(self, request, pk=None):
+        return self._status_action(request, ShiftRequestPeriod.Status.ARCHIVED, "archive", pk)
+
+    @action(detail=True, methods=["post"])
+    def deactivate(self, request, pk=None):
+        self._require_manage()
+        with transaction.atomic():
+            period = set_shift_request_period_active(self.get_object(), is_active=False, actor=request.user)
+            record_shift_event(
+                entity="shift_request_period",
+                action="update",
+                actor=request.user,
+                request=request,
+                metadata=shift_request_period_metadata(period),
+            )
+        return Response(self.get_serializer(period).data)
+
+    @action(detail=True, methods=["post"])
+    def reactivate(self, request, pk=None):
+        self._require_manage()
+        with transaction.atomic():
+            period = set_shift_request_period_active(self.get_object(), is_active=True, actor=request.user)
+            record_shift_event(
+                entity="shift_request_period",
+                action="update",
+                actor=request.user,
+                request=request,
+                metadata=shift_request_period_metadata(period),
+            )
+        return Response(self.get_serializer(period).data)
+
+    @action(detail=True, methods=["get"])
+    def submissions(self, request, pk=None):
+        period = self.get_object()
+        serializer = ShiftRequestSubmissionSerializer(
+            shift_request_submission_queryset().filter(request_period=period),
+            many=True,
+        )
+        return Response(serializer.data)
+
+
+class ShiftRequestSubmissionViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [ShiftRequestPermission]
+    serializer_class = ShiftRequestSubmissionSerializer
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_queryset(self):
+        queryset = shift_request_submission_queryset().order_by(
+            "-request_period__year",
+            "-request_period__month",
+            "staff__employee_code",
+        )
+        params = self.request.query_params
+        if params.get("request_period"):
+            queryset = queryset.filter(request_period_id=params["request_period"])
+        if params.get("location"):
+            queryset = queryset.filter(request_period__location_id=params["location"])
+        if params.get("year"):
+            queryset = queryset.filter(request_period__year=params["year"])
+        if params.get("month"):
+            queryset = queryset.filter(request_period__month=params["month"])
+        if params.get("staff"):
+            queryset = queryset.filter(staff_id=params["staff"])
+        if params.get("status"):
+            queryset = queryset.filter(status=params["status"])
+        if params.get("submitted") in {"true", "false"}:
+            queryset = queryset.filter(
+                status=ShiftRequestSubmission.Status.SUBMITTED
+                if params["submitted"] == "true"
+                else ShiftRequestSubmission.Status.DRAFT
+            )
+        return queryset
+
+    def _require_manage(self):
+        if not can_manage_shifts(self.request.user):
+            raise PermissionDenied("権限がありません。")
+
+    def _submission_action(self, request, action_name: str, pk=None):
+        self._require_manage()
+        serializer = ShiftRequestReturnSerializer(data=request.data) if action_name == "return" else None
+        reason = ""
+        if serializer is not None:
+            serializer.is_valid(raise_exception=True)
+            reason = serializer.validated_data["reason"]
+        with transaction.atomic():
+            submission = self.get_object()
+            if action_name == "return":
+                submission = return_shift_request_submission(submission=submission, actor=request.user, reason=reason)
+            elif action_name == "lock":
+                submission = lock_shift_request_submission(submission=submission, actor=request.user)
+            else:
+                submission = unlock_shift_request_submission(submission=submission, actor=request.user)
+            record_shift_event(
+                entity="shift_request_submission",
+                action=action_name,
+                actor=request.user,
+                request=request,
+                metadata=shift_request_submission_metadata(submission),
+            )
+        return Response(self.get_serializer(submission).data)
+
+    @action(detail=True, methods=["post"], url_path="return")
+    def return_submission(self, request, pk=None):
+        return self._submission_action(request, "return", pk)
+
+    @action(detail=True, methods=["post"])
+    def lock(self, request, pk=None):
+        return self._submission_action(request, "lock", pk)
+
+    @action(detail=True, methods=["post"])
+    def unlock(self, request, pk=None):
+        return self._submission_action(request, "unlock", pk)
+
+
+class MyShiftRequestPeriodViewSet(viewsets.GenericViewSet):
+    permission_classes = [ShiftRequestPermission]
+    serializer_class = ShiftRequestPeriodSerializer
+    http_method_names = ["get", "put", "patch", "post", "head", "options"]
+
+    def get_queryset(self):
+        params = self.request.query_params
+        if "staff" in params:
+            raise ValidationError({"staff": "staffクエリパラメータは指定できません。"})
+        staff_locations = StaffLocation.objects.filter(staff=self.request.user, is_active=True).values_list(
+            "location_id", flat=True
+        )
+        queryset = ShiftRequestPeriod.objects.select_related("location").filter(
+            location_id__in=staff_locations, is_active=True
+        )
+        if params.get("year"):
+            queryset = queryset.filter(year=params["year"])
+        if params.get("month"):
+            queryset = queryset.filter(month=params["month"])
+        if params.get("location"):
+            queryset = queryset.filter(location_id=params["location"])
+        if params.get("status"):
+            queryset = queryset.filter(status=params["status"])
+        return queryset.order_by("-year", "-month", "location__display_order")
+
+    def list(self, request, *args, **kwargs):
+        serializer = self.get_serializer(self.get_queryset(), many=True)
+        return Response(serializer.data)
+
+    def retrieve(self, request, *args, **kwargs):
+        return Response(self.get_serializer(self.get_object()).data)
+
+    def _submission(self):
+        return get_or_create_shift_request_submission(period=self.get_object(), staff=self.request.user)
+
+    @action(detail=True, methods=["get", "put", "patch"])
+    def submission(self, request, pk=None):
+        submission = self._submission()
+        if request.method == "GET":
+            return Response(ShiftRequestSubmissionSerializer(submission).data)
+        serializer = ShiftRequestSubmissionSaveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            submission = save_shift_request_submission(
+                submission=submission,
+                notes=serializer.validated_data.get("notes", ""),
+                items_data=serializer.validated_data.get("items", []),
+                actor=request.user,
+            )
+            record_shift_event(
+                entity="shift_request_submission",
+                action="save",
+                actor=request.user,
+                request=request,
+                metadata=shift_request_submission_metadata(submission),
+            )
+        return Response(ShiftRequestSubmissionSerializer(submission).data)
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        with transaction.atomic():
+            submission = submit_shift_request_submission(submission=self._submission(), actor=request.user)
+            record_shift_event(
+                entity="shift_request_submission",
+                action="submit",
+                actor=request.user,
+                request=request,
+                metadata=shift_request_submission_metadata(submission),
+            )
+        return Response(ShiftRequestSubmissionSerializer(submission).data)
+
+    @action(detail=True, methods=["post"])
+    def unsubmit(self, request, pk=None):
+        with transaction.atomic():
+            submission = unsubmit_shift_request_submission(submission=self._submission(), actor=request.user)
+            record_shift_event(
+                entity="shift_request_submission",
+                action="unsubmit",
+                actor=request.user,
+                request=request,
+                metadata=shift_request_submission_metadata(submission),
+            )
+        return Response(ShiftRequestSubmissionSerializer(submission).data)
 
 
 class MyPublishedShiftsPermission(permissions.BasePermission):

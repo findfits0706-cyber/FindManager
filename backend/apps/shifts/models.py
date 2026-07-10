@@ -591,3 +591,187 @@ class MonthlyShiftPublicationSegment(models.Model):
 
     class Meta:
         ordering = ["start_offset_minutes", "display_order", "created_at"]
+
+
+class ShiftRequestPeriod(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "draft"
+        OPEN = "open", "open"
+        CLOSED = "closed", "closed"
+        ARCHIVED = "archived", "archived"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="shift_request_periods")
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField()
+    name = models.CharField(max_length=150)
+    description = models.TextField(blank=True)
+    opens_at = models.DateTimeField()
+    closes_at = models.DateTimeField()
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="shift_request_periods_created",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="shift_request_periods_updated",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["-year", "-month", "location__display_order", "created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["location", "year", "month"],
+                condition=Q(is_active=True),
+                name="unique_active_shift_request_period_month",
+            ),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.location_id and not self.location.is_active:
+            errors["location"] = "Inactive locations cannot be assigned."
+        if self.year < 2000 or self.year > 2100:
+            errors["year"] = "year must be between 2000 and 2100."
+        if self.month < 1 or self.month > 12:
+            errors["month"] = "month must be between 1 and 12."
+        if self.opens_at and self.closes_at and self.opens_at > self.closes_at:
+            errors["closes_at"] = "closes_at must be on or after opens_at."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.location.short_name} / {self.year}-{self.month:02d} requests"
+
+
+class ShiftRequestSubmission(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "draft"
+        SUBMITTED = "submitted", "submitted"
+        RETURNED = "returned", "returned"
+        LOCKED = "locked", "locked"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    request_period = models.ForeignKey(ShiftRequestPeriod, on_delete=models.PROTECT, related_name="submissions")
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="shift_request_submissions"
+    )
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    submitted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="shift_request_submissions_submitted",
+    )
+    returned_at = models.DateTimeField(null=True, blank=True)
+    returned_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="shift_request_submissions_returned",
+    )
+    return_reason = models.TextField(blank=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["request_period", "staff__display_name", "created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["request_period", "staff"],
+                name="unique_shift_request_submission_staff",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.request_period} / {self.staff}"
+
+
+class ShiftRequestItem(models.Model):
+    class RequestType(models.TextChoices):
+        DAY_OFF = "day_off", "day_off"
+        UNAVAILABLE = "unavailable", "unavailable"
+        PREFER_WORK = "prefer_work", "prefer_work"
+        PREFER_TIME = "prefer_time", "prefer_time"
+        NOTE = "note", "note"
+
+    class Priority(models.TextChoices):
+        HIGH = "high", "high"
+        NORMAL = "normal", "normal"
+        LOW = "low", "low"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    submission = models.ForeignKey(ShiftRequestSubmission, on_delete=models.PROTECT, related_name="items")
+    request_type = models.CharField(max_length=20, choices=RequestType.choices)
+    work_date = models.DateField(null=True, blank=True)
+    start_offset_minutes = models.IntegerField(null=True, blank=True)
+    end_offset_minutes = models.IntegerField(null=True, blank=True)
+    work_type = models.ForeignKey(
+        WorkType,
+        on_delete=models.PROTECT,
+        related_name="shift_request_items",
+        null=True,
+        blank=True,
+    )
+    work_area = models.ForeignKey(
+        WorkArea,
+        on_delete=models.PROTECT,
+        related_name="shift_request_items",
+        null=True,
+        blank=True,
+    )
+    priority = models.CharField(max_length=20, choices=Priority.choices, default=Priority.NORMAL)
+    reason = models.TextField(blank=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["work_date", "start_offset_minutes", "request_type", "created_at"]
+
+    def clean(self):
+        errors = {}
+        period = self.submission.request_period if self.submission_id else None
+        if self.request_type != self.RequestType.NOTE and not self.work_date:
+            errors["work_date"] = "work_date is required."
+        if self.work_date and period and (self.work_date.year != period.year or self.work_date.month != period.month):
+            errors["work_date"] = "work_date must be within the shift request period."
+        needs_time = self.request_type in {self.RequestType.UNAVAILABLE, self.RequestType.PREFER_TIME}
+        if needs_time and (self.start_offset_minutes is None or self.end_offset_minutes is None):
+            errors["start_offset_minutes"] = "start_offset_minutes and end_offset_minutes are required."
+        if self.start_offset_minutes is not None:
+            if (
+                self.start_offset_minutes < 0
+                or self.start_offset_minutes >= 2880
+                or self.start_offset_minutes % 15 != 0
+            ):
+                errors["start_offset_minutes"] = "start_offset_minutes must be 0-2879 in 15-minute increments."
+        if self.end_offset_minutes is not None:
+            if self.end_offset_minutes <= 0 or self.end_offset_minutes > 2880 or self.end_offset_minutes % 15 != 0:
+                errors["end_offset_minutes"] = "end_offset_minutes must be 1-2880 in 15-minute increments."
+        if (
+            self.start_offset_minutes is not None
+            and self.end_offset_minutes is not None
+            and self.start_offset_minutes >= self.end_offset_minutes
+        ):
+            errors["end_offset_minutes"] = "end_offset_minutes must be after start_offset_minutes."
+        if self.work_type_id and not self.work_type.is_active:
+            errors["work_type"] = "Inactive work types cannot be assigned."
+        if self.work_area_id:
+            if not self.work_area.is_active:
+                errors["work_area"] = "Inactive work areas cannot be assigned."
+            elif period and self.work_area.location_id != period.location_id:
+                errors["work_area"] = "work_area must belong to the request period location."
+        if errors:
+            raise ValidationError(errors)

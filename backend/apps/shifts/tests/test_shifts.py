@@ -24,6 +24,7 @@ from ..models import (
     MonthlyShiftSegment,
     ShiftPattern,
     ShiftPatternSegment,
+    ShiftRequestPeriod,
     WeeklyShiftTemplate,
     WeeklyShiftTemplateEntry,
 )
@@ -552,6 +553,20 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
             updated_by=self.system_admin,
         )
 
+    def create_request_period(self, *, month=7, status=ShiftRequestPeriod.Status.OPEN):
+        now = timezone.now()
+        return ShiftRequestPeriod.objects.create(
+            location=self.location,
+            year=2026,
+            month=month,
+            name=f"2026年{month}月 希望提出",
+            opens_at=now - timezone.timedelta(days=1),
+            closes_at=now + timezone.timedelta(days=7),
+            status=status,
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+
     def assignment_payload(self, plan, staff=None, work_date="2026-07-01", pattern_code="gym_early"):
         return {
             "monthly_shift_plan": str(plan.id),
@@ -602,6 +617,143 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
             display_order=display_order,
         )
         return assignment
+
+    def test_shift_request_period_workflow_permissions_and_audit(self):
+        client = self.force_client(self.system_admin)
+        now = timezone.now()
+        payload = {
+            "location": str(self.location.id),
+            "year": 2026,
+            "month": 7,
+            "name": "2026年7月 希望提出",
+            "description": "",
+            "opens_at": (now - timezone.timedelta(days=1)).isoformat(),
+            "closes_at": (now + timezone.timedelta(days=7)).isoformat(),
+        }
+        created = client.post("/api/v1/shift-request-periods/", payload, format="json")
+        self.assertEqual(created.status_code, 201, created.data)
+        period_id = created.data["id"]
+        self.assertEqual(created.data["status"], "draft")
+        self.assertEqual(
+            client.patch(f"/api/v1/shift-request-periods/{period_id}/", {"status": "open"}, format="json").status_code,
+            400,
+        )
+        self.assertEqual(
+            client.post(f"/api/v1/shift-request-periods/{period_id}/open/", {}, format="json").status_code,
+            200,
+        )
+        self.assertEqual(
+            client.post(f"/api/v1/shift-request-periods/{period_id}/close/", {}, format="json").status_code,
+            200,
+        )
+        self.assertEqual(
+            client.post(f"/api/v1/shift-request-periods/{period_id}/reopen/", {}, format="json").status_code,
+            200,
+        )
+        self.assertEqual(
+            client.post(f"/api/v1/shift-request-periods/{period_id}/close/", {}, format="json").status_code,
+            200,
+        )
+        archived = client.post(f"/api/v1/shift-request-periods/{period_id}/archive/", {}, format="json")
+        self.assertEqual(archived.status_code, 200, archived.data)
+        deactivated = client.post(f"/api/v1/shift-request-periods/{period_id}/deactivate/", {}, format="json")
+        self.assertEqual(deactivated.status_code, 200, deactivated.data)
+        self.assertIs(deactivated.data["is_active"], False)
+        self.assertEqual(
+            client.patch(
+                f"/api/v1/shift-request-periods/{period_id}/",
+                {"description": "x"},
+                format="json",
+            ).status_code,
+            400,
+        )
+        supervisor = self.force_client(self.supervisor)
+        self.assertEqual(supervisor.get("/api/v1/shift-request-periods/").status_code, 200)
+        self.assertEqual(
+            supervisor.post(f"/api/v1/shift-request-periods/{period_id}/open/", {}, format="json").status_code,
+            403,
+        )
+        self.assertEqual(self.force_client(self.staff).get("/api/v1/shift-request-periods/").status_code, 403)
+        self.assertTrue(AuditEvent.objects.filter(event_type="shift_request_period_opened").exists())
+
+    def test_my_shift_request_submission_save_submit_return_lock_and_matrix_warning(self):
+        period = self.create_request_period()
+        staff_client = self.force_client(self.staff)
+        periods = staff_client.get("/api/v1/my-shift-request-periods/?year=2026&month=7")
+        self.assertEqual(periods.status_code, 200, periods.data)
+        self.assertEqual(periods.data[0]["id"], str(period.id))
+        submission = staff_client.get(f"/api/v1/my-shift-request-periods/{period.id}/submission/")
+        self.assertEqual(submission.status_code, 200, submission.data)
+        submission_id = submission.data["id"]
+        saved = staff_client.put(
+            f"/api/v1/my-shift-request-periods/{period.id}/submission/",
+            {
+                "notes": "土曜少なめ",
+                "items": [
+                    {
+                        "request_type": "day_off",
+                        "work_date": "2026-07-01",
+                        "priority": "high",
+                        "reason": "私用",
+                        "notes": "",
+                    },
+                    {
+                        "request_type": "unavailable",
+                        "work_date": "2026-07-02",
+                        "start_offset_minutes": 1380,
+                        "end_offset_minutes": 1500,
+                        "priority": "normal",
+                        "reason": "夜不可",
+                        "notes": "",
+                    },
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(saved.status_code, 200, saved.data)
+        self.assertEqual(len(saved.data["items"]), 2)
+        submitted = staff_client.post(f"/api/v1/my-shift-request-periods/{period.id}/submit/", {}, format="json")
+        self.assertEqual(submitted.status_code, 200, submitted.data)
+        self.assertEqual(submitted.data["status"], "submitted")
+
+        plan = self.create_plan()
+        self.create_assignment_record(plan, work_date="2026-07-01")
+        matrix = self.force_client(self.system_admin).get(f"/api/v1/monthly-shift-plans/{plan.id}/matrix/")
+        self.assertEqual(matrix.status_code, 200, matrix.data)
+        row = next(item for item in matrix.data["rows"] if item["staff"] == str(self.staff.id))
+        assignment = row["assignments"]["2026-07-01"]
+        self.assertGreaterEqual(assignment["warning_count"], 1)
+        self.assertEqual(assignment["issues"][0]["code"], "requested_day_off")
+
+        admin = self.force_client(self.system_admin)
+        self.assertEqual(
+            admin.post(f"/api/v1/shift-request-submissions/{submission_id}/return/", {}, format="json").status_code,
+            400,
+        )
+        returned = admin.post(
+            f"/api/v1/shift-request-submissions/{submission_id}/return/",
+            {"reason": "確認してください"},
+            format="json",
+        )
+        self.assertEqual(returned.status_code, 200, returned.data)
+        self.assertEqual(returned.data["status"], "returned")
+        locked = admin.post(f"/api/v1/shift-request-submissions/{submission_id}/lock/", {}, format="json")
+        self.assertEqual(locked.status_code, 200, locked.data)
+        self.assertEqual(
+            staff_client.put(
+                f"/api/v1/my-shift-request-periods/{period.id}/submission/",
+                {"notes": "", "items": []},
+                format="json",
+            ).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.force_client(self.supervisor)
+            .post(f"/api/v1/shift-request-submissions/{submission_id}/lock/", {}, format="json")
+            .status_code,
+            403,
+        )
+        self.assertTrue(AuditEvent.objects.filter(event_type="shift_request_submission_submitted").exists())
 
     def create_plan_for_location(self, location, *, year=2026, month=7):
         return MonthlyShiftPlan.objects.create(

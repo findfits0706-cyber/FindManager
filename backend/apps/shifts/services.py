@@ -24,6 +24,9 @@ from .models import (
     MonthlyShiftSegment,
     ShiftPattern,
     ShiftPatternSegment,
+    ShiftRequestItem,
+    ShiftRequestPeriod,
+    ShiftRequestSubmission,
     WeeklyShiftTemplate,
     WeeklyShiftTemplateEntry,
 )
@@ -95,6 +98,22 @@ EVENT_MAP = {
     },
     "monthly_shift_template": {
         "apply": "monthly_shift_template_applied",
+    },
+    "shift_request_period": {
+        "create": "shift_request_period_created",
+        "update": "shift_request_period_updated",
+        "open": "shift_request_period_opened",
+        "close": "shift_request_period_closed",
+        "reopen": "shift_request_period_reopened",
+        "archive": "shift_request_period_archived",
+    },
+    "shift_request_submission": {
+        "save": "shift_request_submission_saved",
+        "submit": "shift_request_submission_submitted",
+        "unsubmit": "shift_request_submission_unsubmitted",
+        "return": "shift_request_submission_returned",
+        "lock": "shift_request_submission_locked",
+        "unlock": "shift_request_submission_unlocked",
     },
 }
 
@@ -769,6 +788,350 @@ def monthly_assignment_warning_count(
     return warning_count
 
 
+def shift_request_period_metadata(period: ShiftRequestPeriod) -> dict:
+    return {
+        "period_id": str(period.id),
+        "location_id": str(period.location_id),
+        "year": period.year,
+        "month": period.month,
+        "status": period.status,
+    }
+
+
+def shift_request_submission_metadata(submission: ShiftRequestSubmission) -> dict:
+    return {
+        "period_id": str(submission.request_period_id),
+        "submission_id": str(submission.id),
+        "staff_id": str(submission.staff_id),
+        "status": submission.status,
+        "item_count": submission.items.filter(is_active=True).count(),
+    }
+
+
+def get_shift_request_lookup(
+    location: Location, year: int, month: int, staff_ids
+) -> dict[tuple[str, str], list[ShiftRequestItem]]:
+    staff_ids = {str(staff_id) for staff_id in staff_ids}
+    if not staff_ids:
+        return {}
+    queryset = (
+        ShiftRequestItem.objects.filter(
+            is_active=True,
+            submission__staff_id__in=staff_ids,
+            submission__status__in=[
+                ShiftRequestSubmission.Status.SUBMITTED,
+                ShiftRequestSubmission.Status.LOCKED,
+            ],
+            submission__request_period__location=location,
+            submission__request_period__year=year,
+            submission__request_period__month=month,
+            submission__request_period__status__in=[
+                ShiftRequestPeriod.Status.OPEN,
+                ShiftRequestPeriod.Status.CLOSED,
+                ShiftRequestPeriod.Status.ARCHIVED,
+            ],
+            submission__request_period__is_active=True,
+        )
+        .select_related("submission", "work_type", "work_area")
+        .order_by("submission__staff_id", "work_date", "request_type", "start_offset_minutes", "id")
+    )
+    result: dict[tuple[str, str], list[ShiftRequestItem]] = {}
+    for item in queryset:
+        if item.work_date is None:
+            continue
+        key = (str(item.submission.staff_id), item.work_date.isoformat())
+        result.setdefault(key, []).append(item)
+    return result
+
+
+def get_shift_request_info_lookup(
+    location: Location,
+    year: int,
+    month: int,
+    staff_ids,
+) -> dict[tuple[str, str], list[ShiftRequestItem]]:
+    staff_ids = {str(staff_id) for staff_id in staff_ids}
+    if not staff_ids:
+        return {}
+    queryset = (
+        ShiftRequestItem.objects.filter(
+            is_active=True,
+            submission__staff_id__in=staff_ids,
+            submission__status__in=[
+                ShiftRequestSubmission.Status.DRAFT,
+                ShiftRequestSubmission.Status.SUBMITTED,
+                ShiftRequestSubmission.Status.LOCKED,
+            ],
+            submission__request_period__location=location,
+            submission__request_period__year=year,
+            submission__request_period__month=month,
+            submission__request_period__is_active=True,
+        )
+        .select_related("submission", "work_type", "work_area")
+        .order_by("submission__staff_id", "work_date", "request_type", "start_offset_minutes", "id")
+    )
+    result: dict[tuple[str, str], list[ShiftRequestItem]] = {}
+    for item in queryset:
+        if item.work_date is None:
+            continue
+        result.setdefault((str(item.submission.staff_id), item.work_date.isoformat()), []).append(item)
+    return result
+
+
+def _ranges_overlap(start_a: int, end_a: int, start_b: int, end_b: int) -> bool:
+    return start_a < end_b and start_b < end_a
+
+
+def validate_assignment_against_shift_requests(
+    assignment: MonthlyShiftAssignment,
+    segments: list[MonthlyShiftSegment],
+    request_lookup: dict[tuple[str, str], list[ShiftRequestItem]],
+) -> list[dict]:
+    issues = []
+    items = request_lookup.get((str(assignment.staff_id), assignment.work_date.isoformat()), [])
+    active_segments = [segment for segment in segments if segment.is_active]
+    if active_segments:
+        assignment_start = min(segment.start_offset_minutes for segment in active_segments)
+        assignment_end = max(segment.end_offset_minutes for segment in active_segments)
+    else:
+        assignment_start = None
+        assignment_end = None
+    for item in items:
+        if item.request_type == ShiftRequestItem.RequestType.DAY_OFF:
+            issues.append(
+                {
+                    "severity": "warning",
+                    "code": "requested_day_off",
+                    "message": "希望休の日に勤務が割り当てられています。",
+                }
+            )
+        elif item.request_type == ShiftRequestItem.RequestType.UNAVAILABLE:
+            if item.start_offset_minutes is None or item.end_offset_minutes is None:
+                continue
+            overlaps_assignment = (
+                assignment_start is not None
+                and assignment_end is not None
+                and _ranges_overlap(
+                    assignment_start, assignment_end, item.start_offset_minutes, item.end_offset_minutes
+                )
+            )
+            overlaps_segment = any(
+                _ranges_overlap(
+                    segment.start_offset_minutes,
+                    segment.end_offset_minutes,
+                    item.start_offset_minutes,
+                    item.end_offset_minutes,
+                )
+                for segment in active_segments
+            )
+            if overlaps_assignment or overlaps_segment:
+                issues.append(
+                    {
+                        "severity": "warning",
+                        "code": "requested_unavailable_time",
+                        "message": "勤務不可時間帯と重なっています。",
+                    }
+                )
+        elif item.request_type == ShiftRequestItem.RequestType.PREFER_TIME:
+            issues.append(
+                {
+                    "severity": "info",
+                    "code": "preferred_work_time",
+                    "message": "勤務希望時間があります。",
+                }
+            )
+    return issues
+
+
+def shift_request_items_for_display(items: list[ShiftRequestItem]) -> list[dict]:
+    return [
+        {
+            "id": str(item.id),
+            "request_type": item.request_type,
+            "work_date": item.work_date.isoformat() if item.work_date else None,
+            "start_offset_minutes": item.start_offset_minutes,
+            "end_offset_minutes": item.end_offset_minutes,
+            "work_type": str(item.work_type_id) if item.work_type_id else None,
+            "work_type_name": item.work_type.name if item.work_type_id else "",
+            "work_area": str(item.work_area_id) if item.work_area_id else None,
+            "work_area_name": item.work_area.name if item.work_area_id else "",
+            "priority": item.priority,
+            "reason": item.reason,
+            "notes": item.notes,
+        }
+        for item in items
+    ]
+
+
+def is_shift_request_period_open(period: ShiftRequestPeriod, *, now=None) -> bool:
+    now = now or timezone.now()
+    return (
+        period.is_active
+        and period.status == ShiftRequestPeriod.Status.OPEN
+        and period.opens_at <= now <= period.closes_at
+    )
+
+
+def can_edit_shift_request_submission(submission: ShiftRequestSubmission, *, now=None) -> bool:
+    return is_shift_request_period_open(submission.request_period, now=now) and submission.status in {
+        ShiftRequestSubmission.Status.DRAFT,
+        ShiftRequestSubmission.Status.RETURNED,
+    }
+
+
+def can_submit_shift_request_submission(submission: ShiftRequestSubmission, *, now=None) -> bool:
+    return can_edit_shift_request_submission(submission, now=now)
+
+
+def ensure_staff_belongs_to_period(staff: User, period: ShiftRequestPeriod):
+    if not (
+        StaffLocation.objects.filter(
+            staff=staff,
+            location=period.location,
+            is_active=True,
+            valid_from__lte=date(period.year, period.month, calendar.monthrange(period.year, period.month)[1]),
+        )
+        .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=date(period.year, period.month, 1)))
+        .exists()
+    ):
+        raise DRFValidationError({"request_period": "対象拠点の提出期間ではありません。"})
+
+
+def get_or_create_shift_request_submission(*, period: ShiftRequestPeriod, staff: User) -> ShiftRequestSubmission:
+    ensure_staff_belongs_to_period(staff, period)
+    submission, _created = ShiftRequestSubmission.objects.get_or_create(
+        request_period=period,
+        staff=staff,
+        defaults={"status": ShiftRequestSubmission.Status.DRAFT},
+    )
+    return submission
+
+
+def save_shift_request_period(*, instance: ShiftRequestPeriod | None, validated_data: dict, actor: User):
+    try:
+        period = instance or ShiftRequestPeriod(created_by=actor)
+        if instance is not None and period.status == ShiftRequestPeriod.Status.ARCHIVED:
+            raise DRFValidationError({"status": "Archived periods cannot be edited."})
+        for field, value in validated_data.items():
+            if field == "status":
+                raise DRFValidationError({"status": "statusはaction endpointで変更してください。"})
+            setattr(period, field, value)
+        period.updated_by = actor
+        if not period.name:
+            period.name = f"{period.year}年{period.month}月 希望提出"
+        period.full_clean()
+        period.save()
+    except (DjangoValidationError, IntegrityError) as exc:
+        raise _drf_validation(exc, integrity_message="同じ拠点・年月の有効な希望提出期間が既に存在します。") from exc
+    return period
+
+
+def set_shift_request_period_active(period: ShiftRequestPeriod, *, is_active: bool, actor: User) -> ShiftRequestPeriod:
+    try:
+        period.is_active = is_active
+        period.updated_by = actor
+        period.full_clean()
+        period.save(update_fields=["is_active", "updated_by", "updated_at"])
+    except (DjangoValidationError, IntegrityError) as exc:
+        raise _drf_validation(exc, integrity_message="同じ拠点・年月の有効な希望提出期間が既に存在します。") from exc
+    return period
+
+
+def set_shift_request_period_status(
+    period: ShiftRequestPeriod, status_value: str, *, actor: User
+) -> ShiftRequestPeriod:
+    transitions = {
+        ShiftRequestPeriod.Status.OPEN: {ShiftRequestPeriod.Status.DRAFT, ShiftRequestPeriod.Status.CLOSED},
+        ShiftRequestPeriod.Status.CLOSED: {ShiftRequestPeriod.Status.OPEN},
+        ShiftRequestPeriod.Status.ARCHIVED: {ShiftRequestPeriod.Status.CLOSED},
+    }
+    if status_value not in transitions or period.status not in transitions[status_value]:
+        raise DRFValidationError({"status": "Invalid status transition."})
+    period.status = status_value
+    period.updated_by = actor
+    period.save(update_fields=["status", "updated_by", "updated_at"])
+    return period
+
+
+def save_shift_request_submission(
+    *,
+    submission: ShiftRequestSubmission,
+    notes: str,
+    items_data: list[dict],
+    actor: User,
+) -> ShiftRequestSubmission:
+    with transaction.atomic():
+        submission = (
+            ShiftRequestSubmission.objects.select_for_update()
+            .select_related("request_period", "request_period__location", "staff")
+            .get(pk=submission.pk)
+        )
+        if not can_edit_shift_request_submission(submission):
+            raise DRFValidationError({"submission": "希望提出は編集できません。"})
+        submission.items.filter(is_active=True).update(is_active=False)
+        submission.notes = notes
+        submission.save(update_fields=["notes", "updated_at"])
+        for payload in items_data:
+            item = ShiftRequestItem(submission=submission, **payload)
+            item.full_clean()
+            item.save()
+    return submission
+
+
+def submit_shift_request_submission(*, submission: ShiftRequestSubmission, actor: User):
+    with transaction.atomic():
+        submission = (
+            ShiftRequestSubmission.objects.select_for_update().select_related("request_period").get(pk=submission.pk)
+        )
+        if not can_submit_shift_request_submission(submission):
+            raise DRFValidationError({"submission": "希望提出は提出できません。"})
+        now = timezone.now()
+        submission.status = ShiftRequestSubmission.Status.SUBMITTED
+        submission.submitted_at = now
+        submission.submitted_by = actor
+        submission.return_reason = ""
+        submission.save(update_fields=["status", "submitted_at", "submitted_by", "return_reason", "updated_at"])
+    return submission
+
+
+def unsubmit_shift_request_submission(*, submission: ShiftRequestSubmission, actor: User):
+    with transaction.atomic():
+        submission = (
+            ShiftRequestSubmission.objects.select_for_update().select_related("request_period").get(pk=submission.pk)
+        )
+        if (
+            not is_shift_request_period_open(submission.request_period)
+            or submission.status != ShiftRequestSubmission.Status.SUBMITTED
+        ):
+            raise DRFValidationError({"submission": "提出取消できません。"})
+        submission.status = ShiftRequestSubmission.Status.DRAFT
+        submission.save(update_fields=["status", "updated_at"])
+    return submission
+
+
+def return_shift_request_submission(*, submission: ShiftRequestSubmission, actor: User, reason: str):
+    if not reason.strip():
+        raise DRFValidationError({"reason": "差戻し理由を入力してください。"})
+    submission.status = ShiftRequestSubmission.Status.RETURNED
+    submission.returned_at = timezone.now()
+    submission.returned_by = actor
+    submission.return_reason = reason.strip()
+    submission.save(update_fields=["status", "returned_at", "returned_by", "return_reason", "updated_at"])
+    return submission
+
+
+def lock_shift_request_submission(*, submission: ShiftRequestSubmission, actor: User):
+    submission.status = ShiftRequestSubmission.Status.LOCKED
+    submission.save(update_fields=["status", "updated_at"])
+    return submission
+
+
+def unlock_shift_request_submission(*, submission: ShiftRequestSubmission, actor: User):
+    submission.status = ShiftRequestSubmission.Status.RETURNED
+    submission.save(update_fields=["status", "updated_at"])
+    return submission
+
+
 def _validate_assignment_cell_immutable(instance: MonthlyShiftAssignment | None, validated_data: dict):
     if instance is None:
         return
@@ -1195,6 +1558,7 @@ def validate_monthly_assignment(
     segments: list[MonthlyShiftSegment],
     *,
     validate_current_masters: bool = True,
+    shift_request_lookup: dict[tuple[str, str], list[ShiftRequestItem]] | None = None,
 ) -> list[dict]:
     issues: list[dict] = []
     plan = assignment.monthly_shift_plan
@@ -1269,6 +1633,8 @@ def validate_monthly_assignment(
                 raise DRFValidationError({"segments": "Break segments cannot overlap other segments."})
             if not (current.work_type.can_overlap or other.work_type.can_overlap):
                 raise DRFValidationError({"segments": "Monthly shift segments cannot overlap."})
+    if shift_request_lookup is not None:
+        issues.extend(validate_assignment_against_shift_requests(assignment, active_segments, shift_request_lookup))
     return issues
 
 
@@ -1802,10 +2168,17 @@ def save_monthly_assignment(
                 save_segments = []
 
             validate_current_masters = replacing_pattern or segments_data is not None or instance is None
+            shift_request_lookup = get_shift_request_lookup(
+                assignment.monthly_shift_plan.location,
+                assignment.monthly_shift_plan.year,
+                assignment.monthly_shift_plan.month,
+                [assignment.staff_id],
+            )
             warnings = validate_monthly_assignment(
                 assignment,
                 validation_segments,
                 validate_current_masters=validate_current_masters,
+                shift_request_lookup=shift_request_lookup,
             )
             error_issues = [issue for issue in warnings if issue["severity"] == "error"]
             if error_issues:
@@ -1919,6 +2292,12 @@ def preview_template_generation(
     entries_by_weekday: dict[int, list[WeeklyShiftTemplateEntry]] = {}
     for entry in weekly_template.entries.filter(is_active=True).select_related("staff", "shift_pattern"):
         entries_by_weekday.setdefault(entry.weekday, []).append(entry)
+    request_lookup = get_shift_request_lookup(
+        plan.location,
+        plan.year,
+        plan.month,
+        [entry.staff_id for entries in entries_by_weekday.values() for entry in entries],
+    )
 
     candidates: list[GenerationCandidate] = []
     for work_date in month_dates(plan.year, plan.month):
@@ -1938,7 +2317,13 @@ def preview_template_generation(
                     existing=existing if action == "replace" else None,
                 )
                 try:
-                    issues.extend(validate_monthly_assignment(assignment, segments))
+                    issues.extend(
+                        validate_monthly_assignment(
+                            assignment,
+                            segments,
+                            shift_request_lookup=request_lookup,
+                        )
+                    )
                 except DRFValidationError as exc:
                     issues.append(_candidate_issue_from_exception(exc))
             candidates.append(GenerationCandidate(work_date, entry, entry.shift_pattern, action, existing, issues))

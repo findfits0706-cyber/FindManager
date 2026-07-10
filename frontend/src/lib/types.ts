@@ -192,13 +192,15 @@ export type MonthlyShiftPlan = BaseEntity & {
 };
 
 export type MonthlyMatrixAssignment = {
-  id: string;
+  id: string | null;
   pattern_short_name: string;
   start_offset_minutes: number | null;
   end_offset_minutes: number | null;
-  source_type: "template" | "manual";
+  source_type: "template" | "manual" | "";
   is_customized: boolean;
   warning_count: number;
+  issues?: Array<{ severity: "info" | "warning" | "error"; code: string; message: string }>;
+  shift_requests?: ShiftRequestItem[];
 };
 
 export type MonthlyMatrixInactiveAssignment = {
@@ -454,6 +456,63 @@ export type MyPublishedShiftsResponse = {
     is_sunday: boolean;
   }>;
   shifts: MyPublishedShift[];
+};
+
+export type ShiftRequestPeriod = {
+  id: string;
+  location: string;
+  location_name: string;
+  year: number;
+  month: number;
+  name: string;
+  description: string;
+  opens_at: string;
+  closes_at: string;
+  status: "draft" | "open" | "closed" | "archived";
+  draft_count?: number;
+  submitted_count?: number;
+  returned_count?: number;
+  locked_count?: number;
+  submission_count?: number;
+  item_count?: number;
+  is_active: boolean;
+};
+
+export type ShiftRequestItem = {
+  id?: string;
+  request_type: "day_off" | "unavailable" | "prefer_work" | "prefer_time" | "note";
+  work_date: string | null;
+  start_offset_minutes: number | null;
+  end_offset_minutes: number | null;
+  work_type: string | null;
+  work_type_name?: string;
+  work_area: string | null;
+  work_area_name?: string;
+  priority: "high" | "normal" | "low";
+  reason: string;
+  notes: string;
+  is_active?: boolean;
+};
+
+export type ShiftRequestSubmission = {
+  id: string;
+  request_period: string;
+  period: Pick<ShiftRequestPeriod, "id" | "location" | "location_name" | "year" | "month" | "name" | "status" | "opens_at" | "closes_at">;
+  staff: string;
+  staff_display_name: string;
+  status: "draft" | "submitted" | "returned" | "locked";
+  can_edit: boolean;
+  can_submit: boolean;
+  submitted_at: string | null;
+  returned_at: string | null;
+  return_reason: string;
+  notes: string;
+  item_count?: number;
+  day_off_count?: number;
+  unavailable_count?: number;
+  prefer_count?: number;
+  has_note?: boolean;
+  items: ShiftRequestItem[];
 };
 
 export type StaffLocation = BaseEntity & {

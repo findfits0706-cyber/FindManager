@@ -76,6 +76,21 @@ class AuditEvent(models.Model):
             "Monthly shift assignment reactivated",
         )
         MONTHLY_SHIFT_TEMPLATE_APPLIED = "monthly_shift_template_applied", "Monthly shift template applied"
+        SHIFT_REQUEST_PERIOD_CREATED = "shift_request_period_created", "Shift request period created"
+        SHIFT_REQUEST_PERIOD_UPDATED = "shift_request_period_updated", "Shift request period updated"
+        SHIFT_REQUEST_PERIOD_OPENED = "shift_request_period_opened", "Shift request period opened"
+        SHIFT_REQUEST_PERIOD_CLOSED = "shift_request_period_closed", "Shift request period closed"
+        SHIFT_REQUEST_PERIOD_REOPENED = "shift_request_period_reopened", "Shift request period reopened"
+        SHIFT_REQUEST_PERIOD_ARCHIVED = "shift_request_period_archived", "Shift request period archived"
+        SHIFT_REQUEST_SUBMISSION_SAVED = "shift_request_submission_saved", "Shift request submission saved"
+        SHIFT_REQUEST_SUBMISSION_SUBMITTED = "shift_request_submission_submitted", "Shift request submission submitted"
+        SHIFT_REQUEST_SUBMISSION_UNSUBMITTED = (
+            "shift_request_submission_unsubmitted",
+            "Shift request submission unsubmitted",
+        )
+        SHIFT_REQUEST_SUBMISSION_RETURNED = "shift_request_submission_returned", "Shift request submission returned"
+        SHIFT_REQUEST_SUBMISSION_LOCKED = "shift_request_submission_locked", "Shift request submission locked"
+        SHIFT_REQUEST_SUBMISSION_UNLOCKED = "shift_request_submission_unlocked", "Shift request submission unlocked"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     event_type = models.CharField(max_length=64, choices=EventType.choices)

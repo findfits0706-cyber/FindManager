@@ -9,10 +9,21 @@ from .models import (
     MonthlyShiftSegment,
     ShiftPattern,
     ShiftPatternSegment,
+    ShiftRequestItem,
+    ShiftRequestPeriod,
+    ShiftRequestSubmission,
     WeeklyShiftTemplate,
     WeeklyShiftTemplateEntry,
 )
-from .services import save_monthly_assignment, save_monthly_plan, save_shift_pattern, save_weekly_template
+from .services import (
+    can_edit_shift_request_submission,
+    can_submit_shift_request_submission,
+    count_shift_request_target_staff,
+    save_monthly_assignment,
+    save_monthly_plan,
+    save_shift_pattern,
+    save_weekly_template,
+)
 
 FORBIDDEN_CHILD_FIELDS = {"is_active", "created_at", "updated_at"}
 IMMUTABLE_LOCATION_MESSAGE = "拠点は作成後変更できません。別拠点用に複製してください。"
@@ -760,3 +771,181 @@ class MyPublishedShiftSerializer(MonthlyShiftPublicationAssignmentSerializer):
             "month": publication.month,
             "published_at": publication.published_at,
         }
+
+
+class ShiftRequestItemSerializer(serializers.ModelSerializer):
+    work_type_name = serializers.CharField(source="work_type.name", read_only=True)
+    work_area_name = serializers.CharField(source="work_area.name", read_only=True)
+
+    class Meta:
+        model = ShiftRequestItem
+        fields = [
+            "id",
+            "request_type",
+            "work_date",
+            "start_offset_minutes",
+            "end_offset_minutes",
+            "work_type",
+            "work_type_name",
+            "work_area",
+            "work_area_name",
+            "priority",
+            "reason",
+            "notes",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "is_active", "created_at", "updated_at"]
+
+
+class ShiftRequestPeriodSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source="location.name", read_only=True)
+    draft_count = serializers.IntegerField(read_only=True, default=0)
+    submitted_count = serializers.IntegerField(read_only=True, default=0)
+    returned_count = serializers.IntegerField(read_only=True, default=0)
+    locked_count = serializers.IntegerField(read_only=True, default=0)
+    submission_count = serializers.IntegerField(read_only=True, default=0)
+    item_count = serializers.IntegerField(read_only=True, default=0)
+    target_staff_count = serializers.SerializerMethodField()
+    not_created_count = serializers.SerializerMethodField()
+    my_submission = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ShiftRequestPeriod
+        fields = [
+            "id",
+            "location",
+            "location_name",
+            "year",
+            "month",
+            "name",
+            "description",
+            "opens_at",
+            "closes_at",
+            "status",
+            "draft_count",
+            "submitted_count",
+            "returned_count",
+            "locked_count",
+            "submission_count",
+            "item_count",
+            "target_staff_count",
+            "not_created_count",
+            "my_submission",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "status", "created_at", "updated_at"]
+
+    def get_target_staff_count(self, obj):
+        if hasattr(obj, "target_staff_count"):
+            return obj.target_staff_count
+        target_counts = self.context.get("target_staff_counts", {})
+        if str(obj.id) in target_counts:
+            return target_counts[str(obj.id)]
+        return count_shift_request_target_staff(obj)
+
+    def get_not_created_count(self, obj):
+        return max(self.get_target_staff_count(obj) - getattr(obj, "submission_count", 0), 0)
+
+    def get_my_submission(self, obj):
+        submission_map = self.context.get("my_submission_map")
+        submission = submission_map.get(str(obj.id)) if submission_map is not None else None
+        if submission is None:
+            return None
+        return {
+            "id": str(submission.id),
+            "status": submission.status,
+            "submitted_at": submission.submitted_at,
+            "item_count": getattr(submission, "item_count", 0),
+            "can_edit": can_edit_shift_request_submission(submission),
+            "can_submit": can_submit_shift_request_submission(submission),
+        }
+
+
+class ShiftRequestSubmissionSerializer(serializers.ModelSerializer):
+    period = serializers.SerializerMethodField()
+    staff_display_name = serializers.CharField(source="staff.display_name", read_only=True)
+    item_count = serializers.IntegerField(read_only=True, default=0)
+    day_off_count = serializers.IntegerField(read_only=True, default=0)
+    unavailable_count = serializers.IntegerField(read_only=True, default=0)
+    prefer_count = serializers.IntegerField(read_only=True, default=0)
+    has_note = serializers.BooleanField(read_only=True, default=False)
+    can_edit = serializers.SerializerMethodField()
+    can_submit = serializers.SerializerMethodField()
+    items = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ShiftRequestSubmission
+        fields = [
+            "id",
+            "request_period",
+            "period",
+            "staff",
+            "staff_display_name",
+            "status",
+            "can_edit",
+            "can_submit",
+            "submitted_at",
+            "submitted_by",
+            "returned_at",
+            "returned_by",
+            "return_reason",
+            "notes",
+            "item_count",
+            "day_off_count",
+            "unavailable_count",
+            "prefer_count",
+            "has_note",
+            "items",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "request_period",
+            "staff",
+            "status",
+            "submitted_at",
+            "submitted_by",
+            "returned_at",
+            "returned_by",
+            "return_reason",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_period(self, obj):
+        period = obj.request_period
+        return {
+            "id": str(period.id),
+            "location": str(period.location_id),
+            "location_name": period.location.name,
+            "year": period.year,
+            "month": period.month,
+            "name": period.name,
+            "status": period.status,
+            "opens_at": period.opens_at,
+            "closes_at": period.closes_at,
+        }
+
+    def get_can_edit(self, obj):
+        return can_edit_shift_request_submission(obj)
+
+    def get_can_submit(self, obj):
+        return can_submit_shift_request_submission(obj)
+
+    def get_items(self, obj):
+        items = [item for item in obj.items.all() if item.is_active]
+        return ShiftRequestItemSerializer(items, many=True).data
+
+
+class ShiftRequestSubmissionSaveSerializer(serializers.Serializer):
+    notes = serializers.CharField(required=False, allow_blank=True)
+    items = ShiftRequestItemSerializer(many=True, required=False)
+
+
+class ShiftRequestReturnSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=True, allow_blank=False)

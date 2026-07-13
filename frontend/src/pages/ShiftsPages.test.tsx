@@ -7,14 +7,16 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { vi } from "vitest";
 import { AppShell } from "../components/AppShell";
 import { AuthProvider } from "../features/auth/AuthContext";
-import { addDaysToIsoDate } from "../lib/localDate";
+import { addDaysToIsoDate, formatLocalIsoDate } from "../lib/localDate";
 import { labelToOffset, offsetToLabel } from "../lib/timeOffsets";
 import { clampSegmentToRange, durationToWidth, offsetToPosition, type TimelineRange } from "../lib/timeline";
 import { chunkRowsForPrint, estimatePrintRowHeight, printSlotWidthForRange } from "../lib/timelinePrint";
 import { MonthlyShiftsPage } from "./MonthlyShiftsPage";
 import { MyPublishedShiftsPage } from "./MyPublishedShiftsPage";
+import { MyShiftRequestsPage } from "./MyShiftRequestsPage";
 import { ShiftTimelinePage } from "./ShiftTimelinePage";
 import { ShiftPatternsPage } from "./ShiftPatternsPage";
+import { ShiftRequestPeriodsPage } from "./ShiftRequestPeriodsPage";
 import { WeeklyTemplatesPage } from "./WeeklyTemplatesPage";
 import type { PublicationPreview, ShiftTimelineResponse } from "../lib/types";
 
@@ -228,6 +230,27 @@ async function openMonthlyPublicationPreview() {
 }
 const monthlyMatrix = {
   plan: { id: "m1", location: "l1", location_name: "本館", year: 2028, month: 2, name: "2028年2月 本館シフト" },
+  shift_request_period: {
+    id: "rp1",
+    location: "l1",
+    location_name: "本館",
+    year: 2028,
+    month: 2,
+    name: "2028年2月 希望提出",
+    description: "",
+    opens_at: "2028-01-01T00:00:00+09:00",
+    closes_at: "2028-01-31T23:59:00+09:00",
+    status: "open" as const,
+    draft_count: 1,
+    submitted_count: 2,
+    returned_count: 1,
+    locked_count: 1,
+    submission_count: 5,
+    target_staff_count: 6,
+    not_created_count: 1,
+    item_count: 9,
+    is_active: true,
+  },
   dates: Array.from({ length: 29 }, (_, index) => {
     const date = new Date(2028, 1, index + 1);
     const weekday = (date.getDay() + 6) % 7;
@@ -559,8 +582,116 @@ describe("shift settings pages", () => {
     expect(await screen.findByRole("link", { name: "勤務パターン" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "月間シフト" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "日別・週別シフト" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "希望提出管理" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "希望提出" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "自分のシフト" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "週間テンプレート" })).toBeInTheDocument();
+  });
+
+  it("shows request period management and submission actions", async () => {
+    mockAuthAndApi(["system_admin"], {
+      "/api/v1/locations/": locations,
+      "/api/v1/shift-request-periods/p1/submissions/": [
+        {
+          id: "sub1",
+          request_period: "p1",
+          period: { id: "p1", location: "l1", location_name: "本館", year: 2028, month: 2, name: "希望", status: "open", opens_at: "2028-01-01", closes_at: "2028-01-31" },
+          staff: "staff1",
+          staff_display_name: "スタッフA",
+          status: "submitted",
+          can_edit: false,
+          can_submit: false,
+          submitted_at: "2028-01-10",
+          returned_at: null,
+          return_reason: "",
+          notes: "note",
+          item_count: 1,
+          items: [{ id: "i1", request_type: "day_off", work_date: "2028-02-01", start_offset_minutes: null, end_offset_minutes: null, work_type: null, work_area: null, priority: "high", reason: "私用", notes: "" }],
+        },
+      ],
+      "/api/v1/shift-request-periods/": {
+        count: 1,
+        next: null,
+        previous: null,
+        results: [
+          { id: "p1", location: "l1", location_name: "本館", year: 2028, month: 2, name: "希望", description: "", opens_at: "2028-01-01", closes_at: "2028-01-31", status: "open", draft_count: 0, submitted_count: 1, returned_count: 0, locked_count: 0, item_count: 1, is_active: true },
+        ],
+      },
+      "/api/v1/shift-request-submissions/sub1/lock/": { status: "locked" },
+    });
+    renderWithAuth(<ShiftRequestPeriodsPage />);
+    expect(await screen.findByText("希望提出管理")).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        (_content, element) =>
+          element?.tagName === "TD" && (element.textContent?.includes("submitted 1") ?? false),
+      ),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "提出状況" }));
+    expect(await screen.findByText("スタッフA")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "詳細" }));
+    expect(screen.getByText("私用")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "lock" }));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/shift-request-submissions/sub1/lock/"), expect.anything());
+    return;
+    expect(await screen.findByText("希望提出管理")).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        (_content, element) =>
+          element?.tagName === "TD" && (element.textContent?.includes("submitted 1") ?? false),
+      ),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "提出状況" }));
+    expect(await screen.findByText("スタッフA")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "詳細" }));
+    expect(screen.getByText("私用")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "lock" }));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/shift-request-submissions/sub1/lock/"), expect.anything());
+  });
+
+  it("lets users edit and submit their own shift requests without staff id", async () => {
+    const submission = {
+      id: "sub1",
+      request_period: "p1",
+      period: { id: "p1", location: "l1", location_name: "本館", year: 2028, month: 2, name: "希望", status: "open", opens_at: "2028-01-01", closes_at: "2028-01-31" },
+      staff: "u1",
+      staff_display_name: "表示ユーザー",
+      status: "draft",
+      can_edit: true,
+      can_submit: true,
+      submitted_at: null,
+      returned_at: null,
+      return_reason: "",
+      notes: "",
+      items: [],
+    };
+    mockAuthAndApi(["staff"], {
+      "/api/v1/locations/": locations,
+      "/api/v1/my-shift-request-periods/p1/submission/": submission,
+      "/api/v1/my-shift-request-periods/p1/submit/": { ...submission, status: "submitted", can_edit: false },
+      "/api/v1/my-shift-request-periods/": [
+        { id: "p1", location: "l1", location_name: "本館", year: 2028, month: 2, name: "希望", description: "", opens_at: "2028-01-01", closes_at: "2028-01-31", status: "open", is_active: true },
+      ],
+    });
+    renderWithAuth(<MyShiftRequestsPage />);
+    expect(await screen.findByText("希望提出")).toBeInTheDocument();
+    expect(await screen.findByText("未作成")).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("button", { name: "開く" }));
+    await userEvent.click(screen.getByRole("button", { name: "希望休追加" }));
+    await userEvent.type(screen.getByLabelText("理由"), "遘∫畑");
+    await userEvent.click(screen.getByRole("button", { name: "下書き保存" }));
+    await userEvent.click(screen.getByRole("button", { name: "提出" }));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/my-shift-request-periods/p1/submit/"), expect.anything());
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("staff="))).toBe(false);
+    return;
+    expect(await screen.findByText("希望提出")).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("button", { name: "開く" }));
+    await userEvent.click(screen.getByRole("button", { name: "希望休追加" }));
+    await userEvent.type(screen.getByLabelText("理由"), "私用");
+    await userEvent.click(screen.getByRole("button", { name: "下書き保存" }));
+    await userEvent.click(screen.getByRole("button", { name: "提出" }));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/my-shift-request-periods/p1/submit/"), expect.anything());
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("staff="))).toBe(false);
   });
 
   it("shows my published shifts from snapshot API", async () => {
@@ -660,7 +791,15 @@ describe("shift settings pages", () => {
     expect(addDaysToIsoDate("2028-02-29", 1)).toBe("2028-03-01");
     expect(addDaysToIsoDate("2026-12-31", 1)).toBe("2027-01-01");
     expect(addDaysToIsoDate("2026-07-01", -1)).toBe("2026-06-30");
+    expect(formatLocalIsoDate(new Date(2028, 1, 29))).toBe("2028-02-29");
+    expect(formatLocalIsoDate(new Date(2026, 11, 31))).toBe("2026-12-31");
+    const toIsoSpy = vi.spyOn(Date.prototype, "toISOString").mockImplementation(() => {
+      throw new Error("toISOString should not be used");
+    });
+    expect(formatLocalIsoDate(new Date(2026, 6, 1, 0, 30))).toBe("2026-07-01");
+    toIsoSpy.mockRestore();
     expect(addDaysToIsoDate.toString()).not.toContain("toISOString");
+    expect(formatLocalIsoDate.toString()).not.toContain("toISOString");
   });
 
   it("converts all 15 minute offsets including 2880", () => {

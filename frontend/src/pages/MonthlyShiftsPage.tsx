@@ -240,12 +240,12 @@ export function MonthlyShiftsPage() {
       staff: row.staff,
       staffName: row.staff_display_name,
       workDate: targetDate,
-      assignmentId: cell?.id,
+      assignmentId: cell?.id ?? undefined,
       inactiveAssignmentId: inactive?.id,
       inactivePatternShortName: inactive?.pattern_short_name,
     };
     let cancelled = false;
-    if (!cell) {
+    if (!cell?.id) {
       setSelected(nextSelection);
       setAssignment(null);
       setSelectedPattern("");
@@ -782,6 +782,25 @@ export function MonthlyShiftsPage() {
       </div>
       {error ? <p className="error">{error}</p> : null}
       {message ? <p className="success">{message}</p> : null}
+      {matrixQuery.data?.shift_request_period ? (
+        <section className="inline-alert">
+          <h3>希望提出期間</h3>
+          <p>
+            status {matrixQuery.data.shift_request_period.status} / opens_at{" "}
+            {matrixQuery.data.shift_request_period.opens_at} / closes_at{" "}
+            {matrixQuery.data.shift_request_period.closes_at}
+          </p>
+          <p>
+            対象スタッフ数 {matrixQuery.data.shift_request_period.target_staff_count ?? 0} / draft件数{" "}
+            {matrixQuery.data.shift_request_period.draft_count ?? 0} / submitted件数{" "}
+            {matrixQuery.data.shift_request_period.submitted_count ?? 0} / returned件数{" "}
+            {matrixQuery.data.shift_request_period.returned_count ?? 0} / locked件数{" "}
+            {matrixQuery.data.shift_request_period.locked_count ?? 0} / 未作成件数{" "}
+            {matrixQuery.data.shift_request_period.not_created_count ?? 0} / 希望item件数{" "}
+            {matrixQuery.data.shift_request_period.item_count ?? 0}
+          </p>
+        </section>
+      ) : null}
       {matrixQuery.isError ? <p className="error">月間表の取得に失敗しました。</p> : null}
       {!activePlan ? <p className="subtle-text">拠点と年月を選び、月間表を開いてください。</p> : null}
       {activePlan && matrixQuery.isLoading ? <p>読み込み中...</p> : null}
@@ -800,8 +819,8 @@ export function MonthlyShiftsPage() {
                     const inactive = row.inactive_assignments?.[item.date];
                     return (
                       <td key={`${row.staff}-${item.date}`} className={item.is_saturday ? "saturday" : item.is_sunday ? "sunday" : ""}>
-                        <button type="button" className="shift-cell" disabled={!cell && !inactive && !isPlanEditable} onClick={() => void loadAssignment({ staff: row.staff, staffName: row.staff_display_name, workDate: item.date, assignmentId: cell?.id, inactiveAssignmentId: inactive?.id, inactivePatternShortName: inactive?.pattern_short_name })}>
-                          {cell ? <><strong>{cell.pattern_short_name}</strong><span>{cell.start_offset_minutes != null ? offsetToLabel(cell.start_offset_minutes) : ""}~{cell.end_offset_minutes != null ? offsetToLabel(cell.end_offset_minutes) : ""}</span>{cell.is_customized ? <em>調整</em> : null}{cell.warning_count ? <em>警告</em> : null}</> : inactive ? <span className="subtle-text">解除済み {inactive.pattern_short_name}</span> : <span className="subtle-text">+</span>}
+                        <button type="button" className="shift-cell" disabled={!cell && !inactive && !isPlanEditable} onClick={() => void loadAssignment({ staff: row.staff, staffName: row.staff_display_name, workDate: item.date, assignmentId: cell?.id ?? undefined, inactiveAssignmentId: inactive?.id, inactivePatternShortName: inactive?.pattern_short_name })}>
+                          {cell ? <><strong>{cell.pattern_short_name || "希望"}</strong><span>{cell.start_offset_minutes != null ? offsetToLabel(cell.start_offset_minutes) : ""}~{cell.end_offset_minutes != null ? offsetToLabel(cell.end_offset_minutes) : ""}</span>{cell.is_customized ? <em>調整</em> : null}{cell.warning_count ? <em>警告</em> : null}{cell.issues?.some((issue) => issue.code.startsWith("requested_")) ? <em>希望</em> : null}</> : inactive ? <span className="subtle-text">解除済み {inactive.pattern_short_name}</span> : <span className="subtle-text">+</span>}
                         </button>
                       </td>
                     );
@@ -838,6 +857,23 @@ export function MonthlyShiftsPage() {
               </div>
             ))}
             {isPlanEditable ? <div className="actions"><button type="button" disabled={isSubmitting || (!assignment && !selectedPattern)} onClick={() => void saveAssignment()}>{isSubmitting ? "保存中..." : "保存"}</button>{assignment ? <button type="button" disabled={isSubmitting} onClick={() => void deactivateAssignment()}>勤務解除</button> : null}</div> : null}
+            {selected ? (() => {
+              const row = matrixQuery.data?.rows.find((item) => item.staff === selected.staff);
+              const cell = row?.assignments[selected.workDate];
+              const requests = cell?.shift_requests ?? [];
+              return requests.length ? (
+                <section className="inline-alert">
+                  <h3>希望内容</h3>
+                  <ul>
+                    {requests.map((item) => (
+                      <li key={item.id ?? `${item.request_type}-${item.work_date}`}>
+                        {item.request_type} {item.work_date ?? ""} {item.start_offset_minutes != null ? `${offsetToLabel(item.start_offset_minutes)}~${offsetToLabel(item.end_offset_minutes ?? item.start_offset_minutes)}` : ""} {item.reason || item.notes}
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              ) : null;
+            })() : null}
           </aside>
         ) : null}
       </div>

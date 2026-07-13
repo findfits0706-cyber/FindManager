@@ -593,6 +593,216 @@ class MonthlyShiftPublicationSegment(models.Model):
         ordering = ["start_offset_minutes", "display_order", "created_at"]
 
 
+class ShiftChangeRequest(models.Model):
+    class RequestType(models.TextChoices):
+        DROP_SHIFT = "drop_shift", "drop_shift"
+        SWAP_SHIFT = "swap_shift", "swap_shift"
+        COVER_REQUEST = "cover_request", "cover_request"
+        CHANGE_TIME = "change_time", "change_time"
+        CHANGE_ASSIGNMENT = "change_assignment", "change_assignment"
+        MANAGER_ADJUSTMENT = "manager_adjustment", "manager_adjustment"
+        NOTE = "note", "note"
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "draft"
+        SUBMITTED = "submitted", "submitted"
+        APPROVED = "approved", "approved"
+        REJECTED = "rejected", "rejected"
+        CANCELLED = "cancelled", "cancelled"
+        APPLIED = "applied", "applied"
+        CLOSED = "closed", "closed"
+
+    class Priority(models.TextChoices):
+        HIGH = "high", "high"
+        NORMAL = "normal", "normal"
+        LOW = "low", "low"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="shift_change_requests")
+    monthly_shift_plan = models.ForeignKey(
+        MonthlyShiftPlan,
+        on_delete=models.PROTECT,
+        related_name="shift_change_requests",
+    )
+    publication = models.ForeignKey(
+        MonthlyShiftPublication,
+        on_delete=models.PROTECT,
+        related_name="shift_change_requests",
+    )
+    publication_assignment = models.ForeignKey(
+        MonthlyShiftPublicationAssignment,
+        on_delete=models.PROTECT,
+        related_name="shift_change_requests",
+        null=True,
+        blank=True,
+    )
+    requester = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="shift_change_requests_requested",
+    )
+    target_staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="shift_change_requests_targeted",
+    )
+    request_type = models.CharField(max_length=32, choices=RequestType.choices)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    priority = models.CharField(max_length=20, choices=Priority.choices, default=Priority.NORMAL)
+    work_date = models.DateField()
+    original_start_offset_minutes = models.IntegerField(null=True, blank=True)
+    original_end_offset_minutes = models.IntegerField(null=True, blank=True)
+    original_pattern_name_snapshot = models.CharField(max_length=150, blank=True)
+    original_pattern_short_name_snapshot = models.CharField(max_length=100, blank=True)
+    requested_staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="shift_change_requests_requested_as_cover",
+        null=True,
+        blank=True,
+    )
+    requested_work_date = models.DateField(null=True, blank=True)
+    requested_shift_pattern = models.ForeignKey(
+        ShiftPattern,
+        on_delete=models.PROTECT,
+        related_name="shift_change_requests",
+        null=True,
+        blank=True,
+    )
+    requested_start_offset_minutes = models.IntegerField(null=True, blank=True)
+    requested_end_offset_minutes = models.IntegerField(null=True, blank=True)
+    requested_notes = models.TextField(blank=True)
+    reason = models.TextField(blank=True)
+    manager_note = models.TextField(blank=True)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    submitted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="shift_change_requests_submitted",
+        null=True,
+        blank=True,
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="shift_change_requests_approved",
+        null=True,
+        blank=True,
+    )
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    rejected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="shift_change_requests_rejected",
+        null=True,
+        blank=True,
+    )
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancelled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="shift_change_requests_cancelled",
+        null=True,
+        blank=True,
+    )
+    applied_at = models.DateTimeField(null=True, blank=True)
+    applied_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="shift_change_requests_applied",
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["-work_date", "-created_at"]
+        indexes = [
+            models.Index(fields=["location", "work_date"], name="shift_change_location_date_idx"),
+            models.Index(fields=["status", "request_type"], name="shift_change_status_type_idx"),
+            models.Index(fields=["requester", "work_date"], name="shift_chg_requester_dt_idx"),
+            models.Index(fields=["target_staff", "work_date"], name="shift_change_target_date_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(original_start_offset_minutes__isnull=True)
+                | (Q(original_start_offset_minutes__gte=0) & Q(original_start_offset_minutes__lt=2880)),
+                name="shift_change_original_start_range",
+            ),
+            models.CheckConstraint(
+                condition=Q(original_end_offset_minutes__isnull=True)
+                | (Q(original_end_offset_minutes__gt=0) & Q(original_end_offset_minutes__lte=2880)),
+                name="shift_change_original_end_range",
+            ),
+            models.CheckConstraint(
+                condition=Q(requested_start_offset_minutes__isnull=True)
+                | (Q(requested_start_offset_minutes__gte=0) & Q(requested_start_offset_minutes__lt=2880)),
+                name="shift_change_requested_start_range",
+            ),
+            models.CheckConstraint(
+                condition=Q(requested_end_offset_minutes__isnull=True)
+                | (Q(requested_end_offset_minutes__gt=0) & Q(requested_end_offset_minutes__lte=2880)),
+                name="shift_change_requested_end_range",
+            ),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.publication_assignment_id:
+            assignment = self.publication_assignment
+            if self.publication_id and assignment.publication_id != self.publication_id:
+                errors["publication_assignment"] = "publication_assignment must belong to publication."
+            if (
+                self.monthly_shift_plan_id
+                and assignment.publication.monthly_shift_plan_id != self.monthly_shift_plan_id
+            ):
+                errors["monthly_shift_plan"] = "monthly_shift_plan must match the publication assignment."
+            if self.location_id and assignment.publication.location_id != self.location_id:
+                errors["location"] = "location must match the publication assignment."
+            if self.work_date and assignment.work_date != self.work_date:
+                errors["work_date"] = "work_date must match the publication assignment."
+            if self.target_staff_id and assignment.staff_id != self.target_staff_id:
+                errors["target_staff"] = "target_staff must match the publication assignment staff."
+        if self.work_date and self.monthly_shift_plan_id:
+            if (
+                self.work_date.year != self.monthly_shift_plan.year
+                or self.work_date.month != self.monthly_shift_plan.month
+            ):
+                errors["work_date"] = "work_date must be within the monthly shift plan."
+        if self.requested_work_date and self.monthly_shift_plan_id:
+            if (
+                self.requested_work_date.year != self.monthly_shift_plan.year
+                or self.requested_work_date.month != self.monthly_shift_plan.month
+            ):
+                errors["requested_work_date"] = "requested_work_date must be within the monthly shift plan."
+        if self.requested_shift_pattern_id and self.monthly_shift_plan_id:
+            if self.requested_shift_pattern.location_id != self.monthly_shift_plan.location_id:
+                errors["requested_shift_pattern"] = "requested_shift_pattern must belong to the monthly plan location."
+        for field in [
+            "original_start_offset_minutes",
+            "original_end_offset_minutes",
+            "requested_start_offset_minutes",
+            "requested_end_offset_minutes",
+        ]:
+            value = getattr(self, field)
+            if value is not None and value % 15 != 0:
+                errors[field] = "offset must be in 15-minute increments."
+        if (
+            self.requested_start_offset_minutes is not None
+            and self.requested_end_offset_minutes is not None
+            and self.requested_start_offset_minutes >= self.requested_end_offset_minutes
+        ):
+            errors["requested_end_offset_minutes"] = "requested_end_offset_minutes must be after start."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.work_date} / {self.request_type} / {self.status}"
+
+
 class ShiftRequestPeriod(models.Model):
     class Status(models.TextChoices):
         DRAFT = "draft", "draft"

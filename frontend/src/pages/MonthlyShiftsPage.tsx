@@ -782,6 +782,16 @@ export function MonthlyShiftsPage() {
       </div>
       {error ? <p className="error">{error}</p> : null}
       {message ? <p className="success">{message}</p> : null}
+      {matrixQuery.data?.shift_change_request_summary?.needs_republish ? (
+        <section className="inline-alert">
+          <h3>変更反映済み</h3>
+          <p>変更反映済み。再公開が必要です。</p>
+          <p>
+            未完了申請 {matrixQuery.data.shift_change_request_summary.open_count} / 反映済み{" "}
+            {matrixQuery.data.shift_change_request_summary.applied_count}
+          </p>
+        </section>
+      ) : null}
       {matrixQuery.data?.shift_request_period ? (
         <section className="inline-alert">
           <h3>希望提出期間</h3>
@@ -820,7 +830,7 @@ export function MonthlyShiftsPage() {
                     return (
                       <td key={`${row.staff}-${item.date}`} className={item.is_saturday ? "saturday" : item.is_sunday ? "sunday" : ""}>
                         <button type="button" className="shift-cell" disabled={!cell && !inactive && !isPlanEditable} onClick={() => void loadAssignment({ staff: row.staff, staffName: row.staff_display_name, workDate: item.date, assignmentId: cell?.id ?? undefined, inactiveAssignmentId: inactive?.id, inactivePatternShortName: inactive?.pattern_short_name })}>
-                          {cell ? <><strong>{cell.pattern_short_name || "希望"}</strong><span>{cell.start_offset_minutes != null ? offsetToLabel(cell.start_offset_minutes) : ""}~{cell.end_offset_minutes != null ? offsetToLabel(cell.end_offset_minutes) : ""}</span>{cell.is_customized ? <em>調整</em> : null}{cell.warning_count ? <em>警告</em> : null}{cell.issues?.some((issue) => issue.code.startsWith("requested_")) ? <em>希望</em> : null}</> : inactive ? <span className="subtle-text">解除済み {inactive.pattern_short_name}</span> : <span className="subtle-text">+</span>}
+                          {cell ? <><strong>{cell.pattern_short_name || "希望"}</strong><span>{cell.start_offset_minutes != null ? offsetToLabel(cell.start_offset_minutes) : ""}~{cell.end_offset_minutes != null ? offsetToLabel(cell.end_offset_minutes) : ""}</span>{cell.is_customized ? <em>調整</em> : null}{cell.warning_count ? <em>警告</em> : null}{cell.issues?.some((issue) => issue.code.startsWith("requested_")) ? <em>希望</em> : null}{cell.shift_change_requests?.length ? <em>変更</em> : null}</> : inactive ? <span className="subtle-text">解除済み {inactive.pattern_short_name}</span> : <span className="subtle-text">+</span>}
                         </button>
                       </td>
                     );
@@ -868,6 +878,23 @@ export function MonthlyShiftsPage() {
                     {requests.map((item) => (
                       <li key={item.id ?? `${item.request_type}-${item.work_date}`}>
                         {item.request_type} {item.work_date ?? ""} {item.start_offset_minutes != null ? `${offsetToLabel(item.start_offset_minutes)}~${offsetToLabel(item.end_offset_minutes ?? item.start_offset_minutes)}` : ""} {item.reason || item.notes}
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              ) : null;
+            })() : null}
+            {selected ? (() => {
+              const row = matrixQuery.data?.rows.find((item) => item.staff === selected.staff);
+              const cell = row?.assignments[selected.workDate];
+              const requests = cell?.shift_change_requests ?? [];
+              return requests.length ? (
+                <section className="inline-alert">
+                  <h3>変更申請</h3>
+                  <ul>
+                    {requests.map((item) => (
+                      <li key={item.id}>
+                        {item.request_type} / {item.status} / {item.reason || item.manager_note}
                       </li>
                     ))}
                   </ul>

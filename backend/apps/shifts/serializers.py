@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from apps.accounts.models import User
+
 from .models import (
     MonthlyShiftAssignment,
     MonthlyShiftPlan,
@@ -7,6 +9,7 @@ from .models import (
     MonthlyShiftPublicationAssignment,
     MonthlyShiftPublicationSegment,
     MonthlyShiftSegment,
+    ShiftChangeRequest,
     ShiftPattern,
     ShiftPatternSegment,
     ShiftRequestItem,
@@ -16,13 +19,18 @@ from .models import (
     WeeklyShiftTemplateEntry,
 )
 from .services import (
+    can_cancel_shift_change_request,
+    can_edit_shift_change_request,
     can_edit_shift_request_submission,
+    can_manage_shifts,
+    can_submit_shift_change_request,
     can_submit_shift_request_submission,
     count_shift_request_target_staff,
     save_monthly_assignment,
     save_monthly_plan,
     save_shift_pattern,
     save_weekly_template,
+    shift_change_requests_for_display,
 )
 
 FORBIDDEN_CHILD_FIELDS = {"is_active", "created_at", "updated_at"}
@@ -755,9 +763,10 @@ class MonthlyShiftPublicationListSerializer(MonthlyShiftPublicationSerializer):
 
 class MyPublishedShiftSerializer(MonthlyShiftPublicationAssignmentSerializer):
     publication = serializers.SerializerMethodField()
+    shift_change_requests = serializers.SerializerMethodField()
 
     class Meta(MonthlyShiftPublicationAssignmentSerializer.Meta):
-        fields = MonthlyShiftPublicationAssignmentSerializer.Meta.fields + ["publication"]
+        fields = MonthlyShiftPublicationAssignmentSerializer.Meta.fields + ["publication", "shift_change_requests"]
 
     def get_publication(self, obj):
         publication = obj.publication
@@ -771,6 +780,173 @@ class MyPublishedShiftSerializer(MonthlyShiftPublicationAssignmentSerializer):
             "month": publication.month,
             "published_at": publication.published_at,
         }
+
+    def get_shift_change_requests(self, obj):
+        lookup = self.context.get("shift_change_request_lookup", {})
+        return shift_change_requests_for_display(lookup.get(str(obj.id), []))
+
+
+class ShiftChangeRequestSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source="location.name", read_only=True)
+    publication_version = serializers.IntegerField(source="publication.version", read_only=True)
+    requester_display_name = serializers.CharField(source="requester.display_name", read_only=True)
+    target_staff_display_name = serializers.CharField(source="target_staff.display_name", read_only=True)
+    requested_staff_display_name = serializers.CharField(source="requested_staff.display_name", read_only=True)
+    requested_shift_pattern_name = serializers.CharField(source="requested_shift_pattern.name", read_only=True)
+    can_edit = serializers.SerializerMethodField()
+    can_submit = serializers.SerializerMethodField()
+    can_cancel = serializers.SerializerMethodField()
+    can_approve = serializers.SerializerMethodField()
+    can_apply = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ShiftChangeRequest
+        fields = [
+            "id",
+            "location",
+            "location_name",
+            "monthly_shift_plan",
+            "publication",
+            "publication_version",
+            "publication_assignment",
+            "requester",
+            "requester_display_name",
+            "target_staff",
+            "target_staff_display_name",
+            "requested_staff",
+            "requested_staff_display_name",
+            "request_type",
+            "status",
+            "priority",
+            "work_date",
+            "original_start_offset_minutes",
+            "original_end_offset_minutes",
+            "original_pattern_name_snapshot",
+            "original_pattern_short_name_snapshot",
+            "requested_work_date",
+            "requested_shift_pattern",
+            "requested_shift_pattern_name",
+            "requested_start_offset_minutes",
+            "requested_end_offset_minutes",
+            "requested_notes",
+            "reason",
+            "manager_note",
+            "submitted_at",
+            "submitted_by",
+            "approved_at",
+            "approved_by",
+            "rejected_at",
+            "rejected_by",
+            "cancelled_at",
+            "cancelled_by",
+            "applied_at",
+            "applied_by",
+            "can_edit",
+            "can_submit",
+            "can_cancel",
+            "can_approve",
+            "can_apply",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+        read_only_fields = fields
+
+    def _actor(self):
+        request = self.context.get("request")
+        return getattr(request, "user", None)
+
+    def _actor_can_manage(self):
+        if not hasattr(self, "_cached_actor_can_manage"):
+            actor = self._actor()
+            self._cached_actor_can_manage = bool(actor and can_manage_shifts(actor))
+        return self._cached_actor_can_manage
+
+    def get_can_edit(self, obj):
+        return can_edit_shift_change_request(obj, actor=self._actor())
+
+    def get_can_submit(self, obj):
+        return can_submit_shift_change_request(obj, actor=self._actor())
+
+    def get_can_cancel(self, obj):
+        actor = self._actor()
+        return can_cancel_shift_change_request(obj, actor=actor, manager=self._actor_can_manage())
+
+    def get_can_approve(self, obj):
+        return self._actor_can_manage() and obj.status == ShiftChangeRequest.Status.SUBMITTED
+
+    def get_can_apply(self, obj):
+        return (
+            self._actor_can_manage()
+            and obj.status == ShiftChangeRequest.Status.APPROVED
+            and obj.request_type != ShiftChangeRequest.RequestType.NOTE
+        )
+
+
+class ShiftChangeRequestSaveSerializer(serializers.Serializer):
+    publication_assignment = serializers.PrimaryKeyRelatedField(
+        queryset=MonthlyShiftPublicationAssignment.objects.select_related(
+            "publication",
+            "publication__monthly_shift_plan",
+            "publication__location",
+            "staff",
+        ),
+        required=False,
+    )
+    request_type = serializers.ChoiceField(choices=ShiftChangeRequest.RequestType.choices, required=False)
+    priority = serializers.ChoiceField(choices=ShiftChangeRequest.Priority.choices, required=False)
+    requested_staff = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.filter(is_active=True),
+        required=False,
+        allow_null=True,
+    )
+    requested_work_date = serializers.DateField(required=False, allow_null=True)
+    requested_shift_pattern = serializers.PrimaryKeyRelatedField(
+        queryset=ShiftPattern.objects.filter(is_active=True),
+        required=False,
+        allow_null=True,
+    )
+    requested_start_offset_minutes = serializers.IntegerField(required=False, allow_null=True)
+    requested_end_offset_minutes = serializers.IntegerField(required=False, allow_null=True)
+    requested_notes = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+    reason = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+    manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+    submit = serializers.BooleanField(required=False, default=False)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["requested_staff"].queryset = self.context.get(
+            "staff_queryset",
+            User.objects.filter(is_active=True),
+        )
+
+
+class ShiftChangeRequestActionSerializer(serializers.Serializer):
+    requested_staff = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.filter(is_active=True),
+        required=False,
+        allow_null=True,
+    )
+    requested_work_date = serializers.DateField(required=False, allow_null=True)
+    requested_shift_pattern = serializers.PrimaryKeyRelatedField(
+        queryset=ShiftPattern.objects.filter(is_active=True),
+        required=False,
+        allow_null=True,
+    )
+    requested_start_offset_minutes = serializers.IntegerField(required=False, allow_null=True)
+    requested_end_offset_minutes = serializers.IntegerField(required=False, allow_null=True)
+    manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["requested_staff"].queryset = self.context.get(
+            "staff_queryset",
+            User.objects.filter(is_active=True),
+        )
+
+
+class ShiftChangeRequestManagerNoteSerializer(serializers.Serializer):
+    manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=True)
 
 
 class ShiftRequestItemSerializer(serializers.ModelSerializer):

@@ -111,3 +111,14 @@ Phase 7 adds shift request collection before monthly shift creation:
 - Day-off, unavailable, preferred-work, preferred-time, and note request items
 - Monthly matrix, assignment save, and template preview warnings for submitted or locked requests
 - Self-service APIs scoped to the authenticated user under `/api/v1/my-shift-request-periods/`
+
+Phase 8 adds post-publication shift change requests:
+
+- Staff self-service change requests at `/my/shift-change-requests`
+- Change request creation from `/shifts/my-published`
+- Manager/supervisor review at `/shifts/change-requests`
+- Request types for drop, swap, cover, time change, assignment change, manager adjustment, and note
+- Manager approval before any monthly shift is changed
+- Apply flow that updates the monthly plan, withdraws the active publication snapshot, and requires republishing
+- Monthly matrix and my published shift indicators for open or applied change requests
+- Self-service APIs scoped to the authenticated user under `/api/v1/my-shift-change-requests/`

@@ -91,6 +91,14 @@ class AuditEvent(models.Model):
         SHIFT_REQUEST_SUBMISSION_RETURNED = "shift_request_submission_returned", "Shift request submission returned"
         SHIFT_REQUEST_SUBMISSION_LOCKED = "shift_request_submission_locked", "Shift request submission locked"
         SHIFT_REQUEST_SUBMISSION_UNLOCKED = "shift_request_submission_unlocked", "Shift request submission unlocked"
+        SHIFT_CHANGE_REQUEST_CREATED = "shift_change_request_created", "Shift change request created"
+        SHIFT_CHANGE_REQUEST_UPDATED = "shift_change_request_updated", "Shift change request updated"
+        SHIFT_CHANGE_REQUEST_SUBMITTED = "shift_change_request_submitted", "Shift change request submitted"
+        SHIFT_CHANGE_REQUEST_CANCELLED = "shift_change_request_cancelled", "Shift change request cancelled"
+        SHIFT_CHANGE_REQUEST_APPROVED = "shift_change_request_approved", "Shift change request approved"
+        SHIFT_CHANGE_REQUEST_REJECTED = "shift_change_request_rejected", "Shift change request rejected"
+        SHIFT_CHANGE_REQUEST_APPLIED = "shift_change_request_applied", "Shift change request applied"
+        SHIFT_CHANGE_REQUEST_CLOSED = "shift_change_request_closed", "Shift change request closed"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     event_type = models.CharField(max_length=64, choices=EventType.choices)

@@ -18,6 +18,7 @@ from .models import (
     MonthlyShiftPublicationAssignment,
     MonthlyShiftPublicationSegment,
     MonthlyShiftSegment,
+    ShiftChangeRequest,
     ShiftPattern,
     ShiftRequestItem,
     ShiftRequestPeriod,
@@ -35,6 +36,10 @@ from .serializers import (
     PublicationAcknowledgeSerializer,
     PublicationReopenSerializer,
     PublicationWithdrawSerializer,
+    ShiftChangeRequestActionSerializer,
+    ShiftChangeRequestManagerNoteSerializer,
+    ShiftChangeRequestSaveSerializer,
+    ShiftChangeRequestSerializer,
     ShiftPatternDuplicateSerializer,
     ShiftPatternListSerializer,
     ShiftPatternSerializer,
@@ -48,11 +53,15 @@ from .serializers import (
     WeeklyShiftTemplateSerializer,
 )
 from .services import (
+    apply_shift_change_request,
     apply_template_generation,
+    approve_shift_change_request,
     build_capability_lookup,
     build_publication_preview,
     can_manage_shifts,
     can_view_shifts,
+    cancel_shift_change_request,
+    close_shift_change_request,
     confirm_monthly_shift_plan,
     deactivate_instance,
     deactivate_monthly_instance,
@@ -60,6 +69,8 @@ from .services import (
     duplicate_weekly_template,
     ensure_monthly_plan_editable,
     get_or_create_shift_request_submission,
+    get_shift_change_request_assignment_lookup,
+    get_shift_change_request_lookup,
     get_shift_request_info_lookup,
     get_shift_request_lookup,
     get_shift_request_target_staff_counts,
@@ -71,16 +82,22 @@ from .services import (
     preview_template_generation,
     publish_monthly_shift_plan,
     record_shift_event,
+    reject_shift_change_request,
     reopen_monthly_shift_plan,
     return_shift_request_submission,
+    save_shift_change_request,
     save_shift_request_period,
     save_shift_request_submission,
     set_shift_request_period_active,
     set_shift_request_period_status,
+    shift_change_request_metadata,
+    shift_change_request_summary,
+    shift_change_requests_for_display,
     shift_pattern_metadata,
     shift_request_items_for_display,
     shift_request_period_metadata,
     shift_request_submission_metadata,
+    submit_shift_change_request,
     submit_shift_request_submission,
     unlock_shift_request_submission,
     unsubmit_shift_request_submission,
@@ -121,6 +138,57 @@ def publication_detail_queryset():
             ),
         )
     )
+
+
+def shift_change_request_queryset():
+    return ShiftChangeRequest.objects.select_related(
+        "location",
+        "monthly_shift_plan",
+        "publication",
+        "publication_assignment",
+        "requester",
+        "target_staff",
+        "requested_staff",
+        "requested_shift_pattern",
+        "submitted_by",
+        "approved_by",
+        "rejected_by",
+        "cancelled_by",
+        "applied_by",
+    )
+
+
+def get_shift_change_request_for_update(pk):
+    return (
+        ShiftChangeRequest.objects.select_for_update(of=("self",))
+        .select_related(
+            "location",
+            "monthly_shift_plan",
+            "publication",
+            "publication_assignment",
+            "requester",
+            "target_staff",
+            "requested_staff",
+            "requested_shift_pattern",
+        )
+        .get(pk=pk)
+    )
+
+
+def validate_change_request_date_range(params, *, max_days=92):
+    date_from = params.get("date_from")
+    date_to = params.get("date_to")
+    try:
+        parsed_from = date.fromisoformat(date_from) if date_from else None
+        parsed_to = date.fromisoformat(date_to) if date_to else None
+    except ValueError as exc:
+        raise ValidationError({"date": "YYYY-MM-DD形式で指定してください。"}) from exc
+    if parsed_from and parsed_to:
+        if parsed_from > parsed_to:
+            raise ValidationError({"date_to": "date_from以降の日付を指定してください。"})
+        if (parsed_to - parsed_from).days > max_days:
+            raise ValidationError({"date_to": f"検索範囲は最大{max_days + 1}日です。"})
+    return parsed_from, parsed_to
 
 
 class ShiftSettingsPermission(permissions.BasePermission):
@@ -494,6 +562,8 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
         )
         request_lookup = get_shift_request_lookup(plan.location, plan.year, plan.month, staff_ids)
         request_info_lookup = get_shift_request_info_lookup(plan.location, plan.year, plan.month, staff_ids)
+        shift_change_lookup = get_shift_change_request_lookup(plan, staff_ids)
+        shift_change_summary = shift_change_request_summary(plan)
         request_period = (
             ShiftRequestPeriod.objects.select_related("location")
             .annotate(
@@ -561,6 +631,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
             for work_date in dates:
                 assignment = assignments_by_staff_date.get((str(staff.id), work_date.isoformat()))
                 request_items = request_info_lookup.get((str(staff.id), work_date.isoformat()), [])
+                change_requests = shift_change_lookup.get((str(staff.id), work_date.isoformat()), [])
                 if assignment is not None:
                     active_segments = list(assignment.segments.all())
                     request_issues = validate_assignment_against_shift_requests(
@@ -582,6 +653,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                         + sum(1 for issue in request_issues if issue["severity"] == "warning"),
                         "issues": request_issues,
                         "shift_requests": shift_request_items_for_display(request_items),
+                        "shift_change_requests": shift_change_requests_for_display(change_requests),
                     }
                     continue
                 prefer_issues = [
@@ -599,7 +671,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                         "id": str(inactive.id),
                         "pattern_short_name": inactive.pattern_short_name_snapshot,
                     }
-                if request_items or prefer_issues:
+                if request_items or prefer_issues or change_requests:
                     assignments.setdefault(
                         work_date.isoformat(),
                         {
@@ -612,6 +684,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                             "warning_count": 0,
                             "issues": prefer_issues,
                             "shift_requests": shift_request_items_for_display(request_items),
+                            "shift_change_requests": shift_change_requests_for_display(change_requests),
                         },
                     )
             rows.append(
@@ -647,6 +720,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                 ],
                 "rows": rows,
                 "shift_request_period": request_period_data,
+                "shift_change_request_summary": shift_change_summary,
             }
         )
 
@@ -1420,6 +1494,337 @@ class MyShiftRequestPeriodViewSet(viewsets.GenericViewSet):
         return Response(ShiftRequestSubmissionSerializer(submission).data)
 
 
+class MyShiftChangeRequestPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_authenticated)
+
+    def has_object_permission(self, request, view, obj):
+        return obj.requester_id == request.user.id
+
+
+class ShiftChangeRequestManagementPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if request.method in permissions.SAFE_METHODS:
+            return can_view_shifts(request.user)
+        return can_manage_shifts(request.user)
+
+    def has_object_permission(self, request, view, obj):
+        return self.has_permission(request, view)
+
+
+class MyShiftChangeRequestViewSet(viewsets.ModelViewSet):
+    permission_classes = [MyShiftChangeRequestPermission]
+    serializer_class = ShiftChangeRequestSerializer
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def _staff_queryset(self):
+        return User.objects.filter(is_active=True)
+
+    def _save_serializer_context(self):
+        return {**self.get_serializer_context(), "staff_queryset": self._staff_queryset()}
+
+    def get_queryset(self):
+        params = self.request.query_params
+        forbidden = {"staff", "requester", "target_staff"}.intersection(params)
+        if forbidden:
+            raise ValidationError({field: "本人APIでは指定できません。" for field in forbidden})
+        date_from, date_to = validate_change_request_date_range(params)
+        queryset = shift_change_request_queryset().filter(requester=self.request.user, is_active=True)
+        if date_from:
+            queryset = queryset.filter(work_date__gte=date_from)
+        if date_to:
+            queryset = queryset.filter(work_date__lte=date_to)
+        if params.get("location"):
+            queryset = queryset.filter(location_id=params["location"])
+        if params.get("status"):
+            queryset = queryset.filter(status=params["status"])
+        if params.get("request_type"):
+            queryset = queryset.filter(request_type=params["request_type"])
+        return queryset.order_by("-work_date", "-created_at")
+
+    def create(self, request, *args, **kwargs):
+        serializer = ShiftChangeRequestSaveSerializer(data=request.data, context=self._save_serializer_context())
+        serializer.is_valid(raise_exception=True)
+        submit = serializer.validated_data.pop("submit", False)
+        with transaction.atomic():
+            change_request = save_shift_change_request(
+                instance=None,
+                validated_data=serializer.validated_data,
+                actor=request.user,
+                self_service=True,
+                submit=submit,
+            )
+            record_shift_event(
+                entity="shift_change_request",
+                action="create",
+                actor=request.user,
+                request=request,
+                metadata=shift_change_request_metadata(change_request),
+            )
+            if submit:
+                record_shift_event(
+                    entity="shift_change_request",
+                    action="submit",
+                    actor=request.user,
+                    request=request,
+                    metadata=shift_change_request_metadata(change_request),
+                )
+        return Response(self.get_serializer(shift_change_request_queryset().get(pk=change_request.pk)).data, status=201)
+
+    def partial_update(self, request, *args, **kwargs):
+        serializer = ShiftChangeRequestSaveSerializer(
+            data=request.data,
+            partial=True,
+            context=self._save_serializer_context(),
+        )
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            change_request = get_shift_change_request_for_update(kwargs["pk"])
+            if change_request.requester_id != request.user.id:
+                raise PermissionDenied("本人の申請のみ編集できます。")
+            change_request = save_shift_change_request(
+                instance=change_request,
+                validated_data=serializer.validated_data,
+                actor=request.user,
+                self_service=True,
+            )
+            record_shift_event(
+                entity="shift_change_request",
+                action="update",
+                actor=request.user,
+                request=request,
+                metadata=shift_change_request_metadata(change_request),
+            )
+        return Response(self.get_serializer(shift_change_request_queryset().get(pk=change_request.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        with transaction.atomic():
+            change_request = self.get_object()
+            change_request = submit_shift_change_request(change_request=change_request, actor=request.user)
+            record_shift_event(
+                entity="shift_change_request",
+                action="submit",
+                actor=request.user,
+                request=request,
+                metadata=shift_change_request_metadata(change_request),
+            )
+        return Response(self.get_serializer(shift_change_request_queryset().get(pk=change_request.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        with transaction.atomic():
+            change_request = self.get_object()
+            change_request = cancel_shift_change_request(change_request=change_request, actor=request.user)
+            record_shift_event(
+                entity="shift_change_request",
+                action="cancel",
+                actor=request.user,
+                request=request,
+                metadata=shift_change_request_metadata(change_request),
+            )
+        return Response(self.get_serializer(shift_change_request_queryset().get(pk=change_request.pk)).data)
+
+
+class ShiftChangeRequestViewSet(viewsets.ModelViewSet):
+    permission_classes = [ShiftChangeRequestManagementPermission]
+    serializer_class = ShiftChangeRequestSerializer
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def _staff_queryset(self):
+        return User.objects.filter(is_active=True)
+
+    def _save_serializer_context(self):
+        return {**self.get_serializer_context(), "staff_queryset": self._staff_queryset()}
+
+    def get_queryset(self):
+        params = self.request.query_params
+        date_from, date_to = validate_change_request_date_range(params)
+        queryset = shift_change_request_queryset().filter(is_active=True)
+        if params.get("location"):
+            queryset = queryset.filter(location_id=params["location"])
+        if params.get("year"):
+            queryset = queryset.filter(monthly_shift_plan__year=params["year"])
+        if params.get("month"):
+            queryset = queryset.filter(monthly_shift_plan__month=params["month"])
+        if date_from:
+            queryset = queryset.filter(work_date__gte=date_from)
+        if date_to:
+            queryset = queryset.filter(work_date__lte=date_to)
+        for field in [
+            "requester",
+            "target_staff",
+            "requested_staff",
+            "status",
+            "request_type",
+            "priority",
+            "publication",
+            "monthly_shift_plan",
+        ]:
+            if params.get(field):
+                lookup = (
+                    f"{field}_id"
+                    if field.endswith("staff") or field in {"requester", "publication", "monthly_shift_plan"}
+                    else field
+                )
+                queryset = queryset.filter(**{lookup: params[field]})
+        return queryset.order_by("-work_date", "-created_at")
+
+    def create(self, request, *args, **kwargs):
+        serializer = ShiftChangeRequestSaveSerializer(data=request.data, context=self._save_serializer_context())
+        serializer.is_valid(raise_exception=True)
+        if serializer.validated_data.get("request_type") != ShiftChangeRequest.RequestType.MANAGER_ADJUSTMENT:
+            raise ValidationError({"request_type": "管理APIから作成できるのはmanager_adjustmentのみです。"})
+        submit = serializer.validated_data.pop("submit", True)
+        with transaction.atomic():
+            change_request = save_shift_change_request(
+                instance=None,
+                validated_data=serializer.validated_data,
+                actor=request.user,
+                self_service=False,
+                submit=submit,
+            )
+            record_shift_event(
+                entity="shift_change_request",
+                action="create",
+                actor=request.user,
+                request=request,
+                metadata=shift_change_request_metadata(change_request),
+            )
+        return Response(self.get_serializer(shift_change_request_queryset().get(pk=change_request.pk)).data, status=201)
+
+    def partial_update(self, request, *args, **kwargs):
+        serializer = ShiftChangeRequestSaveSerializer(
+            data=request.data,
+            partial=True,
+            context=self._save_serializer_context(),
+        )
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            change_request = get_shift_change_request_for_update(kwargs["pk"])
+            change_request = save_shift_change_request(
+                instance=change_request,
+                validated_data=serializer.validated_data,
+                actor=request.user,
+                self_service=False,
+            )
+            record_shift_event(
+                entity="shift_change_request",
+                action="update",
+                actor=request.user,
+                request=request,
+                metadata=shift_change_request_metadata(change_request),
+            )
+        return Response(self.get_serializer(shift_change_request_queryset().get(pk=change_request.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        serializer = ShiftChangeRequestActionSerializer(data=request.data, context=self._save_serializer_context())
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            change_request = get_shift_change_request_for_update(pk)
+            change_request = approve_shift_change_request(
+                change_request=change_request,
+                actor=request.user,
+                validated_data=serializer.validated_data,
+            )
+            record_shift_event(
+                entity="shift_change_request",
+                action="approve",
+                actor=request.user,
+                request=request,
+                metadata=shift_change_request_metadata(change_request),
+            )
+        return Response(self.get_serializer(shift_change_request_queryset().get(pk=change_request.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        serializer = ShiftChangeRequestManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            change_request = get_shift_change_request_for_update(pk)
+            change_request = reject_shift_change_request(
+                change_request=change_request,
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="shift_change_request",
+                action="reject",
+                actor=request.user,
+                request=request,
+                metadata=shift_change_request_metadata(change_request),
+            )
+        return Response(self.get_serializer(shift_change_request_queryset().get(pk=change_request.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        serializer = ShiftChangeRequestManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            change_request = get_shift_change_request_for_update(pk)
+            change_request = cancel_shift_change_request(
+                change_request=change_request,
+                actor=request.user,
+                manager=True,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="shift_change_request",
+                action="cancel",
+                actor=request.user,
+                request=request,
+                metadata=shift_change_request_metadata(change_request),
+            )
+        return Response(self.get_serializer(shift_change_request_queryset().get(pk=change_request.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def apply(self, request, pk=None):
+        serializer = ShiftChangeRequestManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            change_request = get_shift_change_request_for_update(pk)
+            change_request, publication = apply_shift_change_request(
+                change_request=change_request,
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="shift_change_request",
+                action="apply",
+                actor=request.user,
+                request=request,
+                metadata=shift_change_request_metadata(
+                    change_request,
+                    reason=f"change_request_applied:{change_request.id}",
+                )
+                | {"withdrawn_publication_id": str(publication.id)},
+            )
+        return Response(self.get_serializer(shift_change_request_queryset().get(pk=change_request.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def close(self, request, pk=None):
+        serializer = ShiftChangeRequestManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            change_request = get_shift_change_request_for_update(pk)
+            change_request = close_shift_change_request(
+                change_request=change_request,
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="shift_change_request",
+                action="close",
+                actor=request.user,
+                request=request,
+                metadata=shift_change_request_metadata(change_request),
+            )
+        return Response(self.get_serializer(shift_change_request_queryset().get(pk=change_request.pk)).data)
+
+
 class MyPublishedShiftsPermission(permissions.BasePermission):
     def has_permission(self, request, view):
         return bool(request.user and request.user.is_authenticated)
@@ -1503,7 +1908,13 @@ class MyPublishedShiftViewSet(viewsets.GenericViewSet):
                 }
             )
             current = date.fromordinal(current.toordinal() + 1)
-        serializer = self.get_serializer(self.get_queryset(), many=True)
+        shifts = list(self.get_queryset())
+        change_request_lookup = get_shift_change_request_assignment_lookup([item.id for item in shifts])
+        serializer = self.get_serializer(
+            shifts,
+            many=True,
+            context={**self.get_serializer_context(), "shift_change_request_lookup": change_request_lookup},
+        )
         return Response(
             {
                 "range": {

@@ -210,6 +210,7 @@ export type MonthlyMatrixInactiveAssignment = {
 
 export type MonthlyShiftMatrix = {
   plan: Pick<MonthlyShiftPlan, "id" | "location" | "year" | "month" | "name"> & { location_name: string };
+  shift_request_period: ShiftRequestPeriod | null;
   dates: Array<{
     date: string;
     day: number;
@@ -475,6 +476,16 @@ export type ShiftRequestPeriod = {
   locked_count?: number;
   submission_count?: number;
   item_count?: number;
+  target_staff_count?: number;
+  not_created_count?: number;
+  my_submission?: {
+    id: string;
+    status: ShiftRequestSubmission["status"];
+    submitted_at: string | null;
+    item_count: number;
+    can_edit: boolean;
+    can_submit: boolean;
+  } | null;
   is_active: boolean;
 };
 

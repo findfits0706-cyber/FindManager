@@ -17,6 +17,7 @@ from apps.common.models import AuditEvent
 from apps.operations.models import Location, StaffCapability, StaffLocation, WorkArea, WorkType, WorkTypeAvailability
 from apps.operations.services import seed_operations
 
+from .. import views as shift_views
 from ..models import (
     MonthlyShiftAssignment,
     MonthlyShiftPlan,
@@ -25,6 +26,7 @@ from ..models import (
     ShiftPattern,
     ShiftPatternSegment,
     ShiftRequestPeriod,
+    ShiftRequestSubmission,
     WeeklyShiftTemplate,
     WeeklyShiftTemplateEntry,
 )
@@ -754,6 +756,125 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
             403,
         )
         self.assertTrue(AuditEvent.objects.filter(event_type="shift_request_submission_submitted").exists())
+
+    def test_shift_request_period_actions_use_locked_period_and_rollback_audit_failure(self):
+        period = self.create_request_period(status=ShiftRequestPeriod.Status.DRAFT)
+        client = self.force_client(self.system_admin)
+        original_get_for_update = shift_views.get_shift_request_period_for_update
+
+        def post_period_action(action):
+            return client.post(f"/api/v1/shift-request-periods/{period.id}/{action}/", {}, format="json").status_code
+
+        with patch("apps.shifts.views.get_shift_request_period_for_update", wraps=original_get_for_update) as locked:
+            self.assertEqual(post_period_action("open"), 200)
+            self.assertEqual(post_period_action("close"), 200)
+            self.assertEqual(post_period_action("reopen"), 200)
+            self.assertEqual(post_period_action("close"), 200)
+            self.assertEqual(post_period_action("archive"), 200)
+            self.assertEqual(post_period_action("deactivate"), 200)
+            self.assertEqual(post_period_action("reactivate"), 200)
+        self.assertEqual(locked.call_count, 7)
+        self.assertEqual(
+            self.force_client(self.viewer)
+            .post(f"/api/v1/shift-request-periods/{period.id}/open/", {}, format="json")
+            .status_code,
+            403,
+        )
+
+        rollback_period = self.create_request_period(month=8, status=ShiftRequestPeriod.Status.DRAFT)
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = client.post(f"/api/v1/shift-request-periods/{rollback_period.id}/open/", {}, format="json")
+        self.assertEqual(response.status_code, 500)
+        rollback_period.refresh_from_db()
+        self.assertEqual(rollback_period.status, ShiftRequestPeriod.Status.DRAFT)
+
+    def test_shift_request_submission_actions_rollback_audit_failure_and_permissions(self):
+        period = self.create_request_period(status=ShiftRequestPeriod.Status.OPEN)
+        submission = ShiftRequestSubmission.objects.create(
+            request_period=period,
+            staff=self.staff,
+            status=ShiftRequestSubmission.Status.SUBMITTED,
+        )
+        admin = self.force_client(self.system_admin)
+        supervisor = self.force_client(self.supervisor)
+        viewer = self.force_client(self.viewer)
+        supervisor_return = supervisor.post(
+            f"/api/v1/shift-request-submissions/{submission.id}/return/",
+            {"reason": "x"},
+            format="json",
+        )
+        self.assertEqual(
+            supervisor_return.status_code,
+            403,
+        )
+        self.assertEqual(
+            viewer.post(f"/api/v1/shift-request-submissions/{submission.id}/lock/", {}, format="json").status_code,
+            403,
+        )
+
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = admin.post(
+                f"/api/v1/shift-request-submissions/{submission.id}/return/",
+                {"reason": "差戻し"},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 500)
+        submission.refresh_from_db()
+        self.assertEqual(submission.status, ShiftRequestSubmission.Status.SUBMITTED)
+        self.assertIsNone(submission.returned_at)
+        self.assertEqual(submission.return_reason, "")
+
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = admin.post(f"/api/v1/shift-request-submissions/{submission.id}/lock/", {}, format="json")
+        self.assertEqual(response.status_code, 500)
+        submission.refresh_from_db()
+        self.assertEqual(submission.status, ShiftRequestSubmission.Status.SUBMITTED)
+
+        submission.status = ShiftRequestSubmission.Status.LOCKED
+        submission.save(update_fields=["status", "updated_at"])
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = admin.post(f"/api/v1/shift-request-submissions/{submission.id}/unlock/", {}, format="json")
+        self.assertEqual(response.status_code, 500)
+        submission.refresh_from_db()
+        self.assertEqual(submission.status, ShiftRequestSubmission.Status.LOCKED)
+
+    def test_my_periods_include_only_own_submission_and_request_summary_counts(self):
+        period = self.create_request_period(status=ShiftRequestPeriod.Status.OPEN)
+        other_submission = ShiftRequestSubmission.objects.create(
+            request_period=period,
+            staff=self.shift_manager,
+            status=ShiftRequestSubmission.Status.SUBMITTED,
+        )
+        ShiftRequestSubmission.objects.create(
+            request_period=period,
+            staff=self.staff,
+            status=ShiftRequestSubmission.Status.DRAFT,
+            notes="mine",
+        )
+        response = self.force_client(self.staff).get("/api/v1/my-shift-request-periods/?year=2026&month=7")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data[0]["my_submission"]["status"], "draft")
+        self.assertNotEqual(response.data[0]["my_submission"]["id"], str(other_submission.id))
+
+        admin_response = self.force_client(self.system_admin).get("/api/v1/shift-request-periods/?year=2026&month=7")
+        self.assertEqual(admin_response.status_code, 200, admin_response.data)
+        summary = admin_response.data["results"][0]
+        target_count = (
+            StaffLocation.objects.filter(location=self.location, is_active=True, valid_from__lte=date(2026, 7, 31))
+            .filter(valid_until__isnull=True)
+            .values("staff_id")
+            .distinct()
+            .count()
+        )
+        self.assertEqual(summary["target_staff_count"], target_count)
+        self.assertEqual(summary["not_created_count"], max(target_count - 2, 0))
+        self.assertEqual(summary["submission_count"], 2)
+
+        plan = self.create_plan()
+        matrix = self.force_client(self.supervisor).get(f"/api/v1/monthly-shift-plans/{plan.id}/matrix/")
+        self.assertEqual(matrix.status_code, 200, matrix.data)
+        self.assertEqual(matrix.data["shift_request_period"]["target_staff_count"], target_count)
+        self.assertEqual(matrix.data["shift_request_period"]["not_created_count"], max(target_count - 2, 0))
 
     def create_plan_for_location(self, location, *, year=2026, month=7):
         return MonthlyShiftPlan.objects.create(

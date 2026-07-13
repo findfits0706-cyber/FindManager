@@ -963,6 +963,58 @@ def shift_request_items_for_display(items: list[ShiftRequestItem]) -> list[dict]
     ]
 
 
+def shift_request_period_date_range(period: ShiftRequestPeriod) -> tuple[date, date]:
+    return (
+        date(period.year, period.month, 1),
+        date(period.year, period.month, calendar.monthrange(period.year, period.month)[1]),
+    )
+
+
+def count_shift_request_target_staff(period: ShiftRequestPeriod) -> int:
+    start_date, end_date = shift_request_period_date_range(period)
+    return (
+        StaffLocation.objects.filter(
+            location=period.location,
+            is_active=True,
+            valid_from__lte=end_date,
+        )
+        .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=start_date))
+        .values("staff_id")
+        .distinct()
+        .count()
+    )
+
+
+def get_shift_request_target_staff_counts(periods: list[ShiftRequestPeriod]) -> dict[str, int]:
+    if not periods:
+        return {}
+    ranges = {str(period.id): shift_request_period_date_range(period) for period in periods}
+    min_start = min(start for start, _end in ranges.values())
+    max_end = max(end for _start, end in ranges.values())
+    location_ids = {period.location_id for period in periods}
+    staff_locations = list(
+        StaffLocation.objects.filter(
+            location_id__in=location_ids,
+            is_active=True,
+            valid_from__lte=max_end,
+        )
+        .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=min_start))
+        .values("location_id", "staff_id", "valid_from", "valid_until")
+    )
+    counts = {}
+    for period in periods:
+        start_date, end_date = ranges[str(period.id)]
+        staff_ids = {
+            item["staff_id"]
+            for item in staff_locations
+            if item["location_id"] == period.location_id
+            and item["valid_from"] <= end_date
+            and (item["valid_until"] is None or item["valid_until"] >= start_date)
+        }
+        counts[str(period.id)] = len(staff_ids)
+    return counts
+
+
 def is_shift_request_period_open(period: ShiftRequestPeriod, *, now=None) -> bool:
     now = now or timezone.now()
     return (
@@ -1112,6 +1164,11 @@ def unsubmit_shift_request_submission(*, submission: ShiftRequestSubmission, act
 def return_shift_request_submission(*, submission: ShiftRequestSubmission, actor: User, reason: str):
     if not reason.strip():
         raise DRFValidationError({"reason": "差戻し理由を入力してください。"})
+    submission = (
+        ShiftRequestSubmission.objects.select_for_update()
+        .select_related("request_period", "request_period__location", "staff")
+        .get(pk=submission.pk)
+    )
     submission.status = ShiftRequestSubmission.Status.RETURNED
     submission.returned_at = timezone.now()
     submission.returned_by = actor
@@ -1121,12 +1178,22 @@ def return_shift_request_submission(*, submission: ShiftRequestSubmission, actor
 
 
 def lock_shift_request_submission(*, submission: ShiftRequestSubmission, actor: User):
+    submission = (
+        ShiftRequestSubmission.objects.select_for_update()
+        .select_related("request_period", "request_period__location", "staff")
+        .get(pk=submission.pk)
+    )
     submission.status = ShiftRequestSubmission.Status.LOCKED
     submission.save(update_fields=["status", "updated_at"])
     return submission
 
 
 def unlock_shift_request_submission(*, submission: ShiftRequestSubmission, actor: User):
+    submission = (
+        ShiftRequestSubmission.objects.select_for_update()
+        .select_related("request_period", "request_period__location", "staff")
+        .get(pk=submission.pk)
+    )
     submission.status = ShiftRequestSubmission.Status.RETURNED
     submission.save(update_fields=["status", "updated_at"])
     return submission

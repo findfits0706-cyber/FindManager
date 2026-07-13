@@ -62,6 +62,7 @@ from .services import (
     get_or_create_shift_request_submission,
     get_shift_request_info_lookup,
     get_shift_request_lookup,
+    get_shift_request_target_staff_counts,
     lock_shift_request_submission,
     month_dates,
     monthly_assignment_metadata,
@@ -493,6 +494,41 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
         )
         request_lookup = get_shift_request_lookup(plan.location, plan.year, plan.month, staff_ids)
         request_info_lookup = get_shift_request_info_lookup(plan.location, plan.year, plan.month, staff_ids)
+        request_period = (
+            ShiftRequestPeriod.objects.select_related("location")
+            .annotate(
+                submission_count=Count("submissions", distinct=True),
+                draft_count=Count(
+                    "submissions",
+                    filter=Q(submissions__status=ShiftRequestSubmission.Status.DRAFT),
+                    distinct=True,
+                ),
+                submitted_count=Count(
+                    "submissions",
+                    filter=Q(submissions__status=ShiftRequestSubmission.Status.SUBMITTED),
+                    distinct=True,
+                ),
+                returned_count=Count(
+                    "submissions",
+                    filter=Q(submissions__status=ShiftRequestSubmission.Status.RETURNED),
+                    distinct=True,
+                ),
+                locked_count=Count(
+                    "submissions",
+                    filter=Q(submissions__status=ShiftRequestSubmission.Status.LOCKED),
+                    distinct=True,
+                ),
+                item_count=Count("submissions__items", filter=Q(submissions__items__is_active=True), distinct=True),
+            )
+            .filter(location=plan.location, year=plan.year, month=plan.month, is_active=True)
+            .first()
+        )
+        request_period_data = None
+        if request_period is not None:
+            request_period.target_staff_count = get_shift_request_target_staff_counts([request_period]).get(
+                str(request_period.id), 0
+            )
+            request_period_data = ShiftRequestPeriodSerializer(request_period).data
 
         staff_queryset = User.objects.filter(id__in=staff_ids)
         if staff_search:
@@ -610,6 +646,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                     for item in dates
                 ],
                 "rows": rows,
+                "shift_request_period": request_period_data,
             }
         )
 
@@ -1005,6 +1042,18 @@ def shift_request_submission_queryset():
     )
 
 
+def get_shift_request_period_for_update(pk):
+    return ShiftRequestPeriod.objects.select_for_update(of=("self",)).select_related("location").get(pk=pk)
+
+
+def get_shift_request_submission_for_update(pk):
+    return (
+        ShiftRequestSubmission.objects.select_for_update(of=("self",))
+        .select_related("request_period", "request_period__location", "staff")
+        .get(pk=pk)
+    )
+
+
 class ShiftRequestPeriodViewSet(viewsets.ModelViewSet):
     permission_classes = [ShiftRequestPermission]
     serializer_class = ShiftRequestPeriodSerializer
@@ -1051,6 +1100,28 @@ class ShiftRequestPeriodViewSet(viewsets.ModelViewSet):
         if params.get("is_active") in {"true", "false"}:
             queryset = queryset.filter(is_active=params["is_active"] == "true")
         return queryset
+
+    def _attach_target_staff_counts(self, periods):
+        counts = get_shift_request_target_staff_counts(list(periods))
+        for period in periods:
+            period.target_staff_count = counts.get(str(period.id), 0)
+        return periods
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            periods = self._attach_target_staff_counts(list(page))
+            serializer = self.get_serializer(periods, many=True)
+            return self.get_paginated_response(serializer.data)
+        periods = self._attach_target_staff_counts(list(queryset))
+        serializer = self.get_serializer(periods, many=True)
+        return Response(serializer.data)
+
+    def retrieve(self, request, *args, **kwargs):
+        period = self.get_object()
+        self._attach_target_staff_counts([period])
+        return Response(self.get_serializer(period).data)
 
     def update(self, request, *args, **kwargs):
         if "status" in request.data:
@@ -1099,7 +1170,9 @@ class ShiftRequestPeriodViewSet(viewsets.ModelViewSet):
     def _status_action(self, request, status_value: str, action_name: str, pk=None):
         self._require_manage()
         with transaction.atomic():
-            period = set_shift_request_period_status(self.get_object(), status_value, actor=request.user)
+            period = set_shift_request_period_status(
+                get_shift_request_period_for_update(pk), status_value, actor=request.user
+            )
             record_shift_event(
                 entity="shift_request_period",
                 action=action_name,
@@ -1133,7 +1206,9 @@ class ShiftRequestPeriodViewSet(viewsets.ModelViewSet):
     def deactivate(self, request, pk=None):
         self._require_manage()
         with transaction.atomic():
-            period = set_shift_request_period_active(self.get_object(), is_active=False, actor=request.user)
+            period = set_shift_request_period_active(
+                get_shift_request_period_for_update(pk), is_active=False, actor=request.user
+            )
             record_shift_event(
                 entity="shift_request_period",
                 action="update",
@@ -1147,7 +1222,9 @@ class ShiftRequestPeriodViewSet(viewsets.ModelViewSet):
     def reactivate(self, request, pk=None):
         self._require_manage()
         with transaction.atomic():
-            period = set_shift_request_period_active(self.get_object(), is_active=True, actor=request.user)
+            period = set_shift_request_period_active(
+                get_shift_request_period_for_update(pk), is_active=True, actor=request.user
+            )
             record_shift_event(
                 entity="shift_request_period",
                 action="update",
@@ -1211,7 +1288,7 @@ class ShiftRequestSubmissionViewSet(viewsets.ReadOnlyModelViewSet):
             serializer.is_valid(raise_exception=True)
             reason = serializer.validated_data["reason"]
         with transaction.atomic():
-            submission = self.get_object()
+            submission = get_shift_request_submission_for_update(pk)
             if action_name == "return":
                 submission = return_shift_request_submission(submission=submission, actor=request.user, reason=reason)
             elif action_name == "lock":
@@ -1225,6 +1302,7 @@ class ShiftRequestSubmissionViewSet(viewsets.ReadOnlyModelViewSet):
                 request=request,
                 metadata=shift_request_submission_metadata(submission),
             )
+        submission = shift_request_submission_queryset().get(pk=submission.pk)
         return Response(self.get_serializer(submission).data)
 
     @action(detail=True, methods=["post"], url_path="return")
@@ -1265,12 +1343,29 @@ class MyShiftRequestPeriodViewSet(viewsets.GenericViewSet):
             queryset = queryset.filter(status=params["status"])
         return queryset.order_by("-year", "-month", "location__display_order")
 
+    def _period_serializer_context(self, periods):
+        period_ids = [period.id for period in periods]
+        submission_map = {
+            str(submission.request_period_id): submission
+            for submission in ShiftRequestSubmission.objects.filter(
+                request_period_id__in=period_ids,
+                staff=self.request.user,
+            ).annotate(item_count=Count("items", filter=Q(items__is_active=True), distinct=True))
+        }
+        return {
+            **self.get_serializer_context(),
+            "target_staff_counts": get_shift_request_target_staff_counts(periods),
+            "my_submission_map": submission_map,
+        }
+
     def list(self, request, *args, **kwargs):
-        serializer = self.get_serializer(self.get_queryset(), many=True)
+        periods = list(self.get_queryset())
+        serializer = self.get_serializer(periods, many=True, context=self._period_serializer_context(periods))
         return Response(serializer.data)
 
     def retrieve(self, request, *args, **kwargs):
-        return Response(self.get_serializer(self.get_object()).data)
+        period = self.get_object()
+        return Response(self.get_serializer(period, context=self._period_serializer_context([period])).data)
 
     def _submission(self):
         return get_or_create_shift_request_submission(period=self.get_object(), staff=self.request.user)

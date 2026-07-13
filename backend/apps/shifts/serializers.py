@@ -18,6 +18,7 @@ from .models import (
 from .services import (
     can_edit_shift_request_submission,
     can_submit_shift_request_submission,
+    count_shift_request_target_staff,
     save_monthly_assignment,
     save_monthly_plan,
     save_shift_pattern,
@@ -806,6 +807,9 @@ class ShiftRequestPeriodSerializer(serializers.ModelSerializer):
     locked_count = serializers.IntegerField(read_only=True, default=0)
     submission_count = serializers.IntegerField(read_only=True, default=0)
     item_count = serializers.IntegerField(read_only=True, default=0)
+    target_staff_count = serializers.SerializerMethodField()
+    not_created_count = serializers.SerializerMethodField()
+    my_submission = serializers.SerializerMethodField()
 
     class Meta:
         model = ShiftRequestPeriod
@@ -826,11 +830,39 @@ class ShiftRequestPeriodSerializer(serializers.ModelSerializer):
             "locked_count",
             "submission_count",
             "item_count",
+            "target_staff_count",
+            "not_created_count",
+            "my_submission",
             "is_active",
             "created_at",
             "updated_at",
         ]
         read_only_fields = ["id", "status", "created_at", "updated_at"]
+
+    def get_target_staff_count(self, obj):
+        if hasattr(obj, "target_staff_count"):
+            return obj.target_staff_count
+        target_counts = self.context.get("target_staff_counts", {})
+        if str(obj.id) in target_counts:
+            return target_counts[str(obj.id)]
+        return count_shift_request_target_staff(obj)
+
+    def get_not_created_count(self, obj):
+        return max(self.get_target_staff_count(obj) - getattr(obj, "submission_count", 0), 0)
+
+    def get_my_submission(self, obj):
+        submission_map = self.context.get("my_submission_map")
+        submission = submission_map.get(str(obj.id)) if submission_map is not None else None
+        if submission is None:
+            return None
+        return {
+            "id": str(submission.id),
+            "status": submission.status,
+            "submitted_at": submission.submitted_at,
+            "item_count": getattr(submission, "item_count", 0),
+            "can_edit": can_edit_shift_request_submission(submission),
+            "can_submit": can_submit_shift_request_submission(submission),
+        }
 
 
 class ShiftRequestSubmissionSerializer(serializers.ModelSerializer):

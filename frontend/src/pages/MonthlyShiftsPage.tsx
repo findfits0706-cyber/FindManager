@@ -782,6 +782,25 @@ export function MonthlyShiftsPage() {
       </div>
       {error ? <p className="error">{error}</p> : null}
       {message ? <p className="success">{message}</p> : null}
+      {matrixQuery.data?.shift_request_period ? (
+        <section className="inline-alert">
+          <h3>希望提出期間</h3>
+          <p>
+            status {matrixQuery.data.shift_request_period.status} / opens_at{" "}
+            {matrixQuery.data.shift_request_period.opens_at} / closes_at{" "}
+            {matrixQuery.data.shift_request_period.closes_at}
+          </p>
+          <p>
+            対象スタッフ数 {matrixQuery.data.shift_request_period.target_staff_count ?? 0} / draft件数{" "}
+            {matrixQuery.data.shift_request_period.draft_count ?? 0} / submitted件数{" "}
+            {matrixQuery.data.shift_request_period.submitted_count ?? 0} / returned件数{" "}
+            {matrixQuery.data.shift_request_period.returned_count ?? 0} / locked件数{" "}
+            {matrixQuery.data.shift_request_period.locked_count ?? 0} / 未作成件数{" "}
+            {matrixQuery.data.shift_request_period.not_created_count ?? 0} / 希望item件数{" "}
+            {matrixQuery.data.shift_request_period.item_count ?? 0}
+          </p>
+        </section>
+      ) : null}
       {matrixQuery.isError ? <p className="error">月間表の取得に失敗しました。</p> : null}
       {!activePlan ? <p className="subtle-text">拠点と年月を選び、月間表を開いてください。</p> : null}
       {activePlan && matrixQuery.isLoading ? <p>読み込み中...</p> : null}

@@ -901,6 +901,232 @@ class AttendanceCorrectionRequest(models.Model):
         return f"{self.attendance_record_id} / {self.status}"
 
 
+class AttendanceClosingPeriod(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "draft"
+        REVIEW = "review", "review"
+        CLOSED = "closed", "closed"
+        REOPENED = "reopened", "reopened"
+        ARCHIVED = "archived", "archived"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="attendance_closing_periods")
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField()
+    name = models.CharField(max_length=150)
+    description = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    content_hash = models.CharField(max_length=64, blank=True)
+    validation_fingerprint = models.CharField(max_length=64, blank=True)
+    closed_at = models.DateTimeField(null=True, blank=True)
+    closed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_closing_periods_closed",
+        null=True,
+        blank=True,
+    )
+    reopened_at = models.DateTimeField(null=True, blank=True)
+    reopened_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_closing_periods_reopened",
+        null=True,
+        blank=True,
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_closing_periods_created",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_closing_periods_updated",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["-year", "-month", "location__display_order", "created_at"]
+        indexes = [
+            models.Index(fields=["location", "year", "month"], name="att_close_period_lookup_idx"),
+            models.Index(fields=["status", "is_active"], name="att_close_period_status_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["location", "year", "month"],
+                condition=Q(is_active=True),
+                name="uniq_active_att_close_period",
+            ),
+            models.CheckConstraint(condition=Q(year__gte=2000) & Q(year__lte=2100), name="att_close_year_range"),
+            models.CheckConstraint(condition=Q(month__gte=1) & Q(month__lte=12), name="att_close_month_range"),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.location_id and not self.location.is_active:
+            errors["location"] = "Inactive locations cannot be assigned."
+        if self.year < 2000 or self.year > 2100:
+            errors["year"] = "year must be between 2000 and 2100."
+        if self.month < 1 or self.month > 12:
+            errors["month"] = "month must be between 1 and 12."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.location.short_name} / {self.year}-{self.month:02d} / {self.status}"
+
+
+class AttendanceClosingRecordSnapshot(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    closing_period = models.ForeignKey(
+        AttendanceClosingPeriod,
+        on_delete=models.CASCADE,
+        related_name="record_snapshots",
+    )
+    attendance_record = models.ForeignKey(
+        AttendanceRecord,
+        on_delete=models.PROTECT,
+        related_name="closing_snapshots",
+        null=True,
+        blank=True,
+    )
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="attendance_closing_snapshots")
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_closing_snapshots",
+    )
+    location_code_snapshot = models.CharField(max_length=50)
+    location_name_snapshot = models.CharField(max_length=150)
+    staff_display_name_snapshot = models.CharField(max_length=150)
+    employee_code_snapshot = models.CharField(max_length=50, blank=True)
+    work_date = models.DateField()
+    monthly_shift_plan = models.ForeignKey(
+        MonthlyShiftPlan,
+        on_delete=models.PROTECT,
+        related_name="attendance_closing_snapshots",
+        null=True,
+        blank=True,
+    )
+    monthly_shift_assignment = models.ForeignKey(
+        MonthlyShiftAssignment,
+        on_delete=models.PROTECT,
+        related_name="attendance_closing_snapshots",
+        null=True,
+        blank=True,
+    )
+    publication = models.ForeignKey(
+        MonthlyShiftPublication,
+        on_delete=models.PROTECT,
+        related_name="attendance_closing_snapshots",
+        null=True,
+        blank=True,
+    )
+    publication_assignment = models.ForeignKey(
+        MonthlyShiftPublicationAssignment,
+        on_delete=models.PROTECT,
+        related_name="attendance_closing_snapshots",
+        null=True,
+        blank=True,
+    )
+    status_snapshot = models.CharField(max_length=32)
+    source_snapshot = models.CharField(max_length=32)
+    scheduled_start_offset_minutes = models.IntegerField(null=True, blank=True)
+    scheduled_end_offset_minutes = models.IntegerField(null=True, blank=True)
+    scheduled_pattern_name_snapshot = models.CharField(max_length=150, blank=True)
+    scheduled_pattern_short_name_snapshot = models.CharField(max_length=100, blank=True)
+    actual_clock_in_at = models.DateTimeField(null=True, blank=True)
+    actual_clock_out_at = models.DateTimeField(null=True, blank=True)
+    actual_start_offset_minutes = models.IntegerField(null=True, blank=True)
+    actual_end_offset_minutes = models.IntegerField(null=True, blank=True)
+    break_minutes = models.PositiveIntegerField(default=0)
+    worked_minutes = models.PositiveIntegerField(default=0)
+    difference_start_minutes = models.IntegerField(null=True, blank=True)
+    difference_end_minutes = models.IntegerField(null=True, blank=True)
+    difference_worked_minutes = models.IntegerField(null=True, blank=True)
+    warning_count = models.PositiveIntegerField(default=0)
+    warnings = models.JSONField(default=list, blank=True)
+    manager_note_snapshot = models.TextField(blank=True)
+    staff_note_snapshot = models.TextField(blank=True)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    confirmed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_closing_snapshots_confirmed",
+        null=True,
+        blank=True,
+    )
+    confirmed_by_display_name_snapshot = models.CharField(max_length=150, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["work_date", "employee_code_snapshot", "created_at"]
+        indexes = [
+            models.Index(fields=["closing_period", "work_date"], name="att_close_snap_date_idx"),
+            models.Index(fields=["staff", "work_date"], name="att_close_snap_staff_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["closing_period", "staff", "work_date", "location"],
+                name="uniq_att_close_snapshot_day",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.closing_period_id} / {self.work_date} / {self.staff_id}"
+
+
+class AttendanceClosingStaffSummary(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    closing_period = models.ForeignKey(
+        AttendanceClosingPeriod,
+        on_delete=models.CASCADE,
+        related_name="staff_summaries",
+    )
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_closing_summaries",
+    )
+    staff_display_name_snapshot = models.CharField(max_length=150)
+    employee_code_snapshot = models.CharField(max_length=50, blank=True)
+    scheduled_days = models.PositiveIntegerField(default=0)
+    attendance_record_days = models.PositiveIntegerField(default=0)
+    worked_days = models.PositiveIntegerField(default=0)
+    unscheduled_work_days = models.PositiveIntegerField(default=0)
+    scheduled_minutes = models.PositiveIntegerField(default=0)
+    worked_minutes = models.PositiveIntegerField(default=0)
+    break_minutes = models.PositiveIntegerField(default=0)
+    late_count = models.PositiveIntegerField(default=0)
+    early_leave_count = models.PositiveIntegerField(default=0)
+    missing_clock_in_count = models.PositiveIntegerField(default=0)
+    missing_clock_out_count = models.PositiveIntegerField(default=0)
+    open_break_count = models.PositiveIntegerField(default=0)
+    warning_count = models.PositiveIntegerField(default=0)
+    confirmed_count = models.PositiveIntegerField(default=0)
+    unconfirmed_count = models.PositiveIntegerField(default=0)
+    pending_correction_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["employee_code_snapshot", "staff_display_name_snapshot", "created_at"]
+        indexes = [
+            models.Index(fields=["closing_period", "staff"], name="att_close_sum_staff_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["closing_period", "staff"],
+                name="uniq_att_close_staff_sum",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.closing_period_id} / {self.staff_id}"
+
+
 class ShiftChangeRequest(models.Model):
     class RequestType(models.TextChoices):
         DROP_SHIFT = "drop_shift", "drop_shift"

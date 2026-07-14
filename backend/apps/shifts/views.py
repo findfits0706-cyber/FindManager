@@ -1,8 +1,10 @@
 from datetime import date
 from uuid import UUID
 
-from django.db import transaction
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import IntegrityError, transaction
 from django.db.models import Count, Prefetch, Q
+from django.http import HttpResponse
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -12,6 +14,9 @@ from apps.accounts.models import User
 from apps.operations.models import StaffLocation
 
 from .models import (
+    AttendanceClosingPeriod,
+    AttendanceClosingRecordSnapshot,
+    AttendanceClosingStaffSummary,
     AttendanceCorrectionRequest,
     AttendanceEvent,
     AttendanceRecord,
@@ -31,6 +36,11 @@ from .models import (
 from .serializers import (
     AttendanceClockEventSerializer,
     AttendanceClockInSerializer,
+    AttendanceClosingCloseSerializer,
+    AttendanceClosingManagerNoteSerializer,
+    AttendanceClosingPeriodSerializer,
+    AttendanceClosingRecordSnapshotSerializer,
+    AttendanceClosingStaffSummarySerializer,
     AttendanceCorrectionRequestSerializer,
     AttendanceCorrectionSaveSerializer,
     AttendanceManagerNoteSerializer,
@@ -69,9 +79,12 @@ from .services import (
     apply_template_generation,
     approve_attendance_correction_request,
     approve_shift_change_request,
+    archive_attendance_period,
+    attendance_closing_period_metadata,
     attendance_correction_metadata,
     attendance_record_metadata,
     attendance_record_summary,
+    build_attendance_closing_preview,
     build_capability_lookup,
     build_publication_preview,
     can_manage_shifts,
@@ -79,6 +92,7 @@ from .services import (
     cancel_attendance_correction_request,
     cancel_shift_change_request,
     clock_in_attendance,
+    close_attendance_period,
     close_shift_change_request,
     confirm_attendance_record,
     confirm_monthly_shift_plan,
@@ -87,6 +101,8 @@ from .services import (
     duplicate_shift_pattern,
     duplicate_weekly_template,
     ensure_monthly_plan_editable,
+    export_attendance_closing_csv,
+    get_attendance_closed_period_lookup,
     get_attendance_lookup,
     get_or_create_shift_request_submission,
     get_shift_change_request_assignment_lookup,
@@ -105,6 +121,7 @@ from .services import (
     record_shift_event,
     reject_attendance_correction_request,
     reject_shift_change_request,
+    reopen_attendance_period,
     reopen_monthly_shift_plan,
     return_shift_request_submission,
     save_attendance_correction_request,
@@ -242,6 +259,40 @@ def attendance_correction_queryset():
         "cancelled_by",
         "applied_by",
     )
+
+
+def attendance_closing_period_queryset():
+    return AttendanceClosingPeriod.objects.select_related(
+        "location",
+        "closed_by",
+        "reopened_by",
+        "created_by",
+        "updated_by",
+    ).annotate(
+        snapshot_total=Count("record_snapshots", distinct=True),
+        staff_summary_total=Count("staff_summaries", distinct=True),
+    )
+
+
+def attendance_closing_snapshot_queryset():
+    return AttendanceClosingRecordSnapshot.objects.select_related(
+        "closing_period",
+        "location",
+        "staff",
+        "confirmed_by",
+    )
+
+
+def attendance_closing_staff_summary_queryset():
+    return AttendanceClosingStaffSummary.objects.select_related("closing_period", "staff")
+
+
+def drf_validation_from_django(exc):
+    if isinstance(exc, DjangoValidationError):
+        if hasattr(exc, "message_dict"):
+            return ValidationError(exc.message_dict)
+        return ValidationError({"non_field_errors": exc.messages})
+    return ValidationError({"non_field_errors": ["重複または不正なデータです。"]})
 
 
 def validate_change_request_date_range(params, *, max_days=92):
@@ -1623,6 +1674,306 @@ class AttendanceManagementPermission(permissions.BasePermission):
         return self.has_permission(request, view)
 
 
+class AttendanceClosingPermission(permissions.BasePermission):
+    readonly_actions = {"list", "retrieve", "preview", "snapshots", "staff_summaries", "export_csv"}
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if getattr(view, "action", None) in self.readonly_actions or request.method in permissions.SAFE_METHODS:
+            return can_view_shifts(request.user)
+        return can_manage_shifts(request.user)
+
+    def has_object_permission(self, request, view, obj):
+        return self.has_permission(request, view)
+
+
+class MyAttendanceMonthlyPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_authenticated)
+
+
+class AttendanceClosingPeriodViewSet(viewsets.ModelViewSet):
+    permission_classes = [AttendanceClosingPermission]
+    serializer_class = AttendanceClosingPeriodSerializer
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_queryset(self):
+        params = self.request.query_params
+        queryset = attendance_closing_period_queryset()
+        if params.get("location"):
+            queryset = queryset.filter(location_id=params["location"])
+        if params.get("year"):
+            queryset = queryset.filter(year=params["year"])
+        if params.get("month"):
+            queryset = queryset.filter(month=params["month"])
+        if params.get("status"):
+            queryset = queryset.filter(status=params["status"])
+        if params.get("is_active") == "true":
+            queryset = queryset.filter(is_active=True)
+        if params.get("is_active") == "false":
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("-year", "-month", "location__display_order", "created_at")
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                period = serializer.save()
+                record_shift_event(
+                    entity="attendance_closing_period",
+                    action="create",
+                    actor=request.user,
+                    request=request,
+                    metadata=attendance_closing_period_metadata(period),
+                )
+        except (DjangoValidationError, IntegrityError) as exc:
+            raise drf_validation_from_django(exc) from exc
+        return Response(self.get_serializer(attendance_closing_period_queryset().get(pk=period.pk)).data, status=201)
+
+    def partial_update(self, request, *args, **kwargs):
+        serializer = self.get_serializer(self.get_object(), data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                period = serializer.save()
+                record_shift_event(
+                    entity="attendance_closing_period",
+                    action="update",
+                    actor=request.user,
+                    request=request,
+                    metadata=attendance_closing_period_metadata(period),
+                )
+        except (DjangoValidationError, IntegrityError) as exc:
+            raise drf_validation_from_django(exc) from exc
+        return Response(self.get_serializer(attendance_closing_period_queryset().get(pk=period.pk)).data)
+
+    @action(detail=True, methods=["get", "post"])
+    def preview(self, request, pk=None):
+        period = self.get_object()
+        preview = build_attendance_closing_preview(period)
+        with transaction.atomic():
+            record_shift_event(
+                entity="attendance_closing_period",
+                action="preview",
+                actor=request.user,
+                request=request,
+                metadata=attendance_closing_period_metadata(period, preview),
+            )
+        return Response(preview)
+
+    @action(detail=True, methods=["post"])
+    def close(self, request, pk=None):
+        serializer = AttendanceClosingCloseSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            period, preview = close_attendance_period(
+                period=self.get_object(),
+                actor=request.user,
+                acknowledge_warnings=serializer.validated_data["acknowledge_warnings"],
+                validation_fingerprint=serializer.validated_data["validation_fingerprint"],
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="attendance_closing_period",
+                action="close",
+                actor=request.user,
+                request=request,
+                metadata=attendance_closing_period_metadata(period, preview),
+            )
+        return Response(self.get_serializer(attendance_closing_period_queryset().get(pk=period.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def reopen(self, request, pk=None):
+        serializer = AttendanceClosingManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            period = reopen_attendance_period(
+                period=self.get_object(),
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="attendance_closing_period",
+                action="reopen",
+                actor=request.user,
+                request=request,
+                metadata=attendance_closing_period_metadata(period),
+            )
+        return Response(self.get_serializer(attendance_closing_period_queryset().get(pk=period.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def archive(self, request, pk=None):
+        serializer = AttendanceClosingManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            period = archive_attendance_period(
+                period=self.get_object(),
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="attendance_closing_period",
+                action="archive",
+                actor=request.user,
+                request=request,
+                metadata=attendance_closing_period_metadata(period),
+            )
+        return Response(self.get_serializer(attendance_closing_period_queryset().get(pk=period.pk)).data)
+
+    @action(detail=True, methods=["get"], url_path="snapshots")
+    def snapshots(self, request, pk=None):
+        period = self.get_object()
+        queryset = (
+            attendance_closing_snapshot_queryset()
+            .filter(closing_period=period)
+            .order_by(
+                "work_date",
+                "employee_code_snapshot",
+            )
+        )
+        serializer = AttendanceClosingRecordSnapshotSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["get"], url_path="staff-summaries")
+    def staff_summaries(self, request, pk=None):
+        period = self.get_object()
+        queryset = (
+            attendance_closing_staff_summary_queryset()
+            .filter(closing_period=period)
+            .order_by(
+                "employee_code_snapshot",
+                "staff_display_name_snapshot",
+            )
+        )
+        serializer = AttendanceClosingStaffSummarySerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["get"], url_path="export-csv")
+    def export_csv(self, request, pk=None):
+        period = self.get_object()
+        with transaction.atomic():
+            data, filename, summary = export_attendance_closing_csv(period)
+            record_shift_event(
+                entity="attendance_closing_period",
+                action="export",
+                actor=request.user,
+                request=request,
+                metadata=attendance_closing_period_metadata(period)
+                | {
+                    "snapshot_count": summary.get("snapshot_count", 0),
+                    "warning_count": summary.get("warning_count", 0),
+                    "error_count": summary.get("error_count", 0),
+                },
+            )
+        response = HttpResponse(data, content_type="text/csv; charset=utf-8")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+
+class MyAttendanceMonthlyViewSet(viewsets.GenericViewSet):
+    permission_classes = [MyAttendanceMonthlyPermission]
+    http_method_names = ["get", "head", "options"]
+
+    def _validated_filters(self):
+        params = self.request.query_params
+        if "staff" in params:
+            raise ValidationError({"staff": "本人APIでは指定できません。"})
+        today = date.today()
+        try:
+            year = int(params.get("year", today.year))
+            month = int(params.get("month", today.month))
+        except ValueError as exc:
+            raise ValidationError({"year": "year/monthは数値で指定してください。"}) from exc
+        if month < 1 or month > 12:
+            raise ValidationError({"month": "1から12で指定してください。"})
+        return year, month, params.get("location"), params.get("status")
+
+    def _live_period(self, *, year: int, month: int, location_id: str | None):
+        if not location_id:
+            location_ids = StaffLocation.objects.filter(staff=self.request.user, is_active=True).values_list(
+                "location_id",
+                flat=True,
+            )
+            location_id = next(iter(location_ids), None)
+        if not location_id:
+            return None
+        from apps.operations.models import Location
+
+        location = Location.objects.filter(id=location_id, is_active=True).first()
+        if location is None:
+            return None
+        return AttendanceClosingPeriod(
+            location=location,
+            year=year,
+            month=month,
+            name=f"{location.short_name} {year}-{month:02d} 月次勤怠速報",
+            created_by=self.request.user,
+            updated_by=self.request.user,
+        )
+
+    def _own_live_payload(self, period: AttendanceClosingPeriod):
+        preview = build_attendance_closing_preview(period)
+        own_items = [item for item in preview["items"] if item["staff"] == str(self.request.user.id)]
+        own_summaries = [item for item in preview["staff_summaries"] if item["staff"] == str(self.request.user.id)]
+        return {
+            "period": str(period.id) if period.pk else None,
+            "location": str(period.location_id),
+            "location_name": period.location.name,
+            "year": period.year,
+            "month": period.month,
+            "status": period.status if period.pk else "live",
+            "is_closed": False,
+            "summary": own_summaries[0] if own_summaries else None,
+            "daily": own_items,
+            "warnings": [warning for item in own_items for warning in item["warnings"]],
+        }
+
+    def _own_closed_payload(self, period: AttendanceClosingPeriod):
+        summary = period.staff_summaries.filter(staff=self.request.user).first()
+        snapshots = list(period.record_snapshots.filter(staff=self.request.user).order_by("work_date"))
+        return {
+            "period": str(period.id),
+            "location": str(period.location_id),
+            "location_name": period.location.name,
+            "year": period.year,
+            "month": period.month,
+            "status": period.status,
+            "is_closed": period.status == AttendanceClosingPeriod.Status.CLOSED,
+            "summary": AttendanceClosingStaffSummarySerializer(summary).data if summary else None,
+            "daily": AttendanceClosingRecordSnapshotSerializer(snapshots, many=True).data,
+            "warnings": [warning for snapshot in snapshots for warning in snapshot.warnings],
+        }
+
+    def list(self, request, *args, **kwargs):
+        year, month, location_id, status_filter = self._validated_filters()
+        periods = attendance_closing_period_queryset().filter(year=year, month=month, is_active=True)
+        if location_id:
+            periods = periods.filter(location_id=location_id)
+        if status_filter:
+            periods = periods.filter(status=status_filter)
+        payload = []
+        for period in periods:
+            if period.status == AttendanceClosingPeriod.Status.CLOSED:
+                payload.append(self._own_closed_payload(period))
+            else:
+                payload.append(self._own_live_payload(period))
+        if not payload and (not status_filter or status_filter in {"live", "draft", "review", "reopened"}):
+            live_period = self._live_period(year=year, month=month, location_id=location_id)
+            if live_period is not None:
+                payload.append(self._own_live_payload(live_period))
+        return Response({"results": payload, "count": len(payload)})
+
+    def retrieve(self, request, pk=None):
+        if {"staff", "requester"}.intersection(request.query_params):
+            raise ValidationError({"staff": "本人APIでは指定できません。"})
+        period = attendance_closing_period_queryset().get(pk=pk)
+        if period.status == AttendanceClosingPeriod.Status.CLOSED:
+            return Response(self._own_closed_payload(period))
+        return Response(self._own_live_payload(period))
+
+
 class MyAttendanceViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [MyAttendancePermission]
     serializer_class = AttendanceRecordSerializer
@@ -1643,6 +1994,30 @@ class MyAttendanceViewSet(viewsets.ReadOnlyModelViewSet):
         if params.get("status"):
             queryset = queryset.filter(status=params["status"])
         return queryset.order_by("-work_date", "-created_at")
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        try:
+            date_from, date_to = validate_attendance_date_range(self.request.query_params)
+        except ValidationError:
+            return context
+        if date_from and date_to:
+            location_ids = (
+                {self.request.query_params["location"]}
+                if self.request.query_params.get("location")
+                else set(
+                    StaffLocation.objects.filter(staff=self.request.user, is_active=True).values_list(
+                        "location_id",
+                        flat=True,
+                    )
+                )
+            )
+            context["closed_period_lookup"] = get_attendance_closed_period_lookup(
+                location_ids=location_ids,
+                date_from=date_from,
+                date_to=date_to,
+            )
+        return context
 
     @action(detail=False, methods=["post"], url_path="clock-in")
     def clock_in(self, request):
@@ -1753,6 +2128,29 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
         if params.get("confirmed") == "false":
             queryset = queryset.exclude(status=AttendanceRecord.Status.CONFIRMED)
         return queryset.order_by("-work_date", "location__display_order", "staff__employee_code")
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        try:
+            date_from, date_to = validate_attendance_date_range(self.request.query_params)
+        except ValidationError:
+            return context
+        if date_from and date_to:
+            if self.request.query_params.get("location"):
+                location_ids = {self.request.query_params["location"]}
+            else:
+                location_ids = set(
+                    AttendanceRecord.objects.filter(work_date__gte=date_from, work_date__lte=date_to).values_list(
+                        "location_id",
+                        flat=True,
+                    )
+                )
+            context["closed_period_lookup"] = get_attendance_closed_period_lookup(
+                location_ids=location_ids,
+                date_from=date_from,
+                date_to=date_to,
+            )
+        return context
 
     @action(detail=True, methods=["post"], url_path="manual-adjust")
     def manual_adjust(self, request, pk=None):
@@ -2415,6 +2813,11 @@ class MyPublishedShiftViewSet(viewsets.GenericViewSet):
             date_to=date_to,
             publication_assignment_ids=[item.id for item in shifts],
         )["by_publication_assignment"]
+        closed_period_lookup = get_attendance_closed_period_lookup(
+            location_ids={item.publication.location_id for item in shifts},
+            date_from=date_from,
+            date_to=date_to,
+        )
         serializer = self.get_serializer(
             shifts,
             many=True,
@@ -2422,6 +2825,7 @@ class MyPublishedShiftViewSet(viewsets.GenericViewSet):
                 **self.get_serializer_context(),
                 "shift_change_request_lookup": change_request_lookup,
                 "attendance_lookup": attendance_lookup,
+                "closed_period_lookup": closed_period_lookup,
             },
         )
         return Response(

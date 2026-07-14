@@ -4,6 +4,9 @@ from apps.accounts.models import User
 from apps.operations.models import Location
 
 from .models import (
+    AttendanceClosingPeriod,
+    AttendanceClosingRecordSnapshot,
+    AttendanceClosingStaffSummary,
     AttendanceCorrectionRequest,
     AttendanceEvent,
     AttendanceRecord,
@@ -30,7 +33,9 @@ from .services import (
     can_manage_shifts,
     can_submit_shift_change_request,
     can_submit_shift_request_submission,
+    closed_period_from_lookup,
     count_shift_request_target_staff,
+    is_attendance_period_closed,
     save_monthly_assignment,
     save_monthly_plan,
     save_shift_pattern,
@@ -770,12 +775,16 @@ class MyPublishedShiftSerializer(MonthlyShiftPublicationAssignmentSerializer):
     publication = serializers.SerializerMethodField()
     shift_change_requests = serializers.SerializerMethodField()
     attendance = serializers.SerializerMethodField()
+    is_month_closed = serializers.SerializerMethodField()
+    closing_period = serializers.SerializerMethodField()
 
     class Meta(MonthlyShiftPublicationAssignmentSerializer.Meta):
         fields = MonthlyShiftPublicationAssignmentSerializer.Meta.fields + [
             "publication",
             "shift_change_requests",
             "attendance",
+            "is_month_closed",
+            "closing_period",
         ]
 
     def get_publication(self, obj):
@@ -797,7 +806,26 @@ class MyPublishedShiftSerializer(MonthlyShiftPublicationAssignmentSerializer):
 
     def get_attendance(self, obj):
         lookup = self.context.get("attendance_lookup", {})
-        return attendance_record_summary(lookup.get(str(obj.id)))
+        return attendance_record_summary(
+            lookup.get(str(obj.id)),
+            closed_period_lookup=self.context.get("closed_period_lookup"),
+        )
+
+    def _closed_period(self, obj):
+        return closed_period_from_lookup(
+            self.context.get("closed_period_lookup"),
+            location_id=obj.publication.location_id,
+            work_date=obj.work_date,
+        )
+
+    def get_is_month_closed(self, obj):
+        return self._closed_period(obj) is not None
+
+    def get_closing_period(self, obj):
+        period = self._closed_period(obj)
+        if period is None:
+            return None
+        return {"id": str(period.id), "name": period.name, "status": period.status}
 
 
 class ShiftChangeRequestSerializer(serializers.ModelSerializer):
@@ -963,6 +991,194 @@ class ShiftChangeRequestManagerNoteSerializer(serializers.Serializer):
     manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=True)
 
 
+class AttendanceClosingPeriodSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source="location.name", read_only=True)
+    location_code = serializers.CharField(source="location.code", read_only=True)
+    closed_by_display_name = serializers.CharField(source="closed_by.display_name", read_only=True)
+    reopened_by_display_name = serializers.CharField(source="reopened_by.display_name", read_only=True)
+    created_by_display_name = serializers.CharField(source="created_by.display_name", read_only=True)
+    updated_by_display_name = serializers.CharField(source="updated_by.display_name", read_only=True)
+    snapshot_count = serializers.SerializerMethodField()
+    staff_summary_count = serializers.SerializerMethodField()
+    name = serializers.CharField(required=False, allow_blank=True, trim_whitespace=True)
+
+    class Meta:
+        model = AttendanceClosingPeriod
+        fields = [
+            "id",
+            "location",
+            "location_name",
+            "location_code",
+            "year",
+            "month",
+            "name",
+            "description",
+            "status",
+            "content_hash",
+            "validation_fingerprint",
+            "closed_at",
+            "closed_by",
+            "closed_by_display_name",
+            "reopened_at",
+            "reopened_by",
+            "reopened_by_display_name",
+            "created_by",
+            "created_by_display_name",
+            "updated_by",
+            "updated_by_display_name",
+            "snapshot_count",
+            "staff_summary_count",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+        read_only_fields = [
+            "id",
+            "status",
+            "content_hash",
+            "validation_fingerprint",
+            "closed_at",
+            "closed_by",
+            "reopened_at",
+            "reopened_by",
+            "created_by",
+            "updated_by",
+            "snapshot_count",
+            "staff_summary_count",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+
+    def get_snapshot_count(self, obj):
+        if hasattr(obj, "snapshot_total"):
+            return obj.snapshot_total
+        return obj.record_snapshots.count()
+
+    def get_staff_summary_count(self, obj):
+        if hasattr(obj, "staff_summary_total"):
+            return obj.staff_summary_total
+        return obj.staff_summaries.count()
+
+    def validate(self, attrs):
+        if self.instance is not None:
+            if self.instance.status == AttendanceClosingPeriod.Status.ARCHIVED:
+                raise serializers.ValidationError({"status": "アーカイブ済みの月次締めは編集できません。"})
+            immutable_errors = {}
+            for field in ["location", "year", "month"]:
+                if field in attrs and attrs[field] != getattr(self.instance, field):
+                    immutable_errors[field] = "作成後は変更できません。"
+            if immutable_errors:
+                raise serializers.ValidationError(immutable_errors)
+        return attrs
+
+    def create(self, validated_data):
+        actor = self.context["request"].user
+        location = validated_data["location"]
+        year = validated_data["year"]
+        month = validated_data["month"]
+        if not validated_data.get("name"):
+            validated_data["name"] = f"{location.short_name} {year}-{month:02d} 月次勤怠締め"
+        period = AttendanceClosingPeriod(created_by=actor, updated_by=actor, **validated_data)
+        period.full_clean()
+        period.save()
+        return period
+
+    def update(self, instance, validated_data):
+        for field in ["name", "description"]:
+            if field in validated_data:
+                setattr(instance, field, validated_data[field])
+        instance.updated_by = self.context["request"].user
+        instance.full_clean()
+        instance.save()
+        return instance
+
+
+class AttendanceClosingRecordSnapshotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AttendanceClosingRecordSnapshot
+        fields = [
+            "id",
+            "closing_period",
+            "attendance_record",
+            "location",
+            "location_code_snapshot",
+            "location_name_snapshot",
+            "staff",
+            "staff_display_name_snapshot",
+            "employee_code_snapshot",
+            "work_date",
+            "monthly_shift_plan",
+            "monthly_shift_assignment",
+            "publication",
+            "publication_assignment",
+            "status_snapshot",
+            "source_snapshot",
+            "scheduled_start_offset_minutes",
+            "scheduled_end_offset_minutes",
+            "scheduled_pattern_name_snapshot",
+            "scheduled_pattern_short_name_snapshot",
+            "actual_clock_in_at",
+            "actual_clock_out_at",
+            "actual_start_offset_minutes",
+            "actual_end_offset_minutes",
+            "break_minutes",
+            "worked_minutes",
+            "difference_start_minutes",
+            "difference_end_minutes",
+            "difference_worked_minutes",
+            "warning_count",
+            "warnings",
+            "manager_note_snapshot",
+            "staff_note_snapshot",
+            "confirmed_at",
+            "confirmed_by",
+            "confirmed_by_display_name_snapshot",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class AttendanceClosingStaffSummarySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AttendanceClosingStaffSummary
+        fields = [
+            "id",
+            "closing_period",
+            "staff",
+            "staff_display_name_snapshot",
+            "employee_code_snapshot",
+            "scheduled_days",
+            "attendance_record_days",
+            "worked_days",
+            "unscheduled_work_days",
+            "scheduled_minutes",
+            "worked_minutes",
+            "break_minutes",
+            "late_count",
+            "early_leave_count",
+            "missing_clock_in_count",
+            "missing_clock_out_count",
+            "open_break_count",
+            "warning_count",
+            "confirmed_count",
+            "unconfirmed_count",
+            "pending_correction_count",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class AttendanceClosingCloseSerializer(serializers.Serializer):
+    acknowledge_warnings = serializers.BooleanField(default=False)
+    validation_fingerprint = serializers.CharField(max_length=64)
+    manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+
+
+class AttendanceClosingManagerNoteSerializer(serializers.Serializer):
+    manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+
+
 class AttendanceEventSerializer(serializers.ModelSerializer):
     actor_display_name = serializers.CharField(source="actor.display_name", read_only=True)
 
@@ -1094,6 +1310,9 @@ class AttendanceRecordSerializer(serializers.ModelSerializer):
     can_clock_out = serializers.SerializerMethodField()
     can_request_correction = serializers.SerializerMethodField()
     can_manage = serializers.SerializerMethodField()
+    is_month_closed = serializers.SerializerMethodField()
+    closing_period = serializers.SerializerMethodField()
+    closing_period_name = serializers.SerializerMethodField()
 
     class Meta:
         model = AttendanceRecord
@@ -1139,6 +1358,9 @@ class AttendanceRecordSerializer(serializers.ModelSerializer):
             "can_clock_out",
             "can_request_correction",
             "can_manage",
+            "is_month_closed",
+            "closing_period",
+            "closing_period_name",
             "created_at",
             "updated_at",
             "is_active",
@@ -1155,12 +1377,23 @@ class AttendanceRecordSerializer(serializers.ModelSerializer):
             self._cached_actor_can_manage = bool(actor and can_manage_shifts(actor))
         return self._cached_actor_can_manage
 
+    def _closed_period(self, obj):
+        lookup = self.context.get("closed_period_lookup")
+        if lookup is not None:
+            return closed_period_from_lookup(
+                lookup,
+                location_id=obj.location_id,
+                work_date=obj.work_date,
+            )
+        return is_attendance_period_closed(obj.location, obj.work_date)
+
     def _self_operable(self, obj):
         actor = self._actor()
         return bool(
             actor
             and obj.staff_id == actor.id
             and obj.is_active
+            and self._closed_period(obj) is None
             and obj.status
             not in {
                 AttendanceRecord.Status.CONFIRMED,
@@ -1184,7 +1417,18 @@ class AttendanceRecordSerializer(serializers.ModelSerializer):
         return self._self_operable(obj)
 
     def get_can_manage(self, obj):
-        return self._actor_can_manage()
+        return self._actor_can_manage() and self._closed_period(obj) is None
+
+    def get_is_month_closed(self, obj):
+        return self._closed_period(obj) is not None
+
+    def get_closing_period(self, obj):
+        period = self._closed_period(obj)
+        return str(period.id) if period else None
+
+    def get_closing_period_name(self, obj):
+        period = self._closed_period(obj)
+        return period.name if period else ""
 
 
 class AttendanceClockInSerializer(serializers.Serializer):

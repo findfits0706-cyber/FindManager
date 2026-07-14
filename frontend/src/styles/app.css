@@ -154,6 +154,19 @@ button:disabled {
   color: #136f63;
 }
 
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #e8f2f0;
+  color: #136f63;
+  font-size: 0.78rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
 .table {
   width: 100%;
   border-collapse: collapse;

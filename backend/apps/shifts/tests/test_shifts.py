@@ -19,6 +19,9 @@ from apps.operations.services import seed_operations
 
 from .. import views as shift_views
 from ..models import (
+    AttendanceClosingPeriod,
+    AttendanceClosingRecordSnapshot,
+    AttendanceClosingStaffSummary,
     AttendanceCorrectionRequest,
     AttendanceEvent,
     AttendanceRecord,
@@ -34,7 +37,12 @@ from ..models import (
     WeeklyShiftTemplate,
     WeeklyShiftTemplateEntry,
 )
-from ..services import build_monthly_plan_content_hash, build_publication_preview, seed_shifts
+from ..services import (
+    build_attendance_closing_preview,
+    build_monthly_plan_content_hash,
+    build_publication_preview,
+    seed_shifts,
+)
 
 TEST_SHIFT_VALID_FROM = date(2026, 1, 1)
 
@@ -1324,6 +1332,208 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         self.assertEqual(small.status_code, 200, small.data)
         self.assertEqual(large.status_code, 200, large.data)
         self.assertLessEqual(self.select_query_count(large_context) - self.select_query_count(small_context), 3)
+
+    def test_attendance_monthly_closing_preview_close_csv_lock_and_reopen(self):
+        plan = self.create_plan()
+        assignment = self.create_assignment_record(plan, work_date="2026-07-01", end_offset_minutes=600)
+        publication = self.publish_plan(plan)
+        snapshot = publication.assignments.get(source_assignment=assignment)
+        client = self.force_client(self.system_admin)
+
+        created = client.post(
+            "/api/v1/attendance-closing-periods/",
+            {
+                "location": str(self.location.id),
+                "year": 2026,
+                "month": 7,
+                "name": "2026年7月 月次勤怠締め",
+            },
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        period_id = created.data["id"]
+        self.assertEqual(created.data["status"], AttendanceClosingPeriod.Status.DRAFT)
+        duplicate = client.post(
+            "/api/v1/attendance-closing-periods/",
+            {"location": str(self.location.id), "year": 2026, "month": 7},
+            format="json",
+        )
+        self.assertEqual(duplicate.status_code, 400)
+
+        preview = self.force_client(self.supervisor).post(
+            f"/api/v1/attendance-closing-periods/{period_id}/preview/",
+            {},
+            format="json",
+        )
+        self.assertEqual(preview.status_code, 200, preview.data)
+        service_preview = build_attendance_closing_preview(AttendanceClosingPeriod.objects.get(id=period_id))
+        self.assertEqual(preview.data["content_hash"], service_preview["content_hash"])
+        self.assertGreater(preview.data["summary"]["warning_count"], 0)
+        self.assertTrue(
+            any(
+                warning["code"] == "scheduled_shift_without_record"
+                for item in preview.data["items"]
+                for warning in item["warnings"]
+            )
+        )
+
+        stale = client.post(
+            f"/api/v1/attendance-closing-periods/{period_id}/close/",
+            {"acknowledge_warnings": True, "validation_fingerprint": "bad"},
+            format="json",
+        )
+        self.assertEqual(stale.status_code, 400)
+        no_ack = client.post(
+            f"/api/v1/attendance-closing-periods/{period_id}/close/",
+            {"acknowledge_warnings": False, "validation_fingerprint": preview.data["validation_fingerprint"]},
+            format="json",
+        )
+        self.assertEqual(no_ack.status_code, 400)
+        closed = client.post(
+            f"/api/v1/attendance-closing-periods/{period_id}/close/",
+            {
+                "acknowledge_warnings": True,
+                "validation_fingerprint": preview.data["validation_fingerprint"],
+                "manager_note": "締めます。",
+            },
+            format="json",
+        )
+        self.assertEqual(closed.status_code, 200, closed.data)
+        self.assertEqual(closed.data["status"], AttendanceClosingPeriod.Status.CLOSED)
+        period = AttendanceClosingPeriod.objects.get(id=period_id)
+        self.assertEqual(period.record_snapshots.count(), preview.data["summary"]["snapshot_count"])
+        self.assertEqual(period.staff_summaries.count(), preview.data["summary"]["staff_summary_count"])
+        self.assertTrue(
+            AttendanceClosingRecordSnapshot.objects.filter(
+                closing_period=period,
+                publication_assignment=snapshot,
+                warning_count__gt=0,
+            ).exists()
+        )
+        self.assertTrue(AttendanceClosingStaffSummary.objects.filter(closing_period=period, staff=self.staff).exists())
+        self.assertTrue(AuditEvent.objects.filter(event_type="attendance_closing_period_closed").exists())
+
+        csv_response = client.get(f"/api/v1/attendance-closing-periods/{period_id}/export-csv/")
+        self.assertEqual(csv_response.status_code, 200)
+        self.assertEqual(csv_response["Content-Type"], "text/csv; charset=utf-8")
+        self.assertTrue(csv_response.content.startswith(b"\xef\xbb\xbf"))
+        self.assertIn("attendance_main_2026_07.csv", csv_response["Content-Disposition"])
+        self.assertTrue(AuditEvent.objects.filter(event_type="attendance_closing_period_exported").exists())
+
+        staff_client = self.force_client(self.staff)
+        my_monthly = staff_client.get(f"/api/v1/my-attendance-monthly/?year=2026&month=7&location={self.location.id}")
+        self.assertEqual(my_monthly.status_code, 200, my_monthly.data)
+        self.assertTrue(my_monthly.data["results"][0]["is_closed"])
+        self.assertEqual(str(my_monthly.data["results"][0]["summary"]["staff"]), str(self.staff.id))
+        self.assertEqual(staff_client.get("/api/v1/my-attendance-monthly/?staff=x").status_code, 400)
+        self.assertEqual(
+            self.force_client(self.viewer).get("/api/v1/my-attendance-monthly/?year=2026&month=7").status_code,
+            200,
+        )
+
+        my_published = staff_client.get("/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-07-01")
+        self.assertEqual(my_published.status_code, 200, my_published.data)
+        self.assertTrue(my_published.data["shifts"][0]["is_month_closed"])
+        locked_clock = staff_client.post(
+            "/api/v1/my-attendance/clock-in/",
+            {
+                "location": str(self.location.id),
+                "work_date": "2026-07-01",
+                "occurred_at": "2026-07-01T09:00:00+09:00",
+            },
+            format="json",
+        )
+        self.assertEqual(locked_clock.status_code, 400)
+
+        reopened = client.post(
+            f"/api/v1/attendance-closing-periods/{period_id}/reopen/",
+            {"manager_note": "打刻漏れ対応"},
+            format="json",
+        )
+        self.assertEqual(reopened.status_code, 200, reopened.data)
+        self.assertEqual(reopened.data["status"], AttendanceClosingPeriod.Status.REOPENED)
+        unlocked_clock = staff_client.post(
+            "/api/v1/my-attendance/clock-in/",
+            {
+                "location": str(self.location.id),
+                "work_date": "2026-07-01",
+                "occurred_at": "2026-07-01T09:00:00+09:00",
+            },
+            format="json",
+        )
+        self.assertEqual(unlocked_clock.status_code, 201, unlocked_clock.data)
+        archived = client.post(
+            f"/api/v1/attendance-closing-periods/{period_id}/archive/",
+            {"manager_note": "再作成します。"},
+            format="json",
+        )
+        self.assertEqual(archived.status_code, 200, archived.data)
+        self.assertFalse(AttendanceClosingPeriod.objects.get(id=period_id).is_active)
+
+    def test_attendance_monthly_closing_permissions_hash_and_query_counts(self):
+        client = self.force_client(self.system_admin)
+        small_plan = self.create_plan(month=7)
+        self.create_assignment_record(small_plan, work_date="2026-07-01")
+        small_period = AttendanceClosingPeriod.objects.create(
+            location=self.location,
+            year=2026,
+            month=7,
+            name="small",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        large_plan = self.create_plan(month=8)
+        large_staff = [self.create_user(f"closing_staff_{index}", ROLE_STAFF) for index in range(8)]
+        for staff in large_staff:
+            StaffLocation.objects.create(staff=staff, location=self.location, valid_from="2026-08-01")
+            for day in range(1, 6):
+                self.create_assignment_record(large_plan, staff=staff, work_date=f"2026-08-{day:02d}")
+        large_period = AttendanceClosingPeriod.objects.create(
+            location=self.location,
+            year=2026,
+            month=8,
+            name="large",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+
+        first = build_attendance_closing_preview(small_period)
+        second = build_attendance_closing_preview(small_period)
+        self.assertEqual(first["content_hash"], second["content_hash"])
+        self.assertEqual(first["validation_fingerprint"], second["validation_fingerprint"])
+        self.staff.employee_code = "CHANGED-CLOSING"
+        self.staff.save(update_fields=["employee_code", "updated_at"])
+        self.assertEqual(first["content_hash"], build_attendance_closing_preview(small_period)["content_hash"])
+
+        self.assertEqual(self.force_client(self.supervisor).get("/api/v1/attendance-closing-periods/").status_code, 200)
+        self.assertEqual(
+            self.force_client(self.supervisor)
+            .post(
+                "/api/v1/attendance-closing-periods/",
+                {"location": str(self.location.id), "year": 2026, "month": 9},
+                format="json",
+            )
+            .status_code,
+            403,
+        )
+        self.assertEqual(self.force_client(self.staff).get("/api/v1/attendance-closing-periods/").status_code, 403)
+
+        with CaptureQueriesContext(connection) as small_queries:
+            small_response = client.post(
+                f"/api/v1/attendance-closing-periods/{small_period.id}/preview/",
+                {},
+                format="json",
+            )
+        self.assertEqual(small_response.status_code, 200, small_response.data)
+        with CaptureQueriesContext(connection) as large_queries:
+            large_response = client.post(
+                f"/api/v1/attendance-closing-periods/{large_period.id}/preview/",
+                {},
+                format="json",
+            )
+        self.assertEqual(large_response.status_code, 200, large_response.data)
+        self.assertGreaterEqual(large_response.data["summary"]["snapshot_count"], 40)
+        self.assertLessEqual(self.select_query_count(large_queries) - self.select_query_count(small_queries), 4)
 
     def test_shift_change_request_my_api_manager_apply_and_matrix_badges(self):
         plan = self.create_plan()

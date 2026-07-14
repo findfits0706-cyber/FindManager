@@ -46,6 +46,7 @@ export function AppShell() {
           { to: "/shifts/monthly", label: "月間シフト" },
           { to: "/shifts/timeline", label: "日別・週別シフト" },
           { to: "/attendance", label: "勤怠管理" },
+          { to: "/attendance/monthly", label: "月次勤怠締め" },
           { to: "/attendance/corrections", label: "勤怠修正申請" },
           { to: "/shifts/change-requests", label: "シフト変更申請管理" },
           { to: "/shifts/request-periods", label: "希望提出管理" },
@@ -57,6 +58,7 @@ export function AppShell() {
       ? [
           { to: "/my/shift-requests", label: "希望提出" },
           { to: "/my/attendance", label: "自分の勤怠" },
+          { to: "/my/attendance-monthly", label: "自分の月次勤怠" },
           { to: "/my/shift-change-requests", label: "シフト変更申請" },
           { to: "/shifts/my-published", label: "自分のシフト" },
           { to: "/operations/my-staff-locations", label: "自分の所属" },

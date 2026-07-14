@@ -2,12 +2,14 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
+    AttendanceClosingPeriodViewSet,
     AttendanceCorrectionRequestViewSet,
     AttendanceRecordViewSet,
     MonthlyShiftAssignmentViewSet,
     MonthlyShiftPlanViewSet,
     MonthlyShiftPublicationViewSet,
     MyAttendanceCorrectionRequestViewSet,
+    MyAttendanceMonthlyViewSet,
     MyAttendanceViewSet,
     MyPublishedShiftViewSet,
     MyShiftChangeRequestViewSet,
@@ -29,12 +31,14 @@ router.register("shift-request-periods", ShiftRequestPeriodViewSet, basename="sh
 router.register("shift-request-submissions", ShiftRequestSubmissionViewSet, basename="shift-request-submission")
 router.register("shift-change-requests", ShiftChangeRequestViewSet, basename="shift-change-request")
 router.register("attendance-records", AttendanceRecordViewSet, basename="attendance-record")
+router.register("attendance-closing-periods", AttendanceClosingPeriodViewSet, basename="attendance-closing-period")
 router.register(
     "attendance-correction-requests",
     AttendanceCorrectionRequestViewSet,
     basename="attendance-correction-request",
 )
 router.register("my-attendance", MyAttendanceViewSet, basename="my-attendance")
+router.register("my-attendance-monthly", MyAttendanceMonthlyViewSet, basename="my-attendance-monthly")
 router.register(
     "my-attendance-corrections",
     MyAttendanceCorrectionRequestViewSet,

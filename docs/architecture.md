@@ -43,6 +43,7 @@
   - Shift request periods, submissions, and request items
   - Shift change requests for published shifts
   - Attendance records, immutable attendance events, and attendance correction requests
+  - Attendance closing periods, record snapshots, and staff monthly summaries
 
 ## Phase 2 Domain Rules
 
@@ -62,6 +63,7 @@
 - Shift pattern and weekly template pages
 - Monthly shift planning page
 - Daily/weekly shift timeline page
+- Monthly attendance closing page and self-service monthly attendance page
 
 ## Phase 3 Domain Rules
 
@@ -131,6 +133,18 @@
 - Correction requests move through draft, submitted, approved, rejected, cancelled, and applied. Applying a correction updates the attendance record and leaves an immutable event.
 - Confirmed attendance blocks staff clocking and staff correction requests until a manager unconfirms it.
 - Payroll, wage rates, statutory break enforcement, notifications, and external clocking integrations are intentionally outside the attendance foundation.
+
+## Attendance Monthly Closing
+
+- Attendance closing periods are unique for active location/year/month combinations.
+- Preview reads attendance records, attendance events, correction statuses, published shift snapshots, and fallback monthly shift assignments.
+- `content_hash` tracks the stable operational content used for closing. `validation_fingerprint` tracks the current warning/error set shown to the manager.
+- Closing requires the latest validation fingerprint. Errors block closing; warnings require explicit acknowledgement.
+- Closing stores `AttendanceClosingRecordSnapshot` rows for daily details and `AttendanceClosingStaffSummary` rows for per-staff totals.
+- Closed periods lock attendance mutations for the same location and work month, including clocking, manual adjustment, confirm/unconfirm, void, correction create, correction approval/rejection, and correction apply.
+- Reopening changes the period to `reopened` and unlocks the month. Existing snapshots remain as history and are recreated on the next close.
+- CSV export uses UTF-8 with BOM so Japanese headers and staff names open correctly in common spreadsheet tools.
+- Payroll calculation, wage rates, overtime/legal judgement, paid leave, PDF, Excel, notifications, and external integrations remain outside this phase.
 
 ## Quality Gates
 

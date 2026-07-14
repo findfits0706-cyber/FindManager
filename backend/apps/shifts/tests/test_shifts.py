@@ -23,6 +23,7 @@ from ..models import (
     MonthlyShiftPlan,
     MonthlyShiftPublication,
     MonthlyShiftSegment,
+    ShiftChangeRequest,
     ShiftPattern,
     ShiftPatternSegment,
     ShiftRequestPeriod,
@@ -943,6 +944,280 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
 
     def select_query_count(self, queries):
         return sum(1 for query in queries if query["sql"].lstrip().upper().startswith("SELECT"))
+
+    def test_shift_change_request_my_api_manager_apply_and_matrix_badges(self):
+        plan = self.create_plan()
+        assignment = self.create_assignment_record(plan, work_date="2026-07-01")
+        publication = self.publish_plan(plan)
+        snapshot = publication.assignments.get(source_assignment=assignment)
+        staff_client = self.force_client(self.staff)
+
+        created = staff_client.post(
+            "/api/v1/my-shift-change-requests/",
+            {
+                "publication_assignment": str(snapshot.id),
+                "request_type": "drop_shift",
+                "priority": "high",
+                "requested_staff": str(self.shift_manager.id),
+                "reason": "急用のため勤務が難しくなりました。",
+                "submit": True,
+            },
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        self.assertEqual(created.data["status"], ShiftChangeRequest.Status.SUBMITTED)
+        self.assertEqual(str(created.data["target_staff"]), str(self.staff.id))
+        self.assertEqual(str(created.data["requested_staff"]), str(self.shift_manager.id))
+
+        duplicate = staff_client.post(
+            "/api/v1/my-shift-change-requests/",
+            {
+                "publication_assignment": str(snapshot.id),
+                "request_type": "drop_shift",
+                "reason": "duplicate",
+                "submit": True,
+            },
+            format="json",
+        )
+        self.assertEqual(duplicate.status_code, 400)
+        self.assertEqual(
+            self.force_client(self.shift_manager)
+            .post(
+                "/api/v1/my-shift-change-requests/",
+                {
+                    "publication_assignment": str(snapshot.id),
+                    "request_type": "drop_shift",
+                    "reason": "other",
+                },
+                format="json",
+            )
+            .status_code,
+            400,
+        )
+        self.assertEqual(staff_client.get("/api/v1/my-shift-change-requests/?staff=x").status_code, 400)
+        self.assertEqual(
+            staff_client.get("/api/v1/my-shift-change-requests/?date_from=2026-01-01&date_to=2026-04-10").status_code,
+            400,
+        )
+        self.assertEqual(
+            staff_client.post(
+                "/api/v1/my-shift-change-requests/",
+                {
+                    "publication_assignment": str(snapshot.id),
+                    "request_type": "manager_adjustment",
+                    "reason": "not allowed",
+                },
+                format="json",
+            ).status_code,
+            400,
+        )
+
+        my_published = staff_client.get("/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-07-01")
+        self.assertEqual(my_published.status_code, 200, my_published.data)
+        self.assertEqual(my_published.data["shifts"][0]["shift_change_requests"][0]["status"], "submitted")
+
+        matrix = self.force_client(self.supervisor).get(f"/api/v1/monthly-shift-plans/{plan.id}/matrix/")
+        self.assertEqual(matrix.status_code, 200, matrix.data)
+        row = next(item for item in matrix.data["rows"] if item["staff"] == str(self.staff.id))
+        self.assertEqual(row["assignments"]["2026-07-01"]["shift_change_requests"][0]["request_type"], "drop_shift")
+        self.assertEqual(matrix.data["shift_change_request_summary"]["open_count"], 1)
+
+        admin = self.force_client(self.system_admin)
+        self.assertEqual(admin.get("/api/v1/shift-change-requests/").status_code, 200)
+        self.assertEqual(self.force_client(self.supervisor).get("/api/v1/shift-change-requests/").status_code, 200)
+        self.assertEqual(
+            self.force_client(self.supervisor)
+            .post(f"/api/v1/shift-change-requests/{created.data['id']}/approve/", {}, format="json")
+            .status_code,
+            403,
+        )
+        self.assertEqual(self.force_client(self.staff).get("/api/v1/shift-change-requests/").status_code, 403)
+        self.assertEqual(
+            admin.post(
+                f"/api/v1/shift-change-requests/{created.data['id']}/approve/",
+                {"manager_note": "代行者ありで承認します。"},
+                format="json",
+            ).status_code,
+            200,
+        )
+        applied = admin.post(
+            f"/api/v1/shift-change-requests/{created.data['id']}/apply/",
+            {"manager_note": "月間シフトへ反映しました。"},
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 200, applied.data)
+        self.assertEqual(applied.data["status"], ShiftChangeRequest.Status.APPLIED)
+        assignment.refresh_from_db()
+        publication.refresh_from_db()
+        plan.refresh_from_db()
+        self.assertEqual(assignment.staff_id, self.shift_manager.id)
+        self.assertFalse(publication.is_active)
+        self.assertEqual(plan.workflow_status, MonthlyShiftPlan.WorkflowStatus.CONFIRMED)
+        self.assertTrue(AuditEvent.objects.filter(event_type="shift_change_request_applied").exists())
+
+    def test_shift_change_request_apply_variants_and_audit_rollback(self):
+        admin = self.force_client(self.system_admin)
+        staff_client = self.force_client(self.staff)
+
+        def post_action(request_id, action):
+            return admin.post(f"/api/v1/shift-change-requests/{request_id}/{action}/", {}, format="json")
+
+        drop_plan = self.create_plan(month=8)
+        drop_assignment = self.create_assignment_record(drop_plan, work_date="2026-08-01")
+        drop_publication = self.publish_plan(drop_plan)
+        drop_snapshot = drop_publication.assignments.get(source_assignment=drop_assignment)
+        drop_request = staff_client.post(
+            "/api/v1/my-shift-change-requests/",
+            {
+                "publication_assignment": str(drop_snapshot.id),
+                "request_type": "drop_shift",
+                "reason": "勤務を外れたいです。",
+                "submit": True,
+            },
+            format="json",
+        )
+        self.assertEqual(drop_request.status_code, 201, drop_request.data)
+        self.assertEqual(post_action(drop_request.data["id"], "approve").status_code, 200)
+        self.assertEqual(post_action(drop_request.data["id"], "apply").status_code, 200)
+        drop_assignment.refresh_from_db()
+        self.assertFalse(drop_assignment.is_active)
+
+        cover_plan = self.create_plan(month=9)
+        cover_assignment = self.create_assignment_record(cover_plan, work_date="2026-09-01")
+        cover_publication = self.publish_plan(cover_plan)
+        cover_snapshot = cover_publication.assignments.get(source_assignment=cover_assignment)
+        cover_request = staff_client.post(
+            "/api/v1/my-shift-change-requests/",
+            {
+                "publication_assignment": str(cover_snapshot.id),
+                "request_type": "cover_request",
+                "reason": "代行者未定です。",
+                "submit": True,
+            },
+            format="json",
+        )
+        self.assertEqual(cover_request.status_code, 201, cover_request.data)
+        self.assertEqual(post_action(cover_request.data["id"], "approve").status_code, 200)
+        self.assertEqual(post_action(cover_request.data["id"], "apply").status_code, 400)
+
+        time_plan = self.create_plan(month=10)
+        time_assignment = self.create_assignment_record(time_plan, work_date="2026-10-01")
+        time_publication = self.publish_plan(time_plan)
+        time_snapshot = time_publication.assignments.get(source_assignment=time_assignment)
+        time_request = staff_client.post(
+            "/api/v1/my-shift-change-requests/",
+            {
+                "publication_assignment": str(time_snapshot.id),
+                "request_type": "change_time",
+                "requested_start_offset_minutes": 600,
+                "requested_end_offset_minutes": 900,
+                "reason": "開始を遅らせたいです。",
+                "submit": True,
+            },
+            format="json",
+        )
+        self.assertEqual(time_request.status_code, 201, time_request.data)
+        self.assertEqual(post_action(time_request.data["id"], "approve").status_code, 200)
+        self.assertEqual(post_action(time_request.data["id"], "apply").status_code, 200)
+        time_segment = time_assignment.segments.get(is_active=True)
+        self.assertEqual(time_segment.start_offset_minutes, 600)
+        self.assertEqual(time_segment.end_offset_minutes, 900)
+
+        note_plan = self.create_plan(month=11)
+        note_assignment = self.create_assignment_record(note_plan, work_date="2026-11-01")
+        note_publication = self.publish_plan(note_plan)
+        note_snapshot = note_publication.assignments.get(source_assignment=note_assignment)
+        note_request = staff_client.post(
+            "/api/v1/my-shift-change-requests/",
+            {
+                "publication_assignment": str(note_snapshot.id),
+                "request_type": "note",
+                "reason": "相談です。",
+                "submit": True,
+            },
+            format="json",
+        )
+        self.assertEqual(note_request.status_code, 201, note_request.data)
+        self.assertEqual(post_action(note_request.data["id"], "apply").status_code, 400)
+        closed = admin.post(
+            f"/api/v1/shift-change-requests/{note_request.data['id']}/close/",
+            {"manager_note": "確認済みです。"},
+            format="json",
+        )
+        self.assertEqual(closed.status_code, 200, closed.data)
+        self.assertEqual(closed.data["status"], ShiftChangeRequest.Status.CLOSED)
+
+        rollback_plan = self.create_plan(month=12)
+        rollback_assignment = self.create_assignment_record(rollback_plan, work_date="2026-12-01")
+        rollback_publication = self.publish_plan(rollback_plan)
+        rollback_snapshot = rollback_publication.assignments.get(source_assignment=rollback_assignment)
+        rollback_request = staff_client.post(
+            "/api/v1/my-shift-change-requests/",
+            {
+                "publication_assignment": str(rollback_snapshot.id),
+                "request_type": "drop_shift",
+                "requested_staff": str(self.shift_manager.id),
+                "reason": "rollback",
+                "submit": True,
+            },
+            format="json",
+        )
+        self.assertEqual(rollback_request.status_code, 201, rollback_request.data)
+        admin.raise_request_exception = False
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = admin.post(
+                f"/api/v1/shift-change-requests/{rollback_request.data['id']}/approve/",
+                {},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 500)
+        change_request = ShiftChangeRequest.objects.get(id=rollback_request.data["id"])
+        self.assertEqual(change_request.status, ShiftChangeRequest.Status.SUBMITTED)
+
+    def test_shift_change_request_list_query_counts_are_bounded(self):
+        client = self.force_client(self.system_admin)
+        small_plan = self.create_plan(month=7)
+        small_assignment = self.create_assignment_record(small_plan, work_date="2026-07-01")
+        small_publication = self.publish_plan(small_plan)
+        small_snapshot = small_publication.assignments.get(source_assignment=small_assignment)
+        ShiftChangeRequest.objects.create(
+            location=self.location,
+            monthly_shift_plan=small_plan,
+            publication=small_publication,
+            publication_assignment=small_snapshot,
+            requester=self.staff,
+            target_staff=self.staff,
+            request_type=ShiftChangeRequest.RequestType.DROP_SHIFT,
+            status=ShiftChangeRequest.Status.SUBMITTED,
+            work_date=small_snapshot.work_date,
+            reason="small",
+        )
+
+        large_plan = self.create_plan(month=8)
+        for day in range(1, 29):
+            self.create_assignment_record(large_plan, work_date=f"2026-08-{day:02d}", staff=self.staff)
+        large_publication = self.publish_plan(large_plan)
+        for snapshot in large_publication.assignments.all():
+            ShiftChangeRequest.objects.create(
+                location=self.location,
+                monthly_shift_plan=large_plan,
+                publication=large_publication,
+                publication_assignment=snapshot,
+                requester=self.staff,
+                target_staff=self.staff,
+                request_type=ShiftChangeRequest.RequestType.DROP_SHIFT,
+                status=ShiftChangeRequest.Status.SUBMITTED,
+                work_date=snapshot.work_date,
+                reason="large",
+            )
+
+        with CaptureQueriesContext(connection) as small_queries:
+            small = client.get("/api/v1/shift-change-requests/?date_from=2026-07-01&date_to=2026-07-31")
+        self.assertEqual(small.status_code, 200, small.data)
+        with CaptureQueriesContext(connection) as large_queries:
+            large = client.get("/api/v1/shift-change-requests/?date_from=2026-08-01&date_to=2026-08-31")
+        self.assertEqual(large.status_code, 200, large.data)
+        self.assertLessEqual(self.select_query_count(large_queries) - self.select_query_count(small_queries), 3)
 
     def test_timeline_parameter_validation_and_permissions(self):
         plan = self.create_plan()

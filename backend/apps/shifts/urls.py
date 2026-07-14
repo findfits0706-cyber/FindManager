@@ -6,7 +6,9 @@ from .views import (
     MonthlyShiftPlanViewSet,
     MonthlyShiftPublicationViewSet,
     MyPublishedShiftViewSet,
+    MyShiftChangeRequestViewSet,
     MyShiftRequestPeriodViewSet,
+    ShiftChangeRequestViewSet,
     ShiftPatternViewSet,
     ShiftRequestPeriodViewSet,
     ShiftRequestSubmissionViewSet,
@@ -21,7 +23,9 @@ router.register("monthly-shift-assignments", MonthlyShiftAssignmentViewSet, base
 router.register("monthly-shift-publications", MonthlyShiftPublicationViewSet, basename="monthly-shift-publication")
 router.register("shift-request-periods", ShiftRequestPeriodViewSet, basename="shift-request-period")
 router.register("shift-request-submissions", ShiftRequestSubmissionViewSet, basename="shift-request-submission")
+router.register("shift-change-requests", ShiftChangeRequestViewSet, basename="shift-change-request")
 router.register("my-shift-request-periods", MyShiftRequestPeriodViewSet, basename="my-shift-request-period")
+router.register("my-shift-change-requests", MyShiftChangeRequestViewSet, basename="my-shift-change-request")
 router.register("my-published-shifts", MyPublishedShiftViewSet, basename="my-published-shift")
 
 urlpatterns = [

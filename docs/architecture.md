@@ -41,6 +41,7 @@
   - Monthly shift segments
   - Monthly shift publications and staff self-service snapshots
   - Shift request periods, submissions, and request items
+  - Shift change requests for published shifts
 
 ## Phase 2 Domain Rules
 
@@ -107,6 +108,16 @@
 - Managers review request periods and submissions through `/api/v1/shift-request-periods/` and `/api/v1/shift-request-submissions/`.
 - Returned submissions can be edited and resubmitted while the period is open; submitted and locked submissions are read-only to staff.
 - Submitted and locked request items are used as warnings during monthly assignment validation, monthly matrix display, and template generation preview. Requests are advisory and do not block shift creation.
+
+## Shift Change Requests
+
+- Published shift change requests are stored as `ShiftChangeRequest` rows linked to a `MonthlyShiftPublicationAssignment`.
+- Staff self-service uses `/api/v1/my-shift-change-requests/` and always scopes records to `request.user`.
+- Management review uses `/api/v1/shift-change-requests/`; `system_admin` and `shift_manager` can operate, while `supervisor` is read-only.
+- Open request statuses are `draft`, `submitted`, and `approved`; terminal statuses are `rejected`, `cancelled`, `applied`, and `closed`.
+- Applying an approved request changes the monthly plan row, never the publication snapshot.
+- After apply, the active publication is withdrawn and the plan returns to `confirmed`, so publication preview and republishing are required.
+- Monthly matrix and my published shift responses include change request summaries without per-row follow-up queries.
 
 ## Quality Gates
 

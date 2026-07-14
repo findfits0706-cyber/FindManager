@@ -201,6 +201,7 @@ export type MonthlyMatrixAssignment = {
   warning_count: number;
   issues?: Array<{ severity: "info" | "warning" | "error"; code: string; message: string }>;
   shift_requests?: ShiftRequestItem[];
+  shift_change_requests?: ShiftChangeRequestSummary[];
 };
 
 export type MonthlyMatrixInactiveAssignment = {
@@ -211,6 +212,11 @@ export type MonthlyMatrixInactiveAssignment = {
 export type MonthlyShiftMatrix = {
   plan: Pick<MonthlyShiftPlan, "id" | "location" | "year" | "month" | "name"> & { location_name: string };
   shift_request_period: ShiftRequestPeriod | null;
+  shift_change_request_summary?: {
+    open_count: number;
+    applied_count: number;
+    needs_republish: boolean;
+  };
   dates: Array<{
     date: string;
     day: number;
@@ -432,6 +438,7 @@ export type MyPublishedShift = {
   work_minutes: number;
   break_minutes: number;
   segments: MonthlyShiftPublicationSegment[];
+  shift_change_requests: ShiftChangeRequestSummary[];
   publication: {
     id: string;
     version: number;
@@ -457,6 +464,73 @@ export type MyPublishedShiftsResponse = {
     is_sunday: boolean;
   }>;
   shifts: MyPublishedShift[];
+};
+
+export type ShiftChangeRequestSummary = {
+  id: string;
+  request_type: ShiftChangeRequest["request_type"];
+  status: ShiftChangeRequest["status"];
+  priority: ShiftChangeRequest["priority"];
+  requested_staff: string | null;
+  requested_staff_display_name: string;
+  requested_work_date: string | null;
+  requested_start_offset_minutes: number | null;
+  requested_end_offset_minutes: number | null;
+  reason: string;
+  manager_note: string;
+  applied_at: string | null;
+};
+
+export type ShiftChangeRequest = {
+  id: string;
+  location: string;
+  location_name: string;
+  monthly_shift_plan: string;
+  publication: string;
+  publication_version: number;
+  publication_assignment: string | null;
+  requester: string;
+  requester_display_name: string;
+  target_staff: string;
+  target_staff_display_name: string;
+  requested_staff: string | null;
+  requested_staff_display_name: string;
+  request_type:
+    | "drop_shift"
+    | "swap_shift"
+    | "cover_request"
+    | "change_time"
+    | "change_assignment"
+    | "manager_adjustment"
+    | "note";
+  status: "draft" | "submitted" | "approved" | "rejected" | "cancelled" | "applied" | "closed";
+  priority: "high" | "normal" | "low";
+  work_date: string;
+  original_start_offset_minutes: number | null;
+  original_end_offset_minutes: number | null;
+  original_pattern_name_snapshot: string;
+  original_pattern_short_name_snapshot: string;
+  requested_work_date: string | null;
+  requested_shift_pattern: string | null;
+  requested_shift_pattern_name: string;
+  requested_start_offset_minutes: number | null;
+  requested_end_offset_minutes: number | null;
+  requested_notes: string;
+  reason: string;
+  manager_note: string;
+  submitted_at: string | null;
+  approved_at: string | null;
+  rejected_at: string | null;
+  cancelled_at: string | null;
+  applied_at: string | null;
+  can_edit: boolean;
+  can_submit: boolean;
+  can_cancel: boolean;
+  can_approve: boolean;
+  can_apply: boolean;
+  created_at: string;
+  updated_at: string;
+  is_active: boolean;
 };
 
 export type ShiftRequestPeriod = {

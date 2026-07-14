@@ -7,6 +7,7 @@ import { ForbiddenPage } from "./pages/ForbiddenPage";
 import { LoginPage } from "./pages/LoginPage";
 import { MyCapabilitiesPage } from "./pages/MyCapabilitiesPage";
 import { MyPublishedShiftsPage } from "./pages/MyPublishedShiftsPage";
+import { MyShiftChangeRequestsPage } from "./pages/MyShiftChangeRequestsPage";
 import { MyShiftRequestsPage } from "./pages/MyShiftRequestsPage";
 import { NotFoundPage } from "./pages/NotFoundPage";
 import { OperationsMasterPage } from "./pages/OperationsMasterPage";
@@ -16,6 +17,7 @@ import { StaffListPage } from "./pages/StaffListPage";
 import { MonthlyShiftsPage } from "./pages/MonthlyShiftsPage";
 import { ShiftTimelinePage } from "./pages/ShiftTimelinePage";
 import { ShiftPatternsPage } from "./pages/ShiftPatternsPage";
+import { ShiftChangeRequestsPage } from "./pages/ShiftChangeRequestsPage";
 import { ShiftRequestPeriodsPage } from "./pages/ShiftRequestPeriodsPage";
 import { WeeklyTemplatesPage } from "./pages/WeeklyTemplatesPage";
 
@@ -54,9 +56,11 @@ export function App() {
           <Route path="operations/my-staff-locations" element={<MyCapabilitiesPage section="locations" />} />
           <Route path="operations/my-capabilities" element={<MyCapabilitiesPage />} />
           <Route path="my/shift-requests" element={<MyShiftRequestsPage />} />
+          <Route path="my/shift-change-requests" element={<MyShiftChangeRequestsPage />} />
           <Route path="shifts/my-published" element={<MyPublishedShiftsPage />} />
           <Route path="shifts/monthly" element={<MonthlyShiftsPage />} />
           <Route path="shifts/timeline" element={<ShiftTimelinePage />} />
+          <Route path="shifts/change-requests" element={<ShiftChangeRequestsPage />} />
           <Route path="shifts/request-periods" element={<ShiftRequestPeriodsPage />} />
           <Route path="shifts/patterns" element={<ShiftPatternsPage />} />
           <Route path="shifts/templates" element={<WeeklyTemplatesPage />} />

@@ -22,6 +22,7 @@ from .models import (
     MonthlyShiftPublicationAssignment,
     MonthlyShiftPublicationSegment,
     MonthlyShiftSegment,
+    ShiftChangeRequest,
     ShiftPattern,
     ShiftPatternSegment,
     ShiftRequestItem,
@@ -114,6 +115,16 @@ EVENT_MAP = {
         "return": "shift_request_submission_returned",
         "lock": "shift_request_submission_locked",
         "unlock": "shift_request_submission_unlocked",
+    },
+    "shift_change_request": {
+        "create": "shift_change_request_created",
+        "update": "shift_change_request_updated",
+        "submit": "shift_change_request_submitted",
+        "cancel": "shift_change_request_cancelled",
+        "approve": "shift_change_request_approved",
+        "reject": "shift_change_request_rejected",
+        "apply": "shift_change_request_applied",
+        "close": "shift_change_request_closed",
     },
 }
 
@@ -1197,6 +1208,690 @@ def unlock_shift_request_submission(*, submission: ShiftRequestSubmission, actor
     submission.status = ShiftRequestSubmission.Status.RETURNED
     submission.save(update_fields=["status", "updated_at"])
     return submission
+
+
+SHIFT_CHANGE_OPEN_STATUSES = {
+    ShiftChangeRequest.Status.DRAFT,
+    ShiftChangeRequest.Status.SUBMITTED,
+    ShiftChangeRequest.Status.APPROVED,
+}
+SHIFT_CHANGE_TERMINAL_STATUSES = {
+    ShiftChangeRequest.Status.REJECTED,
+    ShiftChangeRequest.Status.CANCELLED,
+    ShiftChangeRequest.Status.APPLIED,
+    ShiftChangeRequest.Status.CLOSED,
+}
+
+
+def shift_change_request_metadata(change_request: ShiftChangeRequest, *, reason: str = "") -> dict:
+    data = {
+        "change_request_id": str(change_request.id),
+        "request_type": change_request.request_type,
+        "status": change_request.status,
+        "location_id": str(change_request.location_id),
+        "plan_id": str(change_request.monthly_shift_plan_id),
+        "publication_id": str(change_request.publication_id),
+        "publication_assignment_id": (
+            str(change_request.publication_assignment_id) if change_request.publication_assignment_id else None
+        ),
+        "requester_id": str(change_request.requester_id),
+        "target_staff_id": str(change_request.target_staff_id),
+        "requested_staff_id": str(change_request.requested_staff_id) if change_request.requested_staff_id else None,
+        "work_date": change_request.work_date.isoformat(),
+    }
+    if reason:
+        data["reason"] = reason
+    return data
+
+
+def can_edit_shift_change_request(change_request: ShiftChangeRequest, *, actor: User | None = None) -> bool:
+    if change_request.status != ShiftChangeRequest.Status.DRAFT:
+        return False
+    if actor is None:
+        return True
+    return change_request.requester_id == actor.id
+
+
+def can_submit_shift_change_request(change_request: ShiftChangeRequest, *, actor: User | None = None) -> bool:
+    if change_request.status != ShiftChangeRequest.Status.DRAFT:
+        return False
+    if actor is None:
+        return True
+    return change_request.requester_id == actor.id
+
+
+def can_cancel_shift_change_request(
+    change_request: ShiftChangeRequest, *, actor: User | None = None, manager: bool = False
+) -> bool:
+    if manager:
+        return change_request.status in SHIFT_CHANGE_OPEN_STATUSES
+    if actor is None or change_request.requester_id != actor.id:
+        return False
+    return change_request.status in {ShiftChangeRequest.Status.DRAFT, ShiftChangeRequest.Status.SUBMITTED}
+
+
+def can_approve_shift_change_request(change_request: ShiftChangeRequest, *, actor: User | None = None) -> bool:
+    return (
+        actor is not None and can_manage_shifts(actor) and change_request.status == ShiftChangeRequest.Status.SUBMITTED
+    )
+
+
+def can_apply_shift_change_request(change_request: ShiftChangeRequest, *, actor: User | None = None) -> bool:
+    return (
+        actor is not None
+        and can_manage_shifts(actor)
+        and change_request.status == ShiftChangeRequest.Status.APPROVED
+        and change_request.request_type != ShiftChangeRequest.RequestType.NOTE
+    )
+
+
+def shift_change_requests_for_display(change_requests: list[ShiftChangeRequest]) -> list[dict]:
+    return [
+        {
+            "id": str(item.id),
+            "request_type": item.request_type,
+            "status": item.status,
+            "priority": item.priority,
+            "requested_staff": str(item.requested_staff_id) if item.requested_staff_id else None,
+            "requested_staff_display_name": item.requested_staff.display_name if item.requested_staff_id else "",
+            "requested_work_date": item.requested_work_date.isoformat() if item.requested_work_date else None,
+            "requested_start_offset_minutes": item.requested_start_offset_minutes,
+            "requested_end_offset_minutes": item.requested_end_offset_minutes,
+            "reason": item.reason,
+            "manager_note": item.manager_note,
+            "applied_at": item.applied_at,
+        }
+        for item in change_requests
+    ]
+
+
+def get_shift_change_request_lookup(
+    plan: MonthlyShiftPlan,
+    staff_ids: set,
+) -> dict[tuple[str, str], list[ShiftChangeRequest]]:
+    if not staff_ids:
+        return {}
+    requests = (
+        ShiftChangeRequest.objects.filter(
+            monthly_shift_plan=plan,
+            target_staff_id__in=staff_ids,
+            is_active=True,
+            status__in=[
+                ShiftChangeRequest.Status.DRAFT,
+                ShiftChangeRequest.Status.SUBMITTED,
+                ShiftChangeRequest.Status.APPROVED,
+                ShiftChangeRequest.Status.APPLIED,
+            ],
+        )
+        .select_related("requested_staff", "requester", "target_staff", "publication_assignment")
+        .order_by("work_date", "created_at")
+    )
+    result: dict[tuple[str, str], list[ShiftChangeRequest]] = {}
+    for item in requests:
+        result.setdefault((str(item.target_staff_id), item.work_date.isoformat()), []).append(item)
+    return result
+
+
+def get_shift_change_request_assignment_lookup(
+    publication_assignment_ids: list,
+) -> dict[str, list[ShiftChangeRequest]]:
+    if not publication_assignment_ids:
+        return {}
+    requests = (
+        ShiftChangeRequest.objects.filter(
+            publication_assignment_id__in=publication_assignment_ids,
+            is_active=True,
+            status__in=SHIFT_CHANGE_OPEN_STATUSES,
+        )
+        .select_related("requested_staff", "requester", "target_staff")
+        .order_by("created_at")
+    )
+    result: dict[str, list[ShiftChangeRequest]] = {}
+    for item in requests:
+        result.setdefault(str(item.publication_assignment_id), []).append(item)
+    return result
+
+
+def shift_change_request_summary(plan: MonthlyShiftPlan) -> dict:
+    requests = ShiftChangeRequest.objects.filter(monthly_shift_plan=plan, is_active=True)
+    return {
+        "open_count": requests.filter(status__in=SHIFT_CHANGE_OPEN_STATUSES).count(),
+        "applied_count": requests.filter(status=ShiftChangeRequest.Status.APPLIED).count(),
+        "needs_republish": requests.filter(status=ShiftChangeRequest.Status.APPLIED).exists()
+        and not plan.publications.filter(is_active=True).exists(),
+    }
+
+
+def _ensure_active_publication_assignment(publication_assignment: MonthlyShiftPublicationAssignment):
+    publication = publication_assignment.publication
+    if not publication.is_active or publication.withdrawn_at is not None:
+        raise DRFValidationError({"publication_assignment": "公開中の勤務のみ変更申請できます。"})
+
+
+def _ensure_staff_location(staff: User, location: Location, work_date: date, *, field: str):
+    if not staff.is_login_allowed():
+        raise DRFValidationError({field: "有効なスタッフを指定してください。"})
+    exists = (
+        StaffLocation.objects.filter(
+            staff=staff,
+            location=location,
+            is_active=True,
+            staff__is_active=True,
+            location__is_active=True,
+            valid_from__lte=work_date,
+        )
+        .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=work_date))
+        .exists()
+    )
+    if not exists:
+        raise DRFValidationError({field: "対象拠点に有効所属しているスタッフを指定してください。"})
+
+
+def _ensure_no_open_shift_change_duplicate(change_request: ShiftChangeRequest):
+    if not change_request.publication_assignment_id or change_request.status not in SHIFT_CHANGE_OPEN_STATUSES:
+        return
+    duplicate = ShiftChangeRequest.objects.filter(
+        publication_assignment=change_request.publication_assignment,
+        status__in=SHIFT_CHANGE_OPEN_STATUSES,
+        is_active=True,
+    )
+    if change_request.pk:
+        duplicate = duplicate.exclude(pk=change_request.pk)
+    if duplicate.exists():
+        raise DRFValidationError({"publication_assignment": "この勤務には未完了の変更申請が既にあります。"})
+
+
+def _snapshot_original_shift(change_request: ShiftChangeRequest):
+    assignment = change_request.publication_assignment
+    segments = list(assignment.segments.all()) if assignment else []
+    change_request.original_start_offset_minutes = min(
+        (segment.start_offset_minutes for segment in segments),
+        default=None,
+    )
+    change_request.original_end_offset_minutes = max((segment.end_offset_minutes for segment in segments), default=None)
+    change_request.original_pattern_name_snapshot = assignment.pattern_name_snapshot if assignment else ""
+    change_request.original_pattern_short_name_snapshot = assignment.pattern_short_name_snapshot if assignment else ""
+
+
+def _validate_shift_change_request(change_request: ShiftChangeRequest, *, creating: bool = False):
+    if creating:
+        _ensure_active_publication_assignment(change_request.publication_assignment)
+    if change_request.publication_assignment_id:
+        assignment = change_request.publication_assignment
+        if assignment.publication_id != change_request.publication_id:
+            raise DRFValidationError({"publication_assignment": "publicationとpublication_assignmentが一致しません。"})
+        if assignment.publication.monthly_shift_plan_id != change_request.monthly_shift_plan_id:
+            raise DRFValidationError({"monthly_shift_plan": "monthly_shift_planが公開勤務と一致しません。"})
+        if assignment.publication.location_id != change_request.location_id:
+            raise DRFValidationError({"location": "locationが公開勤務と一致しません。"})
+        if assignment.work_date != change_request.work_date:
+            raise DRFValidationError({"work_date": "work_dateが公開勤務と一致しません。"})
+        if assignment.staff_id != change_request.target_staff_id:
+            raise DRFValidationError({"target_staff": "target_staffが公開勤務と一致しません。"})
+    if change_request.request_type == ShiftChangeRequest.RequestType.MANAGER_ADJUSTMENT:
+        if change_request.requester_id and not can_manage_shifts(change_request.requester):
+            raise DRFValidationError({"request_type": "manager_adjustmentは管理者のみ作成できます。"})
+    elif not change_request.publication_assignment_id:
+        raise DRFValidationError({"publication_assignment": "publication_assignmentは必須です。"})
+    if (
+        change_request.request_type == ShiftChangeRequest.RequestType.SWAP_SHIFT
+        and not change_request.requested_staff_id
+    ):
+        raise DRFValidationError({"requested_staff": "swap_shiftにはrequested_staffが必須です。"})
+    if change_request.request_type == ShiftChangeRequest.RequestType.CHANGE_TIME:
+        if change_request.requested_start_offset_minutes is None or change_request.requested_end_offset_minutes is None:
+            raise DRFValidationError({"requested_start_offset_minutes": "change_timeには希望時間が必須です。"})
+    if change_request.request_type == ShiftChangeRequest.RequestType.CHANGE_ASSIGNMENT:
+        if not change_request.requested_shift_pattern_id and not change_request.requested_notes.strip():
+            raise DRFValidationError({"requested_shift_pattern": "勤務パターンまたは備考を指定してください。"})
+    if change_request.requested_staff_id:
+        _ensure_staff_location(
+            change_request.requested_staff,
+            change_request.location,
+            change_request.requested_work_date or change_request.work_date,
+            field="requested_staff",
+        )
+    try:
+        change_request.full_clean()
+    except DjangoValidationError as exc:
+        raise _drf_validation(exc) from exc
+    _ensure_no_open_shift_change_duplicate(change_request)
+
+
+def save_shift_change_request(
+    *,
+    instance: ShiftChangeRequest | None,
+    validated_data: dict,
+    actor: User,
+    self_service: bool,
+    submit: bool = False,
+) -> ShiftChangeRequest:
+    try:
+        creating = instance is None
+        change_request = instance or ShiftChangeRequest(requester=actor, submitted_by=None)
+        if not creating and change_request.status in SHIFT_CHANGE_TERMINAL_STATUSES:
+            raise DRFValidationError({"status": "完了済みの変更申請は編集できません。"})
+        if self_service and not creating and not can_edit_shift_change_request(change_request, actor=actor):
+            raise DRFValidationError({"status": "下書き以外は本人編集できません。"})
+        publication_assignment = validated_data.get("publication_assignment")
+        if publication_assignment is not None:
+            change_request.publication_assignment = publication_assignment
+            change_request.publication = publication_assignment.publication
+            change_request.monthly_shift_plan = publication_assignment.publication.monthly_shift_plan
+            change_request.location = publication_assignment.publication.location
+            change_request.work_date = publication_assignment.work_date
+            change_request.target_staff = publication_assignment.staff
+            if creating:
+                _snapshot_original_shift(change_request)
+        if creating and not publication_assignment:
+            raise DRFValidationError({"publication_assignment": "publication_assignmentは必須です。"})
+        if self_service and change_request.target_staff_id != actor.id:
+            raise DRFValidationError({"publication_assignment": "本人の公開シフトのみ申請できます。"})
+        for field in [
+            "request_type",
+            "priority",
+            "requested_staff",
+            "requested_work_date",
+            "requested_shift_pattern",
+            "requested_start_offset_minutes",
+            "requested_end_offset_minutes",
+            "requested_notes",
+            "reason",
+            "manager_note",
+        ]:
+            if field in validated_data:
+                setattr(change_request, field, validated_data[field])
+        if self_service and change_request.request_type == ShiftChangeRequest.RequestType.MANAGER_ADJUSTMENT:
+            raise DRFValidationError({"request_type": "manager_adjustmentは本人APIでは作成できません。"})
+        if submit:
+            change_request.status = ShiftChangeRequest.Status.SUBMITTED
+            change_request.submitted_at = timezone.now()
+            change_request.submitted_by = actor
+        elif creating:
+            change_request.status = ShiftChangeRequest.Status.DRAFT
+        _validate_shift_change_request(change_request, creating=creating)
+        change_request.save()
+    except (DjangoValidationError, IntegrityError) as exc:
+        raise _drf_validation(exc) from exc
+    return change_request
+
+
+def submit_shift_change_request(*, change_request: ShiftChangeRequest, actor: User) -> ShiftChangeRequest:
+    change_request = ShiftChangeRequest.objects.select_for_update(of=("self",)).get(pk=change_request.pk)
+    if not can_submit_shift_change_request(change_request, actor=actor):
+        raise DRFValidationError({"status": "提出できる状態ではありません。"})
+    _validate_shift_change_request(change_request)
+    change_request.status = ShiftChangeRequest.Status.SUBMITTED
+    change_request.submitted_at = timezone.now()
+    change_request.submitted_by = actor
+    change_request.save(update_fields=["status", "submitted_at", "submitted_by", "updated_at"])
+    return change_request
+
+
+def cancel_shift_change_request(
+    *, change_request: ShiftChangeRequest, actor: User, manager: bool = False, manager_note: str = ""
+) -> ShiftChangeRequest:
+    change_request = ShiftChangeRequest.objects.select_for_update(of=("self",)).get(pk=change_request.pk)
+    if not can_cancel_shift_change_request(change_request, actor=actor, manager=manager):
+        raise DRFValidationError({"status": "取消できる状態ではありません。"})
+    change_request.status = ShiftChangeRequest.Status.CANCELLED
+    change_request.cancelled_at = timezone.now()
+    change_request.cancelled_by = actor
+    if manager_note:
+        change_request.manager_note = manager_note
+    change_request.save(update_fields=["status", "cancelled_at", "cancelled_by", "manager_note", "updated_at"])
+    return change_request
+
+
+def approve_shift_change_request(
+    *, change_request: ShiftChangeRequest, actor: User, validated_data: dict
+) -> ShiftChangeRequest:
+    change_request = ShiftChangeRequest.objects.select_for_update(of=("self",)).get(pk=change_request.pk)
+    if change_request.status != ShiftChangeRequest.Status.SUBMITTED:
+        raise DRFValidationError({"status": "submittedのみ承認できます。"})
+    for field in [
+        "requested_staff",
+        "requested_work_date",
+        "requested_shift_pattern",
+        "requested_start_offset_minutes",
+        "requested_end_offset_minutes",
+        "manager_note",
+    ]:
+        if field in validated_data:
+            setattr(change_request, field, validated_data[field])
+    _validate_shift_change_request(change_request)
+    change_request.status = ShiftChangeRequest.Status.APPROVED
+    change_request.approved_at = timezone.now()
+    change_request.approved_by = actor
+    change_request.save(
+        update_fields=[
+            "requested_staff",
+            "requested_work_date",
+            "requested_shift_pattern",
+            "requested_start_offset_minutes",
+            "requested_end_offset_minutes",
+            "manager_note",
+            "status",
+            "approved_at",
+            "approved_by",
+            "updated_at",
+        ]
+    )
+    return change_request
+
+
+def reject_shift_change_request(*, change_request: ShiftChangeRequest, actor: User, manager_note: str):
+    if not manager_note.strip():
+        raise DRFValidationError({"manager_note": "却下理由を入力してください。"})
+    change_request = ShiftChangeRequest.objects.select_for_update(of=("self",)).get(pk=change_request.pk)
+    if change_request.status not in {ShiftChangeRequest.Status.SUBMITTED, ShiftChangeRequest.Status.APPROVED}:
+        raise DRFValidationError({"status": "却下できる状態ではありません。"})
+    change_request.status = ShiftChangeRequest.Status.REJECTED
+    change_request.rejected_at = timezone.now()
+    change_request.rejected_by = actor
+    change_request.manager_note = manager_note.strip()
+    change_request.save(update_fields=["status", "rejected_at", "rejected_by", "manager_note", "updated_at"])
+    return change_request
+
+
+def close_shift_change_request(*, change_request: ShiftChangeRequest, actor: User, manager_note: str = ""):
+    change_request = ShiftChangeRequest.objects.select_for_update(of=("self",)).get(pk=change_request.pk)
+    if change_request.status in SHIFT_CHANGE_TERMINAL_STATUSES:
+        raise DRFValidationError({"status": "完了済みです。"})
+    if change_request.request_type != ShiftChangeRequest.RequestType.NOTE:
+        raise DRFValidationError({"request_type": "closeはnote申請のみ利用できます。"})
+    change_request.status = ShiftChangeRequest.Status.CLOSED
+    if manager_note:
+        change_request.manager_note = manager_note
+    change_request.save(update_fields=["status", "manager_note", "updated_at"])
+    return change_request
+
+
+def _active_monthly_segments(assignment: MonthlyShiftAssignment) -> list[MonthlyShiftSegment]:
+    return list(assignment.segments.select_related("work_type", "work_area").filter(is_active=True))
+
+
+def _assignment_collision_exists(
+    plan: MonthlyShiftPlan,
+    *,
+    staff: User,
+    work_date: date,
+    exclude_ids: set[str] | None = None,
+) -> bool:
+    queryset = MonthlyShiftAssignment.objects.filter(
+        monthly_shift_plan=plan,
+        staff=staff,
+        work_date=work_date,
+        is_active=True,
+    )
+    if exclude_ids:
+        queryset = queryset.exclude(id__in=exclude_ids)
+    return queryset.exists()
+
+
+def _validate_assignment_after_change(assignment: MonthlyShiftAssignment, segments: list[MonthlyShiftSegment]):
+    issues = validate_monthly_assignment(assignment, segments, validate_current_masters=True)
+    errors = [issue for issue in issues if issue["severity"] == "error"]
+    if errors:
+        raise DRFValidationError({"warnings": errors})
+    assignment.full_clean()
+    for segment in segments:
+        if segment.is_active:
+            segment.full_clean()
+    return issues
+
+
+def _assign_monthly_assignment_staff(
+    assignment: MonthlyShiftAssignment,
+    *,
+    staff: User,
+    actor: User,
+):
+    _ensure_staff_location(staff, assignment.monthly_shift_plan.location, assignment.work_date, field="requested_staff")
+    if _assignment_collision_exists(
+        assignment.monthly_shift_plan,
+        staff=staff,
+        work_date=assignment.work_date,
+        exclude_ids={str(assignment.id)},
+    ):
+        raise DRFValidationError({"requested_staff": "指定スタッフは同日に勤務があります。"})
+    assignment.staff = staff
+    assignment.source_type = MonthlyShiftAssignment.SourceType.MANUAL
+    assignment.is_customized = True
+    assignment.updated_by = actor
+    _validate_assignment_after_change(assignment, _active_monthly_segments(assignment))
+    assignment.save(update_fields=["staff", "source_type", "is_customized", "updated_by", "updated_at"])
+
+
+def _drop_shift_assignment(assignment: MonthlyShiftAssignment, *, actor: User):
+    assignment.is_active = False
+    assignment.source_type = MonthlyShiftAssignment.SourceType.MANUAL
+    assignment.is_customized = True
+    assignment.updated_by = actor
+    assignment.save(update_fields=["is_active", "source_type", "is_customized", "updated_by", "updated_at"])
+
+
+def _change_assignment_time(
+    assignment: MonthlyShiftAssignment,
+    *,
+    start_offset_minutes: int,
+    end_offset_minutes: int,
+    actor: User,
+):
+    segments = _active_monthly_segments(assignment)
+    if not segments:
+        raise DRFValidationError({"segments": "変更対象の勤務内訳がありません。"})
+    target = next((segment for segment in segments if not segment.work_type_is_break_snapshot), segments[0])
+    target.start_offset_minutes = start_offset_minutes
+    target.end_offset_minutes = end_offset_minutes
+    assignment.source_type = MonthlyShiftAssignment.SourceType.MANUAL
+    assignment.is_customized = True
+    assignment.updated_by = actor
+    _validate_assignment_after_change(assignment, segments)
+    assignment.save(update_fields=["source_type", "is_customized", "updated_by", "updated_at"])
+    target.save(update_fields=["start_offset_minutes", "end_offset_minutes", "updated_at"])
+
+
+def _replace_assignment_pattern(
+    assignment: MonthlyShiftAssignment,
+    *,
+    pattern: ShiftPattern | None,
+    notes: str,
+    actor: User,
+):
+    active_segments = _active_monthly_segments(assignment)
+    save_segments = []
+    validation_segments = active_segments
+    if pattern is not None:
+        if pattern.location_id != assignment.monthly_shift_plan.location_id:
+            raise DRFValidationError({"requested_shift_pattern": "勤務パターンの拠点が一致しません。"})
+        for segment in active_segments:
+            segment.is_active = False
+            save_segments.append(segment)
+        new_segments = _segments_from_pattern(pattern, assignment)
+        validation_segments = new_segments
+        save_segments.extend(new_segments)
+        assignment.source_shift_pattern = pattern
+        assignment.pattern_code_snapshot = pattern.code
+        assignment.pattern_name_snapshot = pattern.name
+        assignment.pattern_short_name_snapshot = pattern.short_name
+    if notes:
+        assignment.notes = notes
+    assignment.source_type = MonthlyShiftAssignment.SourceType.MANUAL
+    assignment.is_customized = True
+    assignment.updated_by = actor
+    _validate_assignment_after_change(assignment, validation_segments)
+    assignment.save(
+        update_fields=[
+            "source_shift_pattern",
+            "pattern_code_snapshot",
+            "pattern_name_snapshot",
+            "pattern_short_name_snapshot",
+            "notes",
+            "source_type",
+            "is_customized",
+            "updated_by",
+            "updated_at",
+        ]
+    )
+    for segment in save_segments:
+        segment.monthly_shift_assignment = assignment
+        segment.save()
+
+
+def _swap_shift_assignment(assignment: MonthlyShiftAssignment, *, change_request: ShiftChangeRequest, actor: User):
+    requested_staff = change_request.requested_staff
+    if requested_staff is None:
+        raise DRFValidationError({"requested_staff": "swap_shiftにはrequested_staffが必須です。"})
+    _ensure_staff_location(
+        requested_staff,
+        assignment.monthly_shift_plan.location,
+        assignment.work_date,
+        field="requested_staff",
+    )
+    other_date = change_request.requested_work_date or assignment.work_date
+    other = (
+        MonthlyShiftAssignment.objects.select_for_update(of=("self",))
+        .filter(
+            monthly_shift_plan=assignment.monthly_shift_plan,
+            staff=requested_staff,
+            work_date=other_date,
+            is_active=True,
+        )
+        .exclude(pk=assignment.pk)
+        .first()
+    )
+    if other is None:
+        _assign_monthly_assignment_staff(assignment, staff=requested_staff, actor=actor)
+        return
+    if _assignment_collision_exists(
+        assignment.monthly_shift_plan,
+        staff=assignment.staff,
+        work_date=other.work_date,
+        exclude_ids={str(assignment.id), str(other.id)},
+    ):
+        raise DRFValidationError({"requested_staff": "交換先の日付に対象スタッフの勤務があります。"})
+    if other.work_date == assignment.work_date:
+        other.is_active = False
+        other.save(update_fields=["is_active", "updated_at"])
+        assignment.staff = requested_staff
+        assignment.source_type = MonthlyShiftAssignment.SourceType.MANUAL
+        assignment.is_customized = True
+        assignment.updated_by = actor
+        _validate_assignment_after_change(assignment, _active_monthly_segments(assignment))
+        assignment.save(update_fields=["staff", "source_type", "is_customized", "updated_by", "updated_at"])
+        other.staff = change_request.target_staff
+        other.is_active = True
+        other.source_type = MonthlyShiftAssignment.SourceType.MANUAL
+        other.is_customized = True
+        other.updated_by = actor
+        _validate_assignment_after_change(other, _active_monthly_segments(other))
+        other.save(update_fields=["staff", "is_active", "source_type", "is_customized", "updated_by", "updated_at"])
+        return
+    assignment.staff = requested_staff
+    assignment.source_type = MonthlyShiftAssignment.SourceType.MANUAL
+    assignment.is_customized = True
+    assignment.updated_by = actor
+    _validate_assignment_after_change(assignment, _active_monthly_segments(assignment))
+    assignment.save(update_fields=["staff", "source_type", "is_customized", "updated_by", "updated_at"])
+    other.staff = change_request.target_staff
+    other.source_type = MonthlyShiftAssignment.SourceType.MANUAL
+    other.is_customized = True
+    other.updated_by = actor
+    _validate_assignment_after_change(other, _active_monthly_segments(other))
+    other.save(update_fields=["staff", "source_type", "is_customized", "updated_by", "updated_at"])
+
+
+def apply_shift_change_request(
+    *, change_request: ShiftChangeRequest, actor: User, manager_note: str = ""
+) -> tuple[ShiftChangeRequest, MonthlyShiftPublication]:
+    try:
+        change_request = (
+            ShiftChangeRequest.objects.select_for_update(of=("self",))
+            .select_related(
+                "location",
+                "monthly_shift_plan",
+                "publication",
+                "publication_assignment",
+                "publication_assignment__source_assignment",
+                "requested_staff",
+                "requested_shift_pattern",
+                "target_staff",
+            )
+            .get(pk=change_request.pk)
+        )
+        if change_request.status != ShiftChangeRequest.Status.APPROVED:
+            raise DRFValidationError({"status": "approvedのみ反映できます。"})
+        if change_request.request_type == ShiftChangeRequest.RequestType.NOTE:
+            raise DRFValidationError({"request_type": "noteは反映不要です。closeしてください。"})
+        if not change_request.publication.is_active or change_request.publication.withdrawn_at is not None:
+            raise DRFValidationError({"publication": "公開中の申請のみ反映できます。"})
+        plan = MonthlyShiftPlan.objects.select_for_update(of=("self",)).get(pk=change_request.monthly_shift_plan_id)
+        assignment = (
+            MonthlyShiftAssignment.objects.select_for_update(of=("self",))
+            .select_related("monthly_shift_plan", "monthly_shift_plan__location", "staff")
+            .get(pk=change_request.publication_assignment.source_assignment_id)
+        )
+        if assignment.monthly_shift_plan_id != plan.id:
+            raise DRFValidationError({"publication_assignment": "元勤務が月間表と一致しません。"})
+        if not assignment.is_active and change_request.request_type != ShiftChangeRequest.RequestType.DROP_SHIFT:
+            raise DRFValidationError({"publication_assignment": "元勤務が解除済みです。"})
+        if change_request.request_type == ShiftChangeRequest.RequestType.DROP_SHIFT:
+            if change_request.requested_staff_id:
+                _assign_monthly_assignment_staff(assignment, staff=change_request.requested_staff, actor=actor)
+            else:
+                _drop_shift_assignment(assignment, actor=actor)
+        elif change_request.request_type == ShiftChangeRequest.RequestType.COVER_REQUEST:
+            if not change_request.requested_staff_id:
+                raise DRFValidationError({"requested_staff": "代行者未定のため反映できません。"})
+            _assign_monthly_assignment_staff(assignment, staff=change_request.requested_staff, actor=actor)
+        elif change_request.request_type == ShiftChangeRequest.RequestType.SWAP_SHIFT:
+            _swap_shift_assignment(assignment, change_request=change_request, actor=actor)
+        elif change_request.request_type == ShiftChangeRequest.RequestType.CHANGE_TIME:
+            _change_assignment_time(
+                assignment,
+                start_offset_minutes=change_request.requested_start_offset_minutes,
+                end_offset_minutes=change_request.requested_end_offset_minutes,
+                actor=actor,
+            )
+        elif change_request.request_type == ShiftChangeRequest.RequestType.CHANGE_ASSIGNMENT:
+            _replace_assignment_pattern(
+                assignment,
+                pattern=change_request.requested_shift_pattern,
+                notes=change_request.requested_notes,
+                actor=actor,
+            )
+        elif change_request.request_type == ShiftChangeRequest.RequestType.MANAGER_ADJUSTMENT:
+            if change_request.requested_staff_id:
+                _assign_monthly_assignment_staff(assignment, staff=change_request.requested_staff, actor=actor)
+            if change_request.requested_start_offset_minutes is not None:
+                _change_assignment_time(
+                    assignment,
+                    start_offset_minutes=change_request.requested_start_offset_minutes,
+                    end_offset_minutes=change_request.requested_end_offset_minutes,
+                    actor=actor,
+                )
+            if change_request.requested_shift_pattern_id or change_request.requested_notes.strip():
+                _replace_assignment_pattern(
+                    assignment,
+                    pattern=change_request.requested_shift_pattern,
+                    notes=change_request.requested_notes,
+                    actor=actor,
+                )
+        withdrawn_publication = withdraw_monthly_shift_publication(
+            plan=plan,
+            actor=actor,
+            reason=f"change_request_applied:{change_request.id}",
+        )
+        change_request.status = ShiftChangeRequest.Status.APPLIED
+        change_request.applied_at = timezone.now()
+        change_request.applied_by = actor
+        if manager_note:
+            change_request.manager_note = manager_note
+        change_request.save(update_fields=["status", "applied_at", "applied_by", "manager_note", "updated_at"])
+    except (DjangoValidationError, IntegrityError) as exc:
+        raise _drf_validation(exc, integrity_message=MONTHLY_ASSIGNMENT_DUPLICATE_MESSAGE) from exc
+    return change_request, withdrawn_publication
 
 
 def _validate_assignment_cell_immutable(instance: MonthlyShiftAssignment | None, validated_data: dict):

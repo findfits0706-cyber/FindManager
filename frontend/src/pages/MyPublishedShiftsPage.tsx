@@ -1,8 +1,8 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import { offsetToLabel } from "../lib/timeOffsets";
-import type { MyPublishedShift, MyPublishedShiftsResponse } from "../lib/types";
+import type { MyPublishedShift, MyPublishedShiftsResponse, ShiftChangeRequest, Staff, Paginated } from "../lib/types";
 
 function isoDate(date: Date) {
   const year = date.getFullYear();
@@ -20,13 +20,28 @@ function monthRange(year: number, month: number) {
 
 const today = new Date();
 const emptyShifts: MyPublishedShift[] = [];
+const defaultRequestForm = {
+  request_type: "drop_shift" as ShiftChangeRequest["request_type"],
+  priority: "normal" as ShiftChangeRequest["priority"],
+  requested_staff: "",
+  requested_work_date: "",
+  requested_start_offset_minutes: "",
+  requested_end_offset_minutes: "",
+  requested_notes: "",
+  reason: "",
+};
 
 export function MyPublishedShiftsPage() {
+  const queryClient = useQueryClient();
   const [year, setYear] = useState(today.getFullYear());
   const [month, setMonth] = useState(today.getMonth() + 1);
   const [location, setLocation] = useState("");
   const [selectedShift, setSelectedShift] = useState<MyPublishedShift | null>(null);
   const [knownLocations, setKnownLocations] = useState<Array<{ id: string; name: string }>>([]);
+  const [requestForm, setRequestForm] = useState(defaultRequestForm);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const range = monthRange(year, month);
   const query = useQuery({
     queryKey: ["my-published-shifts", year, month, location],
@@ -38,6 +53,12 @@ export function MyPublishedShiftsPage() {
       ),
   });
   const shifts = query.data?.shifts ?? emptyShifts;
+  const staffQuery = useQuery({
+    queryKey: ["my-published-change-staff"],
+    queryFn: () => api<Paginated<Staff>>("/api/v1/staff/?page_size=100"),
+    retry: false,
+  });
+  const staffOptions = staffQuery.data?.results ?? [];
   useEffect(() => {
     if (!query.data) return;
     setKnownLocations((current) => {
@@ -78,6 +99,49 @@ export function MyPublishedShiftsPage() {
     setSelectedShift(null);
   };
 
+  const chooseShift = (shift: MyPublishedShift) => {
+    setSelectedShift(shift);
+    setRequestForm(defaultRequestForm);
+    setMessage("");
+    setError("");
+  };
+
+  const submitChangeRequest = async (submit: boolean) => {
+    if (!selectedShift) return;
+    setIsSubmitting(true);
+    setError("");
+    setMessage("");
+    try {
+      await api<ShiftChangeRequest>("/api/v1/my-shift-change-requests/", {
+        method: "POST",
+        body: JSON.stringify({
+          publication_assignment: selectedShift.id,
+          request_type: requestForm.request_type,
+          priority: requestForm.priority,
+          requested_staff: requestForm.requested_staff || null,
+          requested_work_date: requestForm.requested_work_date || null,
+          requested_start_offset_minutes: requestForm.requested_start_offset_minutes
+            ? Number(requestForm.requested_start_offset_minutes)
+            : null,
+          requested_end_offset_minutes: requestForm.requested_end_offset_minutes
+            ? Number(requestForm.requested_end_offset_minutes)
+            : null,
+          requested_notes: requestForm.requested_notes,
+          reason: requestForm.reason,
+          submit,
+        }),
+      });
+      setMessage(submit ? "変更申請を提出しました。" : "変更申請を下書き保存しました。");
+      setRequestForm(defaultRequestForm);
+      await queryClient.invalidateQueries({ queryKey: ["my-published-shifts"] });
+      await queryClient.invalidateQueries({ queryKey: ["my-shift-change-requests"] });
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "変更申請に失敗しました。");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   return (
     <section className="card monthly-page">
       <div className="section-header">
@@ -96,24 +160,27 @@ export function MyPublishedShiftsPage() {
       </div>
       {query.isLoading ? <p>読み込み中...</p> : null}
       {query.isError ? <p className="error">公開シフトの取得に失敗しました。</p> : null}
+      {error ? <p className="error">{error}</p> : null}
+      {message ? <p className="success">{message}</p> : null}
       {!query.isLoading && !query.isError && shifts.length === 0 ? <p className="subtle-text">公開シフトはありません。</p> : null}
       {shifts.length ? (
         <div className="monthly-layout">
           <div className="monthly-grid-wrap">
             <table className="table">
               <thead>
-                <tr><th>日付</th><th>曜日</th><th>拠点</th><th>勤務パターン</th><th>開始～終了</th><th>勤務時間</th><th>休憩時間</th><th>公開Version</th><th>公開日時</th></tr>
+                <tr><th>日付</th><th>曜日</th><th>拠点</th><th>勤務パターン</th><th>開始～終了</th><th>変更申請</th><th>勤務時間</th><th>休憩時間</th><th>公開Version</th><th>公開日時</th></tr>
               </thead>
               <tbody>
                 {shifts.map((shift) => {
                   const dateInfo = query.data?.dates.find((item) => item.date === shift.work_date);
                   return (
                     <tr key={shift.id} className={dateInfo?.is_saturday ? "saturday" : dateInfo?.is_sunday ? "sunday" : ""}>
-                      <td><button type="button" className="btn-link" onClick={() => setSelectedShift(shift)}>{shift.work_date}</button></td>
+                      <td><button type="button" className="btn-link" onClick={() => chooseShift(shift)}>{shift.work_date}</button></td>
                       <td>{dateInfo?.weekday_label ?? ""}</td>
                       <td>{shift.publication.location_name}</td>
                       <td>{shift.pattern_short_name_snapshot || shift.pattern_name_snapshot}</td>
                       <td>{shift.start_offset_minutes == null || shift.end_offset_minutes == null ? "-" : `${offsetToLabel(shift.start_offset_minutes)}~${offsetToLabel(shift.end_offset_minutes)}`}</td>
+                      <td>{shift.shift_change_requests.length ? shift.shift_change_requests.map((item) => item.status).join(" / ") : <button type="button" onClick={() => chooseShift(shift)}>変更申請</button>}</td>
                       <td>{shift.work_minutes}分</td>
                       <td>{shift.break_minutes}分</td>
                       <td>v{shift.publication.version}</td>
@@ -137,6 +204,31 @@ export function MyPublishedShiftsPage() {
                 <dt>公開Version</dt><dd>v{selectedShift.publication.version}</dd>
                 <dt>公開日時</dt><dd>{selectedShift.publication.published_at}</dd>
               </dl>
+              {selectedShift.shift_change_requests.length ? (
+                <section className="inline-alert">
+                  <h3>既存の変更申請</h3>
+                  <ul>
+                    {selectedShift.shift_change_requests.map((item) => (
+                      <li key={item.id}>{item.request_type} / {item.status} / {item.reason}</li>
+                    ))}
+                  </ul>
+                </section>
+              ) : null}
+              <section className="inline-alert">
+                <h3>変更申請</h3>
+                <label>種別<select disabled={isSubmitting || selectedShift.shift_change_requests.length > 0} value={requestForm.request_type} onChange={(event) => setRequestForm({ ...requestForm, request_type: event.target.value as ShiftChangeRequest["request_type"] })}><option value="drop_shift">勤務辞退</option><option value="swap_shift">勤務交換</option><option value="cover_request">代行依頼</option><option value="change_time">時間変更</option><option value="change_assignment">業務変更</option><option value="note">相談メモ</option></select></label>
+                <label>優先度<select disabled={isSubmitting || selectedShift.shift_change_requests.length > 0} value={requestForm.priority} onChange={(event) => setRequestForm({ ...requestForm, priority: event.target.value as ShiftChangeRequest["priority"] })}><option value="high">high</option><option value="normal">normal</option><option value="low">low</option></select></label>
+                <label>代行候補<select disabled={isSubmitting || selectedShift.shift_change_requests.length > 0} value={requestForm.requested_staff} onChange={(event) => setRequestForm({ ...requestForm, requested_staff: event.target.value })}><option value="">未指定</option>{staffOptions.map((item) => <option key={item.id} value={item.id}>{item.display_name}</option>)}</select></label>
+                <label>希望日<input type="date" readOnly={isSubmitting || selectedShift.shift_change_requests.length > 0} value={requestForm.requested_work_date} onChange={(event) => setRequestForm({ ...requestForm, requested_work_date: event.target.value })} /></label>
+                <label>希望開始<input type="number" step={15} readOnly={isSubmitting || selectedShift.shift_change_requests.length > 0} value={requestForm.requested_start_offset_minutes} onChange={(event) => setRequestForm({ ...requestForm, requested_start_offset_minutes: event.target.value })} /></label>
+                <label>希望終了<input type="number" step={15} readOnly={isSubmitting || selectedShift.shift_change_requests.length > 0} value={requestForm.requested_end_offset_minutes} onChange={(event) => setRequestForm({ ...requestForm, requested_end_offset_minutes: event.target.value })} /></label>
+                <label>理由<textarea readOnly={isSubmitting || selectedShift.shift_change_requests.length > 0} value={requestForm.reason} onChange={(event) => setRequestForm({ ...requestForm, reason: event.target.value })} /></label>
+                <label>備考<textarea readOnly={isSubmitting || selectedShift.shift_change_requests.length > 0} value={requestForm.requested_notes} onChange={(event) => setRequestForm({ ...requestForm, requested_notes: event.target.value })} /></label>
+                <div className="actions">
+                  <button type="button" disabled={isSubmitting || selectedShift.shift_change_requests.length > 0} onClick={() => void submitChangeRequest(false)}>下書き保存</button>
+                  <button type="button" disabled={isSubmitting || selectedShift.shift_change_requests.length > 0} onClick={() => void submitChangeRequest(true)}>提出</button>
+                </div>
+              </section>
               <h3>勤務内訳</h3>
               <table className="table">
                 <thead><tr><th>開始～終了</th><th>業務名</th><th>業務エリア</th><th>備考</th><th>休憩区分</th></tr></thead>

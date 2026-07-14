@@ -13,7 +13,9 @@ import { clampSegmentToRange, durationToWidth, offsetToPosition, type TimelineRa
 import { chunkRowsForPrint, estimatePrintRowHeight, printSlotWidthForRange } from "../lib/timelinePrint";
 import { MonthlyShiftsPage } from "./MonthlyShiftsPage";
 import { MyPublishedShiftsPage } from "./MyPublishedShiftsPage";
+import { MyShiftChangeRequestsPage } from "./MyShiftChangeRequestsPage";
 import { MyShiftRequestsPage } from "./MyShiftRequestsPage";
+import { ShiftChangeRequestsPage } from "./ShiftChangeRequestsPage";
 import { ShiftTimelinePage } from "./ShiftTimelinePage";
 import { ShiftPatternsPage } from "./ShiftPatternsPage";
 import { ShiftRequestPeriodsPage } from "./ShiftRequestPeriodsPage";
@@ -230,6 +232,11 @@ async function openMonthlyPublicationPreview() {
 }
 const monthlyMatrix = {
   plan: { id: "m1", location: "l1", location_name: "本館", year: 2028, month: 2, name: "2028年2月 本館シフト" },
+  shift_change_request_summary: {
+    open_count: 1,
+    applied_count: 1,
+    needs_republish: true,
+  },
   shift_request_period: {
     id: "rp1",
     location: "l1",
@@ -277,6 +284,22 @@ const monthlyMatrix = {
           source_type: "template" as const,
           is_customized: false,
           warning_count: 0,
+          shift_change_requests: [
+            {
+              id: "cr1",
+              request_type: "drop_shift",
+              status: "submitted",
+              priority: "high",
+              requested_staff: "staff2",
+              requested_staff_display_name: "スタッフB",
+              requested_work_date: null,
+              requested_start_offset_minutes: null,
+              requested_end_offset_minutes: null,
+              reason: "急用",
+              manager_note: "",
+              applied_at: null,
+            },
+          ],
         },
       },
       inactive_assignments: {
@@ -727,6 +750,7 @@ describe("shift settings pages", () => {
             end_offset_minutes: 1020,
             work_minutes: 450,
             break_minutes: 60,
+            shift_change_requests: [],
             segments: [
               {
                 id: "pub-s1",
@@ -767,9 +791,160 @@ describe("shift settings pages", () => {
     expect(screen.getByText("火")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "2028-02-01" }));
     expect(screen.getByText("公開備考")).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("理由"), "急用");
+    await userEvent.click(screen.getByRole("button", { name: "提出" }));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/my-shift-change-requests/"), expect.anything());
+    const changeRequestCall = fetchMock.mock.calls.find(
+      ([input, init]) => String(input).includes("/api/v1/my-shift-change-requests/") && init?.method === "POST",
+    );
+    expect(changeRequestCall?.[1]?.body).toContain("\"publication_assignment\":\"pub-a1\"");
+    expect(changeRequestCall?.[1]?.body).not.toContain("target_staff");
+    expect(changeRequestCall?.[1]?.body).not.toContain("requester");
     await userEvent.clear(screen.getByLabelText("年"));
     await userEvent.type(screen.getByLabelText("年"), "2029");
     expect(screen.queryByText("公開備考")).not.toBeInTheDocument();
+  });
+
+  it("lists and edits my shift change requests", async () => {
+    const draftRequest = {
+      id: "cr1",
+      location: "l1",
+      location_name: "本館",
+      monthly_shift_plan: "m1",
+      publication: "pub1",
+      publication_version: 1,
+      publication_assignment: "pub-a1",
+      requester: "u1",
+      requester_display_name: "表示ユーザー",
+      target_staff: "u1",
+      target_staff_display_name: "表示ユーザー",
+      requested_staff: null,
+      requested_staff_display_name: "",
+      request_type: "drop_shift",
+      status: "draft",
+      priority: "normal",
+      work_date: "2028-02-01",
+      original_start_offset_minutes: 510,
+      original_end_offset_minutes: 1020,
+      original_pattern_name_snapshot: "早番",
+      original_pattern_short_name_snapshot: "早",
+      requested_work_date: null,
+      requested_shift_pattern: null,
+      requested_shift_pattern_name: "",
+      requested_start_offset_minutes: null,
+      requested_end_offset_minutes: null,
+      requested_notes: "",
+      reason: "急用",
+      manager_note: "",
+      submitted_at: null,
+      approved_at: null,
+      rejected_at: null,
+      cancelled_at: null,
+      applied_at: null,
+      can_edit: true,
+      can_submit: true,
+      can_cancel: true,
+      can_approve: false,
+      can_apply: false,
+      created_at: "2028-01-25T00:00:00+09:00",
+      updated_at: "2028-01-25T00:00:00+09:00",
+      is_active: true,
+    };
+    mockAuthAndApi(["staff"], {
+      "/api/v1/staff/": { count: 1, next: null, previous: null, results: [{ id: "u2", display_name: "スタッフB" }] },
+      "/api/v1/my-shift-change-requests/": (input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "PATCH") return { ...draftRequest, reason: "更新後" };
+        if (String(input).includes("/submit/")) return { ...draftRequest, status: "submitted", can_edit: false, can_submit: false };
+        if (String(input).includes("/cancel/")) return { ...draftRequest, status: "cancelled", can_edit: false, can_submit: false, can_cancel: false };
+        return { count: 1, next: null, previous: null, results: [draftRequest] };
+      },
+    });
+    renderWithAuth(<MyShiftChangeRequestsPage />);
+    expect(await screen.findByText("シフト変更申請")).toBeInTheDocument();
+    expect(await screen.findByText("drop_shift")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "詳細" }));
+    expect(screen.getByDisplayValue("急用")).toBeInTheDocument();
+    await userEvent.clear(screen.getByLabelText("理由"));
+    await userEvent.type(screen.getByLabelText("理由"), "更新後");
+    await userEvent.click(screen.getByRole("button", { name: "下書き保存" }));
+    await userEvent.click(screen.getByRole("button", { name: "提出" }));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/my-shift-change-requests/cr1/submit/"), expect.anything());
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("staff="))).toBe(false);
+  });
+
+  it("manages shift change requests and keeps supervisors read-only", async () => {
+    const submittedRequest = {
+      id: "cr-admin",
+      location: "l1",
+      location_name: "本館",
+      monthly_shift_plan: "m1",
+      publication: "pub1",
+      publication_version: 1,
+      publication_assignment: "pub-a1",
+      requester: "u1",
+      requester_display_name: "スタッフA",
+      target_staff: "u1",
+      target_staff_display_name: "スタッフA",
+      requested_staff: null,
+      requested_staff_display_name: "",
+      request_type: "cover_request",
+      status: "submitted",
+      priority: "high",
+      work_date: "2028-02-01",
+      original_start_offset_minutes: 510,
+      original_end_offset_minutes: 1020,
+      original_pattern_name_snapshot: "早番",
+      original_pattern_short_name_snapshot: "早",
+      requested_work_date: null,
+      requested_shift_pattern: null,
+      requested_shift_pattern_name: "",
+      requested_start_offset_minutes: null,
+      requested_end_offset_minutes: null,
+      requested_notes: "",
+      reason: "代行依頼",
+      manager_note: "",
+      submitted_at: "2028-01-25T00:00:00+09:00",
+      approved_at: null,
+      rejected_at: null,
+      cancelled_at: null,
+      applied_at: null,
+      can_edit: false,
+      can_submit: false,
+      can_cancel: true,
+      can_approve: true,
+      can_apply: false,
+      created_at: "2028-01-25T00:00:00+09:00",
+      updated_at: "2028-01-25T00:00:00+09:00",
+      is_active: true,
+    };
+    mockAuthAndApi(["shift_manager"], {
+      "/api/v1/staff/": { count: 1, next: null, previous: null, results: [{ id: "u2", display_name: "スタッフB" }] },
+      "/api/v1/shift-change-requests/": (input: RequestInfo | URL) => {
+        if (String(input).includes("/approve/")) return { ...submittedRequest, status: "approved", can_approve: false, can_apply: true, manager_note: "承認" };
+        if (String(input).includes("/apply/")) return { ...submittedRequest, status: "applied", can_approve: false, can_apply: false, manager_note: "反映" };
+        return { count: 1, next: null, previous: null, results: [submittedRequest] };
+      },
+    });
+    renderWithAuth(<ShiftChangeRequestsPage />);
+    expect(await screen.findByText("シフト変更申請管理")).toBeInTheDocument();
+    expect(await screen.findByText("代行依頼")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "詳細" }));
+    await userEvent.selectOptions(screen.getByLabelText("代行/交換スタッフ"), "u2");
+    await userEvent.type(screen.getByLabelText("管理メモ"), "承認");
+    await userEvent.click(screen.getByRole("button", { name: "承認" }));
+    await userEvent.click(await screen.findByRole("button", { name: "反映" }));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/shift-change-requests/cr-admin/approve/"), expect.anything());
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/shift-change-requests/cr-admin/apply/"), expect.anything());
+
+    cleanup();
+    mockAuthAndApi(["supervisor"], {
+      "/api/v1/staff/": { count: 1, next: null, previous: null, results: [{ id: "u2", display_name: "スタッフB" }] },
+      "/api/v1/shift-change-requests/": { count: 1, next: null, previous: null, results: [{ ...submittedRequest, can_approve: false, can_cancel: false }] },
+    });
+    renderWithAuth(<ShiftChangeRequestsPage />);
+    await userEvent.click(await screen.findByRole("button", { name: "詳細" }));
+    expect(screen.getByText("閲覧のみです。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "承認" })).not.toBeInTheDocument();
   });
 
   it("calculates timeline positions and clamps next-day segments", () => {
@@ -1043,9 +1218,11 @@ describe("shift settings pages", () => {
     await userEvent.type(screen.getByLabelText("月"), "2");
     await userEvent.click(await screen.findByRole("button", { name: "月間表を開く" }));
     expect(await screen.findByText("スタッフA")).toBeInTheDocument();
+    expect(screen.getByText("変更反映済み")).toBeInTheDocument();
     expect(document.body.textContent).toContain("29");
     await userEvent.click(screen.getByText("早"));
     expect(await screen.findByText("2028-02-01")).toBeInTheDocument();
+    expect(screen.getByText("drop_shift / submitted / 急用")).toBeInTheDocument();
     await userEvent.selectOptions(screen.getByLabelText("週間テンプレート"), "t1");
     await userEvent.click(screen.getByRole("button", { name: "生成プレビュー" }));
     expect(await screen.findByText(/エラー 1/)).toBeInTheDocument();

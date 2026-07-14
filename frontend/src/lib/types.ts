@@ -452,6 +452,8 @@ export type MyPublishedShift = {
     month: number;
     published_at: string;
   };
+  is_month_closed: boolean;
+  closing_period: { id: string; name: string; status: string } | null;
 };
 
 export type AttendanceStatus =
@@ -484,6 +486,9 @@ export type AttendanceSummary = {
   warning_count: number;
   warnings: AttendanceWarning[];
   confirmed_at: string | null;
+  is_month_closed?: boolean;
+  closing_period?: string | null;
+  closing_period_name?: string;
 };
 
 export type AttendanceEvent = {
@@ -547,6 +552,167 @@ export type AttendanceCorrectionRequest = {
   created_at: string;
   updated_at: string;
   is_active: boolean;
+};
+
+export type AttendanceClosingStatus = "draft" | "review" | "closed" | "reopened" | "archived";
+
+export type AttendanceClosingPeriod = {
+  id: string;
+  location: string;
+  location_name: string;
+  location_code: string;
+  year: number;
+  month: number;
+  name: string;
+  description: string;
+  status: AttendanceClosingStatus;
+  content_hash: string;
+  validation_fingerprint: string;
+  closed_at: string | null;
+  closed_by: string | null;
+  closed_by_display_name: string;
+  reopened_at: string | null;
+  reopened_by: string | null;
+  reopened_by_display_name: string;
+  snapshot_count: number;
+  staff_summary_count: number;
+  created_at: string;
+  updated_at: string;
+  is_active: boolean;
+};
+
+export type AttendanceClosingIssue = {
+  severity: "warning" | "error";
+  code: string;
+  message: string;
+};
+
+export type AttendanceClosingPreviewItem = {
+  attendance_record: string | null;
+  location: string;
+  location_name: string;
+  staff: string;
+  staff_display_name: string;
+  employee_code: string;
+  work_date: string;
+  status: AttendanceStatus;
+  source: AttendanceSource;
+  scheduled_start_offset_minutes: number | null;
+  scheduled_end_offset_minutes: number | null;
+  actual_clock_in_at: string | null;
+  actual_clock_out_at: string | null;
+  actual_start_offset_minutes: number | null;
+  actual_end_offset_minutes: number | null;
+  break_minutes: number;
+  worked_minutes: number;
+  difference_start_minutes: number | null;
+  difference_end_minutes: number | null;
+  difference_worked_minutes: number | null;
+  warning_count: number;
+  warnings: AttendanceClosingIssue[];
+  errors: AttendanceClosingIssue[];
+  issues: AttendanceClosingIssue[];
+  manager_note: string;
+  staff_note: string;
+  confirmed_at: string | null;
+};
+
+export type AttendanceClosingStaffSummary = {
+  id?: string;
+  closing_period?: string;
+  staff: string;
+  staff_display_name_snapshot: string;
+  employee_code_snapshot: string;
+  scheduled_days: number;
+  attendance_record_days: number;
+  worked_days: number;
+  unscheduled_work_days: number;
+  scheduled_minutes: number;
+  worked_minutes: number;
+  break_minutes: number;
+  late_count: number;
+  early_leave_count: number;
+  missing_clock_in_count: number;
+  missing_clock_out_count: number;
+  open_break_count: number;
+  warning_count: number;
+  confirmed_count: number;
+  unconfirmed_count: number;
+  pending_correction_count: number;
+};
+
+export type AttendanceClosingRecordSnapshot = {
+  id: string;
+  closing_period: string;
+  attendance_record: string | null;
+  location: string;
+  location_name_snapshot: string;
+  staff: string;
+  staff_display_name_snapshot: string;
+  employee_code_snapshot: string;
+  work_date: string;
+  status_snapshot: AttendanceStatus;
+  source_snapshot: AttendanceSource;
+  scheduled_start_offset_minutes: number | null;
+  scheduled_end_offset_minutes: number | null;
+  actual_clock_in_at: string | null;
+  actual_clock_out_at: string | null;
+  actual_start_offset_minutes: number | null;
+  actual_end_offset_minutes: number | null;
+  break_minutes: number;
+  worked_minutes: number;
+  difference_start_minutes: number | null;
+  difference_end_minutes: number | null;
+  difference_worked_minutes: number | null;
+  warning_count: number;
+  warnings: AttendanceWarning[];
+  manager_note_snapshot: string;
+  staff_note_snapshot: string;
+  confirmed_at: string | null;
+};
+
+export type AttendanceClosingPreview = {
+  period: string | null;
+  location: string;
+  year: number;
+  month: number;
+  status: AttendanceClosingStatus | "live";
+  content_hash: string;
+  validation_fingerprint: string;
+  summary: {
+    date_from: string;
+    date_to: string;
+    snapshot_count: number;
+    staff_summary_count: number;
+    staff_count: number;
+    attendance_record_count: number;
+    scheduled_count: number;
+    warning_count: number;
+    error_count: number;
+    worked_minutes: number;
+    break_minutes: number;
+  };
+  items: AttendanceClosingPreviewItem[];
+  staff_summaries: AttendanceClosingStaffSummary[];
+  can_close: boolean;
+};
+
+export type MyAttendanceMonthlyItem = {
+  period: string | null;
+  location: string;
+  location_name: string;
+  year: number;
+  month: number;
+  status: AttendanceClosingStatus | "live";
+  is_closed: boolean;
+  summary: AttendanceClosingStaffSummary | null;
+  daily: Array<AttendanceClosingPreviewItem | AttendanceClosingRecordSnapshot>;
+  warnings: AttendanceWarning[];
+};
+
+export type MyAttendanceMonthlyResponse = {
+  results: MyAttendanceMonthlyItem[];
+  count: number;
 };
 
 export type AttendanceRecord = AttendanceSummary & {

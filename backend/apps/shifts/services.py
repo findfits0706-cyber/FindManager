@@ -1,6 +1,9 @@
 import calendar
+import csv
 import hashlib
+import io
 import json
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -17,6 +20,9 @@ from apps.accounts.services import create_audit_event
 from apps.operations.models import Location, StaffCapability, StaffLocation, WorkArea, WorkType, WorkTypeAvailability
 
 from .models import (
+    AttendanceClosingPeriod,
+    AttendanceClosingRecordSnapshot,
+    AttendanceClosingStaffSummary,
     AttendanceCorrectionRequest,
     AttendanceEvent,
     AttendanceRecord,
@@ -149,6 +155,15 @@ EVENT_MAP = {
         "approve": "attendance_correction_approved",
         "reject": "attendance_correction_rejected",
         "apply": "attendance_correction_applied",
+    },
+    "attendance_closing_period": {
+        "create": "attendance_closing_period_created",
+        "update": "attendance_closing_period_updated",
+        "preview": "attendance_closing_period_previewed",
+        "close": "attendance_closing_period_closed",
+        "reopen": "attendance_closing_period_reopened",
+        "archive": "attendance_closing_period_archived",
+        "export": "attendance_closing_period_exported",
     },
 }
 
@@ -1396,6 +1411,1046 @@ ATTENDANCE_CORRECTION_TERMINAL_STATUSES = {
     AttendanceCorrectionRequest.Status.CANCELLED,
     AttendanceCorrectionRequest.Status.APPLIED,
 }
+ATTENDANCE_CLOSING_LOCK_MESSAGE = "月次勤怠締め済み期間のため勤怠は変更できません。"
+
+
+def _stable_sha256(payload: dict | list) -> str:
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _month_range(year: int, month: int) -> tuple[date, date]:
+    return date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1])
+
+
+def _issue(severity: str, code: str, message: str) -> dict:
+    return {"severity": severity, "code": code, "message": message}
+
+
+def _warning(code: str, message: str) -> dict:
+    return _issue("warning", code, message)
+
+
+def _error(code: str, message: str) -> dict:
+    return _issue("error", code, message)
+
+
+def _datetime_payload(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+def _offset_label(value: int | None) -> str:
+    if value is None:
+        return ""
+    hours, minutes = divmod(value, 60)
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def _dedupe_issues(issues: list[dict]) -> list[dict]:
+    seen = set()
+    result = []
+    for item in issues:
+        key = (item["severity"], item["code"], item["message"])
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def attendance_closing_period_metadata(period: AttendanceClosingPeriod, preview: dict | None = None) -> dict:
+    summary = (preview or {}).get("summary", {})
+    return {
+        "period_id": str(period.id),
+        "location_id": str(period.location_id),
+        "year": period.year,
+        "month": period.month,
+        "status": period.status,
+        "content_hash": period.content_hash or (preview or {}).get("content_hash", ""),
+        "validation_fingerprint": period.validation_fingerprint or (preview or {}).get("validation_fingerprint", ""),
+        "staff_summary_count": summary.get("staff_summary_count", period.staff_summaries.count() if period.pk else 0),
+        "snapshot_count": summary.get("snapshot_count", period.record_snapshots.count() if period.pk else 0),
+        "warning_count": summary.get("warning_count", 0),
+        "error_count": summary.get("error_count", 0),
+    }
+
+
+def is_attendance_period_closed(location: Location, work_date: date) -> AttendanceClosingPeriod | None:
+    return (
+        AttendanceClosingPeriod.objects.filter(
+            location=location,
+            year=work_date.year,
+            month=work_date.month,
+            status=AttendanceClosingPeriod.Status.CLOSED,
+            is_active=True,
+        )
+        .select_related("location")
+        .first()
+    )
+
+
+def ensure_attendance_record_not_month_closed(location: Location, work_date: date):
+    period = is_attendance_period_closed(location, work_date)
+    if period is not None:
+        raise DRFValidationError(
+            {
+                "work_date": (
+                    f"{ATTENDANCE_CLOSING_LOCK_MESSAGE}"
+                    f" 対象: {period.location.short_name} {period.year}-{period.month:02d}"
+                )
+            }
+        )
+
+
+def get_attendance_closed_period_lookup(
+    *,
+    location_ids: set | list,
+    date_from: date,
+    date_to: date,
+) -> dict[tuple[str, int, int], AttendanceClosingPeriod]:
+    if not location_ids:
+        return {}
+    months = {
+        (current.year, current.month)
+        for current in month_dates(date_from.year, date_from.month)
+        if date_from <= current <= date_to
+    }
+    current = date(date_from.year, date_from.month, 1)
+    while current <= date_to:
+        months.add((current.year, current.month))
+        if current.month == 12:
+            current = date(current.year + 1, 1, 1)
+        else:
+            current = date(current.year, current.month + 1, 1)
+    query = Q()
+    for year, month in months:
+        query |= Q(year=year, month=month)
+    if not query:
+        return {}
+    periods = AttendanceClosingPeriod.objects.filter(
+        query,
+        location_id__in=location_ids,
+        status=AttendanceClosingPeriod.Status.CLOSED,
+        is_active=True,
+    ).select_related("location")
+    return {(str(period.location_id), period.year, period.month): period for period in periods}
+
+
+def closed_period_from_lookup(
+    lookup: dict[tuple[str, int, int], AttendanceClosingPeriod] | None,
+    *,
+    location_id,
+    work_date: date,
+) -> AttendanceClosingPeriod | None:
+    if not lookup:
+        return None
+    return lookup.get((str(location_id), work_date.year, work_date.month))
+
+
+def _active_publication_for_period(period: AttendanceClosingPeriod) -> MonthlyShiftPublication | None:
+    return (
+        MonthlyShiftPublication.objects.filter(
+            location=period.location,
+            year=period.year,
+            month=period.month,
+            is_active=True,
+            withdrawn_at__isnull=True,
+        )
+        .select_related("monthly_shift_plan", "location")
+        .order_by("-version")
+        .first()
+    )
+
+
+def _scheduled_from_publication(period: AttendanceClosingPeriod) -> dict[tuple[str, date], dict]:
+    publication = _active_publication_for_period(period)
+    if publication is None:
+        return {}
+    assignments = (
+        MonthlyShiftPublicationAssignment.objects.filter(publication=publication)
+        .select_related("staff", "publication", "publication__monthly_shift_plan", "source_assignment")
+        .prefetch_related("segments")
+        .order_by("work_date", "display_order", "staff_id", "id")
+    )
+    result = {}
+    for assignment in assignments:
+        scheduled = _scheduled_values_from_segments(assignment.segments.all())
+        result[(str(assignment.staff_id), assignment.work_date)] = {
+            "staff": assignment.staff,
+            "work_date": assignment.work_date,
+            "monthly_shift_plan": assignment.publication.monthly_shift_plan,
+            "monthly_shift_assignment": assignment.source_assignment,
+            "publication": assignment.publication,
+            "publication_assignment": assignment,
+            "scheduled_start_offset_minutes": scheduled["scheduled_start_offset_minutes"],
+            "scheduled_end_offset_minutes": scheduled["scheduled_end_offset_minutes"],
+            "scheduled_worked_minutes": scheduled["scheduled_worked_minutes"],
+            "scheduled_pattern_name_snapshot": assignment.pattern_name_snapshot,
+            "scheduled_pattern_short_name_snapshot": assignment.pattern_short_name_snapshot,
+        }
+    return result
+
+
+def _scheduled_from_monthly_assignments(
+    period: AttendanceClosingPeriod,
+    existing_keys: set,
+) -> dict[tuple[str, date], dict]:
+    assignments = (
+        MonthlyShiftAssignment.objects.filter(
+            monthly_shift_plan__location=period.location,
+            monthly_shift_plan__year=period.year,
+            monthly_shift_plan__month=period.month,
+            monthly_shift_plan__is_active=True,
+            is_active=True,
+        )
+        .select_related("staff", "monthly_shift_plan")
+        .prefetch_related("segments")
+        .order_by("work_date", "display_order", "staff_id", "id")
+    )
+    result = {}
+    for assignment in assignments:
+        key = (str(assignment.staff_id), assignment.work_date)
+        if key in existing_keys:
+            continue
+        scheduled = _scheduled_values_from_segments(
+            [segment for segment in assignment.segments.all() if segment.is_active]
+        )
+        result[key] = {
+            "staff": assignment.staff,
+            "work_date": assignment.work_date,
+            "monthly_shift_plan": assignment.monthly_shift_plan,
+            "monthly_shift_assignment": assignment,
+            "publication": None,
+            "publication_assignment": None,
+            "scheduled_start_offset_minutes": scheduled["scheduled_start_offset_minutes"],
+            "scheduled_end_offset_minutes": scheduled["scheduled_end_offset_minutes"],
+            "scheduled_worked_minutes": scheduled["scheduled_worked_minutes"],
+            "scheduled_pattern_name_snapshot": assignment.pattern_name_snapshot,
+            "scheduled_pattern_short_name_snapshot": assignment.pattern_short_name_snapshot,
+        }
+    return result
+
+
+def _scheduled_items_for_period(period: AttendanceClosingPeriod) -> dict[tuple[str, date], dict]:
+    published = _scheduled_from_publication(period)
+    fallback = _scheduled_from_monthly_assignments(period, set(published))
+    return published | fallback
+
+
+def _attendance_records_for_period(period: AttendanceClosingPeriod) -> list[AttendanceRecord]:
+    start_date, end_date = _month_range(period.year, period.month)
+    return list(
+        AttendanceRecord.objects.filter(
+            location=period.location,
+            work_date__gte=start_date,
+            work_date__lte=end_date,
+            is_active=True,
+        )
+        .select_related(
+            "location",
+            "staff",
+            "monthly_shift_plan",
+            "monthly_shift_assignment",
+            "publication",
+            "publication_assignment",
+            "confirmed_by",
+        )
+        .prefetch_related(
+            "events",
+            "correction_requests",
+            "publication_assignment__segments",
+            "monthly_shift_assignment__segments",
+        )
+        .order_by("work_date", "staff_id", "id")
+    )
+
+
+def _staff_for_period(period: AttendanceClosingPeriod, staff_ids: set) -> dict[str, User]:
+    start_date, end_date = _month_range(period.year, period.month)
+    location_staff_ids = set(
+        StaffLocation.objects.filter(
+            location=period.location,
+            is_active=True,
+            staff__is_active=True,
+            location__is_active=True,
+            valid_from__lte=end_date,
+        )
+        .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=start_date))
+        .values_list("staff_id", flat=True)
+    )
+    all_staff_ids = staff_ids | location_staff_ids
+    return {str(staff.id): staff for staff in User.objects.filter(id__in=all_staff_ids).order_by("employee_code")}
+
+
+def _record_warning_issues(record: AttendanceRecord) -> list[dict]:
+    issues = [
+        _warning(item.get("code", "attendance_warning"), item.get("message", "勤怠warningがあります。"))
+        for item in record.warnings
+        if isinstance(item, dict)
+    ]
+    if record.status == AttendanceRecord.Status.OPEN:
+        issues.append(_warning("not_clocked", "勤怠が未打刻です。"))
+    if record.status == AttendanceRecord.Status.CLOCKED_IN:
+        issues.append(_warning("missing_clock_out", "退勤打刻がありません。"))
+    if record.status == AttendanceRecord.Status.ON_BREAK:
+        issues.append(_warning("open_break", "終了していない休憩があります。"))
+    if record.status != AttendanceRecord.Status.CONFIRMED:
+        issues.append(_warning("unconfirmed_attendance", "勤怠が未確定です。"))
+    open_corrections = [
+        correction
+        for correction in record.correction_requests.all()
+        if correction.is_active and correction.status in ATTENDANCE_CORRECTION_OPEN_STATUSES
+    ]
+    if open_corrections:
+        issues.append(_warning("pending_correction", "未完了の勤怠修正申請があります。"))
+    return issues
+
+
+def _record_error_issues(record: AttendanceRecord, *, duplicate: bool = False) -> list[dict]:
+    issues = []
+    if duplicate:
+        issues.append(_error("duplicate_attendance_record", "同じスタッフ・日付・拠点の有効勤怠が重複しています。"))
+    if (
+        record.status != AttendanceRecord.Status.VOID
+        and record.actual_start_offset_minutes is not None
+        and record.actual_end_offset_minutes is not None
+        and record.actual_start_offset_minutes >= record.actual_end_offset_minutes
+    ):
+        issues.append(_error("invalid_actual_time", "実績退勤は実績出勤より後である必要があります。"))
+    approved_corrections = [
+        correction
+        for correction in record.correction_requests.all()
+        if correction.is_active and correction.status == AttendanceCorrectionRequest.Status.APPROVED
+    ]
+    if approved_corrections:
+        issues.append(_error("approved_correction_not_applied", "承認済みの勤怠修正申請が未反映です。"))
+    return issues
+
+
+def _preview_item_from_schedule_only(period: AttendanceClosingPeriod, schedule: dict) -> dict:
+    staff = schedule["staff"]
+    issues = [
+        _warning("scheduled_shift_without_record", "公開または月間シフトに予定がありますが勤怠がありません。"),
+        _warning("missing_clock_in", "出勤打刻がありません。"),
+        _warning("unconfirmed_attendance", "勤怠が未確定です。"),
+    ]
+    return {
+        "attendance_record": None,
+        "location": str(period.location_id),
+        "location_code": period.location.code,
+        "location_name": period.location.name,
+        "staff": str(staff.id),
+        "staff_display_name": staff.display_name,
+        "employee_code": staff.employee_code,
+        "work_date": schedule["work_date"].isoformat(),
+        "monthly_shift_plan": str(schedule["monthly_shift_plan"].id) if schedule["monthly_shift_plan"] else None,
+        "monthly_shift_assignment": (
+            str(schedule["monthly_shift_assignment"].id) if schedule["monthly_shift_assignment"] else None
+        ),
+        "publication": str(schedule["publication"].id) if schedule["publication"] else None,
+        "publication_assignment": (
+            str(schedule["publication_assignment"].id) if schedule["publication_assignment"] else None
+        ),
+        "status": AttendanceRecord.Status.OPEN,
+        "source": AttendanceRecord.Source.SCHEDULED,
+        "scheduled_start_offset_minutes": schedule["scheduled_start_offset_minutes"],
+        "scheduled_end_offset_minutes": schedule["scheduled_end_offset_minutes"],
+        "scheduled_worked_minutes": schedule["scheduled_worked_minutes"],
+        "scheduled_pattern_name_snapshot": schedule["scheduled_pattern_name_snapshot"],
+        "scheduled_pattern_short_name_snapshot": schedule["scheduled_pattern_short_name_snapshot"],
+        "actual_clock_in_at": None,
+        "actual_clock_out_at": None,
+        "actual_start_offset_minutes": None,
+        "actual_end_offset_minutes": None,
+        "break_minutes": 0,
+        "worked_minutes": 0,
+        "difference_start_minutes": None,
+        "difference_end_minutes": None,
+        "difference_worked_minutes": -schedule["scheduled_worked_minutes"]
+        if schedule["scheduled_worked_minutes"] is not None
+        else None,
+        "warning_count": len(issues),
+        "warnings": issues,
+        "errors": [],
+        "issues": issues,
+        "manager_note": "",
+        "staff_note": "",
+        "confirmed_at": None,
+        "confirmed_by": None,
+        "confirmed_by_display_name": "",
+    }
+
+
+def _preview_item_from_record(
+    period: AttendanceClosingPeriod,
+    record: AttendanceRecord,
+    schedule: dict | None,
+    *,
+    duplicate: bool = False,
+) -> dict:
+    scheduled_worked = _scheduled_worked_minutes(record)
+    if schedule is not None:
+        scheduled_start = schedule["scheduled_start_offset_minutes"]
+        scheduled_end = schedule["scheduled_end_offset_minutes"]
+        scheduled_worked = schedule["scheduled_worked_minutes"]
+        monthly_shift_plan = schedule["monthly_shift_plan"]
+        monthly_shift_assignment = schedule["monthly_shift_assignment"]
+        publication = schedule["publication"]
+        publication_assignment = schedule["publication_assignment"]
+        pattern_name = schedule["scheduled_pattern_name_snapshot"]
+        pattern_short_name = schedule["scheduled_pattern_short_name_snapshot"]
+    else:
+        scheduled_start = record.scheduled_start_offset_minutes
+        scheduled_end = record.scheduled_end_offset_minutes
+        monthly_shift_plan = record.monthly_shift_plan
+        monthly_shift_assignment = record.monthly_shift_assignment
+        publication = record.publication
+        publication_assignment = record.publication_assignment
+        pattern_name = record.scheduled_pattern_name_snapshot
+        pattern_short_name = record.scheduled_pattern_short_name_snapshot
+    warnings = _record_warning_issues(record)
+    if schedule is None and record.worked_minutes > 0:
+        warnings.append(_warning("unscheduled_work", "予定がない勤怠実績です。"))
+    if publication is None and record.publication_id is None:
+        warnings.append(_warning("record_without_publication", "公開シフトに紐づかない勤怠です。"))
+    errors = _record_error_issues(record, duplicate=duplicate)
+    issues = _dedupe_issues(warnings + errors)
+    return {
+        "attendance_record": str(record.id),
+        "location": str(record.location_id),
+        "location_code": record.location.code,
+        "location_name": record.location.name,
+        "staff": str(record.staff_id),
+        "staff_display_name": record.staff.display_name,
+        "employee_code": record.staff.employee_code,
+        "work_date": record.work_date.isoformat(),
+        "monthly_shift_plan": str(monthly_shift_plan.id) if monthly_shift_plan else None,
+        "monthly_shift_assignment": str(monthly_shift_assignment.id) if monthly_shift_assignment else None,
+        "publication": str(publication.id) if publication else None,
+        "publication_assignment": str(publication_assignment.id) if publication_assignment else None,
+        "status": record.status,
+        "source": record.source,
+        "scheduled_start_offset_minutes": scheduled_start,
+        "scheduled_end_offset_minutes": scheduled_end,
+        "scheduled_worked_minutes": scheduled_worked,
+        "scheduled_pattern_name_snapshot": pattern_name,
+        "scheduled_pattern_short_name_snapshot": pattern_short_name,
+        "actual_clock_in_at": _datetime_payload(record.actual_clock_in_at),
+        "actual_clock_out_at": _datetime_payload(record.actual_clock_out_at),
+        "actual_start_offset_minutes": record.actual_start_offset_minutes,
+        "actual_end_offset_minutes": record.actual_end_offset_minutes,
+        "break_minutes": record.break_minutes,
+        "worked_minutes": record.worked_minutes,
+        "difference_start_minutes": record.difference_start_minutes,
+        "difference_end_minutes": record.difference_end_minutes,
+        "difference_worked_minutes": record.difference_worked_minutes,
+        "warning_count": sum(1 for item in issues if item["severity"] == "warning"),
+        "warnings": [item for item in issues if item["severity"] == "warning"],
+        "errors": [item for item in issues if item["severity"] == "error"],
+        "issues": issues,
+        "manager_note": record.manager_note,
+        "staff_note": record.staff_note,
+        "confirmed_at": _datetime_payload(record.confirmed_at),
+        "confirmed_by": str(record.confirmed_by_id) if record.confirmed_by_id else None,
+        "confirmed_by_display_name": record.confirmed_by.display_name if record.confirmed_by_id else "",
+    }
+
+
+def _closing_content_payload(
+    period: AttendanceClosingPeriod,
+    items: list[dict],
+    records: list[AttendanceRecord],
+) -> dict:
+    events = []
+    corrections = []
+    for record in records:
+        for event in record.events.all():
+            events.append(
+                {
+                    "attendance_record": str(record.id),
+                    "event_type": event.event_type,
+                    "occurred_at": event.occurred_at.isoformat(),
+                    "offset_minutes": event.offset_minutes,
+                    "source": event.source,
+                    "actor": str(event.actor_id),
+                    "note": event.note,
+                    "metadata": event.metadata,
+                }
+            )
+        for correction in record.correction_requests.all():
+            if not correction.is_active:
+                continue
+            corrections.append(
+                {
+                    "attendance_record": str(record.id),
+                    "correction": str(correction.id),
+                    "status": correction.status,
+                    "requested_clock_in_at": _datetime_payload(correction.requested_clock_in_at),
+                    "requested_clock_out_at": _datetime_payload(correction.requested_clock_out_at),
+                    "requested_break_minutes": correction.requested_break_minutes,
+                    "requested_staff_note": correction.requested_staff_note,
+                    "reason": correction.reason,
+                    "manager_note": correction.manager_note,
+                }
+            )
+    content_items = [
+        {
+            key: item.get(key)
+            for key in [
+                "attendance_record",
+                "location",
+                "staff",
+                "work_date",
+                "monthly_shift_plan",
+                "monthly_shift_assignment",
+                "publication",
+                "publication_assignment",
+                "status",
+                "source",
+                "scheduled_start_offset_minutes",
+                "scheduled_end_offset_minutes",
+                "scheduled_worked_minutes",
+                "actual_clock_in_at",
+                "actual_clock_out_at",
+                "actual_start_offset_minutes",
+                "actual_end_offset_minutes",
+                "break_minutes",
+                "worked_minutes",
+                "difference_start_minutes",
+                "difference_end_minutes",
+                "difference_worked_minutes",
+                "manager_note",
+                "staff_note",
+                "confirmed_at",
+                "confirmed_by",
+            ]
+        }
+        for item in sorted(items, key=lambda value: (value["location"], value["staff"], value["work_date"]))
+    ]
+    return {
+        "period": {
+            "location": str(period.location_id),
+            "year": period.year,
+            "month": period.month,
+        },
+        "items": content_items,
+        "events": sorted(
+            events,
+            key=lambda value: (value["attendance_record"], value["occurred_at"], value["event_type"]),
+        ),
+        "corrections": sorted(corrections, key=lambda value: (value["attendance_record"], value["correction"])),
+    }
+
+
+def build_attendance_closing_content_hash(
+    period: AttendanceClosingPeriod,
+    *,
+    items: list[dict] | None = None,
+    records: list[AttendanceRecord] | None = None,
+) -> str:
+    if items is None or records is None:
+        preview = build_attendance_closing_preview(period)
+        return preview["content_hash"]
+    return _stable_sha256(_closing_content_payload(period, items, records))
+
+
+def build_attendance_closing_validation_fingerprint(
+    period: AttendanceClosingPeriod,
+    *,
+    items: list[dict] | None = None,
+    content_hash: str | None = None,
+) -> str:
+    if items is None:
+        preview = build_attendance_closing_preview(period)
+        return preview["validation_fingerprint"]
+    payload = {
+        "period": str(period.id),
+        "location": str(period.location_id),
+        "year": period.year,
+        "month": period.month,
+        "content_hash": content_hash or "",
+        "items": [
+            {
+                "attendance_record": item.get("attendance_record") or "",
+                "staff": item["staff"],
+                "work_date": item["work_date"],
+                "issues": sorted(
+                    [
+                        {"severity": issue["severity"], "code": issue["code"], "message": issue["message"]}
+                        for issue in item.get("issues", [])
+                    ],
+                    key=lambda issue: (issue["severity"], issue["code"], issue["message"]),
+                ),
+            }
+            for item in sorted(
+                items,
+                key=lambda value: (value["staff"], value["work_date"], value.get("attendance_record") or ""),
+            )
+        ],
+    }
+    return _stable_sha256(payload)
+
+
+def build_attendance_closing_staff_summaries(period: AttendanceClosingPeriod, items: list[dict]) -> list[dict]:
+    summaries = {}
+    for item in items:
+        summary = summaries.setdefault(
+            item["staff"],
+            {
+                "closing_period": str(period.id),
+                "staff": item["staff"],
+                "staff_display_name_snapshot": item["staff_display_name"],
+                "employee_code_snapshot": item["employee_code"],
+                "scheduled_days": 0,
+                "attendance_record_days": 0,
+                "worked_days": 0,
+                "unscheduled_work_days": 0,
+                "scheduled_minutes": 0,
+                "worked_minutes": 0,
+                "break_minutes": 0,
+                "late_count": 0,
+                "early_leave_count": 0,
+                "missing_clock_in_count": 0,
+                "missing_clock_out_count": 0,
+                "open_break_count": 0,
+                "warning_count": 0,
+                "confirmed_count": 0,
+                "unconfirmed_count": 0,
+                "pending_correction_count": 0,
+            },
+        )
+        if (
+            item.get("scheduled_start_offset_minutes") is not None
+            or item.get("scheduled_end_offset_minutes") is not None
+        ):
+            summary["scheduled_days"] += 1
+        if item.get("attendance_record"):
+            summary["attendance_record_days"] += 1
+        if item.get("worked_minutes", 0) > 0:
+            summary["worked_days"] += 1
+        summary["scheduled_minutes"] += item.get("scheduled_worked_minutes") or 0
+        summary["worked_minutes"] += item.get("worked_minutes") or 0
+        summary["break_minutes"] += item.get("break_minutes") or 0
+        warning_codes = {warning["code"] for warning in item.get("warnings", [])}
+        if "unscheduled_work" in warning_codes:
+            summary["unscheduled_work_days"] += 1
+        if "late_clock_in" in warning_codes:
+            summary["late_count"] += 1
+        if "early_clock_out" in warning_codes:
+            summary["early_leave_count"] += 1
+        if "missing_clock_in" in warning_codes:
+            summary["missing_clock_in_count"] += 1
+        if "missing_clock_out" in warning_codes:
+            summary["missing_clock_out_count"] += 1
+        if "open_break" in warning_codes:
+            summary["open_break_count"] += 1
+        if "pending_correction" in warning_codes or item["status"] == AttendanceRecord.Status.PENDING_CORRECTION:
+            summary["pending_correction_count"] += 1
+        summary["warning_count"] += item.get("warning_count", 0)
+        if item["status"] == AttendanceRecord.Status.CONFIRMED:
+            summary["confirmed_count"] += 1
+        else:
+            summary["unconfirmed_count"] += 1
+    return list(sorted(summaries.values(), key=lambda value: (value["employee_code_snapshot"], value["staff"])))
+
+
+def build_attendance_closing_preview(period: AttendanceClosingPeriod) -> dict:
+    if period.pk:
+        period = AttendanceClosingPeriod.objects.select_related("location").get(pk=period.pk)
+    start_date, end_date = _month_range(period.year, period.month)
+    schedules = _scheduled_items_for_period(period)
+    records = _attendance_records_for_period(period)
+    record_counts = defaultdict(int)
+    for record in records:
+        record_counts[(str(record.staff_id), record.work_date, str(record.location_id))] += 1
+    record_keys = {(str(record.staff_id), record.work_date) for record in records}
+    staff_map = _staff_for_period(period, {staff_id for staff_id, _work_date in set(schedules) | record_keys})
+    items = []
+    for record in records:
+        key = (str(record.staff_id), record.work_date)
+        duplicate = record_counts[(str(record.staff_id), record.work_date, str(record.location_id))] > 1
+        items.append(_preview_item_from_record(period, record, schedules.get(key), duplicate=duplicate))
+    for key, schedule in schedules.items():
+        if key in record_keys:
+            continue
+        items.append(_preview_item_from_schedule_only(period, schedule))
+    for staff_id, staff in staff_map.items():
+        if any(item["staff"] == staff_id for item in items):
+            continue
+        items.append(
+            {
+                "attendance_record": None,
+                "location": str(period.location_id),
+                "location_code": period.location.code,
+                "location_name": period.location.name,
+                "staff": staff_id,
+                "staff_display_name": staff.display_name,
+                "employee_code": staff.employee_code,
+                "work_date": start_date.isoformat(),
+                "monthly_shift_plan": None,
+                "monthly_shift_assignment": None,
+                "publication": None,
+                "publication_assignment": None,
+                "status": AttendanceRecord.Status.OPEN,
+                "source": AttendanceRecord.Source.UNSCHEDULED,
+                "scheduled_start_offset_minutes": None,
+                "scheduled_end_offset_minutes": None,
+                "scheduled_worked_minutes": 0,
+                "scheduled_pattern_name_snapshot": "",
+                "scheduled_pattern_short_name_snapshot": "",
+                "actual_clock_in_at": None,
+                "actual_clock_out_at": None,
+                "actual_start_offset_minutes": None,
+                "actual_end_offset_minutes": None,
+                "break_minutes": 0,
+                "worked_minutes": 0,
+                "difference_start_minutes": None,
+                "difference_end_minutes": None,
+                "difference_worked_minutes": None,
+                "warning_count": 0,
+                "warnings": [],
+                "errors": [],
+                "issues": [],
+                "manager_note": "",
+                "staff_note": "",
+                "confirmed_at": None,
+                "confirmed_by": None,
+                "confirmed_by_display_name": "",
+            }
+        )
+    items = sorted(items, key=lambda value: (value["work_date"], value["employee_code"], value["staff"]))
+    content_hash = build_attendance_closing_content_hash(period, items=items, records=records)
+    validation_fingerprint = build_attendance_closing_validation_fingerprint(
+        period,
+        items=items,
+        content_hash=content_hash,
+    )
+    staff_summaries = build_attendance_closing_staff_summaries(period, items)
+    warning_count = sum(item["warning_count"] for item in items)
+    error_count = sum(len(item["errors"]) for item in items)
+    summary = {
+        "date_from": start_date.isoformat(),
+        "date_to": end_date.isoformat(),
+        "snapshot_count": len(items),
+        "staff_summary_count": len(staff_summaries),
+        "staff_count": len({item["staff"] for item in items}),
+        "attendance_record_count": sum(1 for item in items if item.get("attendance_record")),
+        "scheduled_count": sum(1 for item in items if item.get("scheduled_start_offset_minutes") is not None),
+        "warning_count": warning_count,
+        "error_count": error_count,
+        "worked_minutes": sum(item.get("worked_minutes", 0) for item in items),
+        "break_minutes": sum(item.get("break_minutes", 0) for item in items),
+    }
+    return {
+        "period": str(period.id),
+        "location": str(period.location_id),
+        "year": period.year,
+        "month": period.month,
+        "status": period.status,
+        "content_hash": content_hash,
+        "validation_fingerprint": validation_fingerprint,
+        "summary": summary,
+        "items": items,
+        "staff_summaries": staff_summaries,
+        "can_close": period.status != AttendanceClosingPeriod.Status.ARCHIVED and error_count == 0,
+    }
+
+
+def _snapshot_from_preview_item(period: AttendanceClosingPeriod, item: dict) -> AttendanceClosingRecordSnapshot:
+    return AttendanceClosingRecordSnapshot(
+        closing_period=period,
+        attendance_record_id=item["attendance_record"],
+        location_id=item["location"],
+        staff_id=item["staff"],
+        location_code_snapshot=item["location_code"],
+        location_name_snapshot=item["location_name"],
+        staff_display_name_snapshot=item["staff_display_name"],
+        employee_code_snapshot=item["employee_code"],
+        work_date=date.fromisoformat(item["work_date"]),
+        monthly_shift_plan_id=item["monthly_shift_plan"],
+        monthly_shift_assignment_id=item["monthly_shift_assignment"],
+        publication_id=item["publication"],
+        publication_assignment_id=item["publication_assignment"],
+        status_snapshot=item["status"],
+        source_snapshot=item["source"],
+        scheduled_start_offset_minutes=item["scheduled_start_offset_minutes"],
+        scheduled_end_offset_minutes=item["scheduled_end_offset_minutes"],
+        scheduled_pattern_name_snapshot=item["scheduled_pattern_name_snapshot"],
+        scheduled_pattern_short_name_snapshot=item["scheduled_pattern_short_name_snapshot"],
+        actual_clock_in_at=datetime.fromisoformat(item["actual_clock_in_at"]) if item["actual_clock_in_at"] else None,
+        actual_clock_out_at=(
+            datetime.fromisoformat(item["actual_clock_out_at"]) if item["actual_clock_out_at"] else None
+        ),
+        actual_start_offset_minutes=item["actual_start_offset_minutes"],
+        actual_end_offset_minutes=item["actual_end_offset_minutes"],
+        break_minutes=item["break_minutes"],
+        worked_minutes=item["worked_minutes"],
+        difference_start_minutes=item["difference_start_minutes"],
+        difference_end_minutes=item["difference_end_minutes"],
+        difference_worked_minutes=item["difference_worked_minutes"],
+        warning_count=item["warning_count"],
+        warnings=item["warnings"],
+        manager_note_snapshot=item["manager_note"],
+        staff_note_snapshot=item["staff_note"],
+        confirmed_at=datetime.fromisoformat(item["confirmed_at"]) if item["confirmed_at"] else None,
+        confirmed_by_id=item["confirmed_by"],
+        confirmed_by_display_name_snapshot=item["confirmed_by_display_name"],
+    )
+
+
+def build_attendance_closing_snapshots(
+    period: AttendanceClosingPeriod,
+    *,
+    preview: dict | None = None,
+) -> list[AttendanceClosingRecordSnapshot]:
+    preview = preview or build_attendance_closing_preview(period)
+    return [_snapshot_from_preview_item(period, item) for item in preview["items"]]
+
+
+def _summary_from_preview_item(period: AttendanceClosingPeriod, item: dict) -> AttendanceClosingStaffSummary:
+    return AttendanceClosingStaffSummary(
+        closing_period=period,
+        staff_id=item["staff"],
+        staff_display_name_snapshot=item["staff_display_name_snapshot"],
+        employee_code_snapshot=item["employee_code_snapshot"],
+        scheduled_days=item["scheduled_days"],
+        attendance_record_days=item["attendance_record_days"],
+        worked_days=item["worked_days"],
+        unscheduled_work_days=item["unscheduled_work_days"],
+        scheduled_minutes=item["scheduled_minutes"],
+        worked_minutes=item["worked_minutes"],
+        break_minutes=item["break_minutes"],
+        late_count=item["late_count"],
+        early_leave_count=item["early_leave_count"],
+        missing_clock_in_count=item["missing_clock_in_count"],
+        missing_clock_out_count=item["missing_clock_out_count"],
+        open_break_count=item["open_break_count"],
+        warning_count=item["warning_count"],
+        confirmed_count=item["confirmed_count"],
+        unconfirmed_count=item["unconfirmed_count"],
+        pending_correction_count=item["pending_correction_count"],
+    )
+
+
+def close_attendance_period(
+    *,
+    period: AttendanceClosingPeriod,
+    actor: User,
+    acknowledge_warnings: bool,
+    validation_fingerprint: str,
+    manager_note: str = "",
+) -> tuple[AttendanceClosingPeriod, dict]:
+    with transaction.atomic():
+        period = (
+            AttendanceClosingPeriod.objects.select_for_update(of=("self",)).select_related("location").get(pk=period.pk)
+        )
+        if period.status == AttendanceClosingPeriod.Status.ARCHIVED or not period.is_active:
+            raise DRFValidationError({"status": "アーカイブ済みの月次締めは操作できません。"})
+        if period.status == AttendanceClosingPeriod.Status.CLOSED:
+            raise DRFValidationError({"status": "既に締め済みです。"})
+        start_date, end_date = _month_range(period.year, period.month)
+        list(
+            AttendanceRecord.objects.select_for_update()
+            .filter(location=period.location, work_date__gte=start_date, work_date__lte=end_date, is_active=True)
+            .values_list("id", flat=True)
+        )
+        list(
+            AttendanceCorrectionRequest.objects.select_for_update()
+            .filter(
+                attendance_record__location=period.location,
+                attendance_record__work_date__gte=start_date,
+                attendance_record__work_date__lte=end_date,
+                is_active=True,
+            )
+            .values_list("id", flat=True)
+        )
+        preview = build_attendance_closing_preview(period)
+        if not validation_fingerprint or validation_fingerprint != preview["validation_fingerprint"]:
+            raise DRFValidationError({"validation_fingerprint": "最新のpreview結果と一致しません。"})
+        if preview["summary"]["error_count"] > 0:
+            raise DRFValidationError({"errors": "errorがあるため月次締めできません。"})
+        if preview["summary"]["warning_count"] > 0 and not acknowledge_warnings:
+            raise DRFValidationError({"acknowledge_warnings": "warningがあるため確認チェックが必要です。"})
+        period.record_snapshots.all().delete()
+        period.staff_summaries.all().delete()
+        AttendanceClosingRecordSnapshot.objects.bulk_create(build_attendance_closing_snapshots(period, preview=preview))
+        AttendanceClosingStaffSummary.objects.bulk_create(
+            [_summary_from_preview_item(period, item) for item in preview["staff_summaries"]]
+        )
+        period.status = AttendanceClosingPeriod.Status.CLOSED
+        period.closed_at = timezone.now()
+        period.closed_by = actor
+        period.updated_by = actor
+        period.content_hash = preview["content_hash"]
+        period.validation_fingerprint = preview["validation_fingerprint"]
+        if manager_note:
+            period.description = manager_note
+        period.full_clean()
+        period.save()
+        return period, preview
+
+
+def reopen_attendance_period(
+    *,
+    period: AttendanceClosingPeriod,
+    actor: User,
+    manager_note: str = "",
+) -> AttendanceClosingPeriod:
+    with transaction.atomic():
+        period = (
+            AttendanceClosingPeriod.objects.select_for_update(of=("self",)).select_related("location").get(pk=period.pk)
+        )
+        if period.status != AttendanceClosingPeriod.Status.CLOSED:
+            raise DRFValidationError({"status": "締め済み期間のみ再オープンできます。"})
+        period.status = AttendanceClosingPeriod.Status.REOPENED
+        period.reopened_at = timezone.now()
+        period.reopened_by = actor
+        period.updated_by = actor
+        if manager_note:
+            period.description = manager_note
+        period.full_clean()
+        period.save()
+        return period
+
+
+def archive_attendance_period(
+    *,
+    period: AttendanceClosingPeriod,
+    actor: User,
+    manager_note: str = "",
+) -> AttendanceClosingPeriod:
+    with transaction.atomic():
+        period = (
+            AttendanceClosingPeriod.objects.select_for_update(of=("self",)).select_related("location").get(pk=period.pk)
+        )
+        if period.status == AttendanceClosingPeriod.Status.CLOSED:
+            raise DRFValidationError({"status": "締め済み期間は再オープンしてからアーカイブしてください。"})
+        if period.status == AttendanceClosingPeriod.Status.ARCHIVED:
+            raise DRFValidationError({"status": "既にアーカイブ済みです。"})
+        period.status = AttendanceClosingPeriod.Status.ARCHIVED
+        period.is_active = False
+        period.updated_by = actor
+        if manager_note:
+            period.description = manager_note
+        period.full_clean()
+        period.save()
+        return period
+
+
+def _closing_csv_rows_from_preview(preview: dict, closing_status_label: str) -> list[list]:
+    rows = []
+    for item in preview["items"]:
+        rows.append(
+            [
+                item["location_name"],
+                f"{preview['year']}-{preview['month']:02d}",
+                item["employee_code"],
+                item["staff_display_name"],
+                item["work_date"],
+                _offset_label(item["scheduled_start_offset_minutes"]),
+                _offset_label(item["scheduled_end_offset_minutes"]),
+                item["actual_clock_in_at"] or "",
+                item["actual_clock_out_at"] or "",
+                item["break_minutes"],
+                item["worked_minutes"],
+                item["difference_start_minutes"] if item["difference_start_minutes"] is not None else "",
+                item["difference_end_minutes"] if item["difference_end_minutes"] is not None else "",
+                item["difference_worked_minutes"] if item["difference_worked_minutes"] is not None else "",
+                item["status"],
+                item["source"],
+                item["warning_count"],
+                " ".join(warning["code"] for warning in item["warnings"]),
+                item["manager_note"],
+                item["staff_note"],
+                item["confirmed_at"] or "",
+                closing_status_label,
+            ]
+        )
+    return rows
+
+
+def _closing_csv_rows_from_snapshots(period: AttendanceClosingPeriod) -> list[list]:
+    snapshots = (
+        period.record_snapshots.select_related("location", "staff")
+        .all()
+        .order_by("work_date", "employee_code_snapshot", "staff_display_name_snapshot")
+    )
+    rows = []
+    for item in snapshots:
+        rows.append(
+            [
+                item.location_name_snapshot,
+                f"{period.year}-{period.month:02d}",
+                item.employee_code_snapshot,
+                item.staff_display_name_snapshot,
+                item.work_date.isoformat(),
+                _offset_label(item.scheduled_start_offset_minutes),
+                _offset_label(item.scheduled_end_offset_minutes),
+                item.actual_clock_in_at.isoformat() if item.actual_clock_in_at else "",
+                item.actual_clock_out_at.isoformat() if item.actual_clock_out_at else "",
+                item.break_minutes,
+                item.worked_minutes,
+                item.difference_start_minutes if item.difference_start_minutes is not None else "",
+                item.difference_end_minutes if item.difference_end_minutes is not None else "",
+                item.difference_worked_minutes if item.difference_worked_minutes is not None else "",
+                item.status_snapshot,
+                item.source_snapshot,
+                item.warning_count,
+                " ".join(warning.get("code", "") for warning in item.warnings if isinstance(warning, dict)),
+                item.manager_note_snapshot,
+                item.staff_note_snapshot,
+                item.confirmed_at.isoformat() if item.confirmed_at else "",
+                "締め済み",
+            ]
+        )
+    return rows
+
+
+def export_attendance_closing_csv(period: AttendanceClosingPeriod) -> tuple[bytes, str, dict]:
+    period = AttendanceClosingPeriod.objects.select_related("location").get(pk=period.pk)
+    header = [
+        "拠点",
+        "年月",
+        "スタッフコード",
+        "スタッフ名",
+        "勤務日",
+        "予定開始",
+        "予定終了",
+        "実績出勤",
+        "実績退勤",
+        "休憩分",
+        "勤務分",
+        "開始差異分",
+        "終了差異分",
+        "勤務差異分",
+        "状態",
+        "ソース",
+        "警告数",
+        "警告コード",
+        "管理者メモ",
+        "スタッフメモ",
+        "確定日時",
+        "締め状態",
+    ]
+    preview = None
+    if period.status == AttendanceClosingPeriod.Status.CLOSED:
+        rows = _closing_csv_rows_from_snapshots(period)
+        summary = {
+            "snapshot_count": len(rows),
+            "warning_count": sum(row[16] for row in rows),
+            "error_count": 0,
+        }
+    else:
+        preview = build_attendance_closing_preview(period)
+        rows = _closing_csv_rows_from_preview(preview, "未締め")
+        summary = preview["summary"]
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(header)
+    writer.writerows(rows)
+    filename = f"attendance_{period.location.code}_{period.year}_{period.month:02d}.csv"
+    data = ("\ufeff" + output.getvalue()).encode("utf-8")
+    return data, filename, summary if preview is None else preview["summary"]
 
 
 def _location_timezone(location: Location) -> ZoneInfo:
@@ -1572,9 +2627,21 @@ def attendance_correction_metadata(correction: AttendanceCorrectionRequest) -> d
     }
 
 
-def attendance_record_summary(record: AttendanceRecord | None) -> dict | None:
+def attendance_record_summary(
+    record: AttendanceRecord | None,
+    *,
+    closed_period_lookup: dict[tuple[str, int, int], AttendanceClosingPeriod] | None = None,
+) -> dict | None:
     if record is None:
         return None
+    if closed_period_lookup is not None:
+        closed_period = closed_period_from_lookup(
+            closed_period_lookup,
+            location_id=record.location_id,
+            work_date=record.work_date,
+        )
+    else:
+        closed_period = is_attendance_period_closed(record.location, record.work_date)
     return {
         "id": str(record.id),
         "status": record.status,
@@ -1589,6 +2656,9 @@ def attendance_record_summary(record: AttendanceRecord | None) -> dict | None:
         "warning_count": record.warning_count,
         "warnings": record.warnings,
         "confirmed_at": record.confirmed_at,
+        "is_month_closed": closed_period is not None,
+        "closing_period": str(closed_period.id) if closed_period else None,
+        "closing_period_name": closed_period.name if closed_period else "",
     }
 
 
@@ -1626,6 +2696,7 @@ def build_or_get_attendance_record(
     location: Location,
     work_date: date,
 ) -> tuple[AttendanceRecord, bool]:
+    ensure_attendance_record_not_month_closed(location, work_date)
     publication_assignment = _active_publication_assignment(staff=staff, location=location, work_date=work_date)
     defaults = {
         "source": AttendanceRecord.Source.SCHEDULED if publication_assignment else AttendanceRecord.Source.UNSCHEDULED,
@@ -1649,6 +2720,7 @@ def build_or_get_attendance_record(
 
 
 def _ensure_attendance_record_self_operable(record: AttendanceRecord):
+    ensure_attendance_record_not_month_closed(record.location, record.work_date)
     if record.status == AttendanceRecord.Status.CONFIRMED:
         raise DRFValidationError({"status": "確定済み勤怠は本人操作できません。"})
     if record.status == AttendanceRecord.Status.VOID or not record.is_active:
@@ -1656,6 +2728,7 @@ def _ensure_attendance_record_self_operable(record: AttendanceRecord):
 
 
 def _ensure_attendance_record_manager_operable(record: AttendanceRecord):
+    ensure_attendance_record_not_month_closed(record.location, record.work_date)
     if record.status == AttendanceRecord.Status.VOID or not record.is_active:
         raise DRFValidationError({"status": "無効な勤怠は操作できません。"})
 
@@ -1916,6 +2989,7 @@ def unconfirm_attendance_record(*, record: AttendanceRecord, actor: User, manage
     record = (
         AttendanceRecord.objects.select_for_update(of=("self",)).select_related("location", "staff").get(pk=record.pk)
     )
+    ensure_attendance_record_not_month_closed(record.location, record.work_date)
     if record.status != AttendanceRecord.Status.CONFIRMED:
         raise DRFValidationError({"status": "確定済み勤怠のみ解除できます。"})
     record.status = _record_status_from_actual(record)
@@ -1939,6 +3013,7 @@ def void_attendance_record(*, record: AttendanceRecord, actor: User, manager_not
     record = (
         AttendanceRecord.objects.select_for_update(of=("self",)).select_related("location", "staff").get(pk=record.pk)
     )
+    ensure_attendance_record_not_month_closed(record.location, record.work_date)
     if record.status == AttendanceRecord.Status.VOID:
         raise DRFValidationError({"status": "既に無効です。"})
     record.status = AttendanceRecord.Status.VOID
@@ -2053,6 +3128,10 @@ def cancel_attendance_correction_request(
     )
     if correction.requester_id != actor.id:
         raise DRFValidationError({"attendance_correction": "本人の修正申請のみ取消できます。"})
+    ensure_attendance_record_not_month_closed(
+        correction.attendance_record.location,
+        correction.attendance_record.work_date,
+    )
     if correction.status not in ATTENDANCE_CORRECTION_OPEN_STATUSES:
         raise DRFValidationError({"status": "取消できる状態ではありません。"})
     correction.status = AttendanceCorrectionRequest.Status.CANCELLED
@@ -2070,6 +3149,10 @@ def approve_attendance_correction_request(
         AttendanceCorrectionRequest.objects.select_for_update(of=("self",))
         .select_related("attendance_record", "attendance_record__location", "requester")
         .get(pk=correction.pk)
+    )
+    ensure_attendance_record_not_month_closed(
+        correction.attendance_record.location,
+        correction.attendance_record.work_date,
     )
     if correction.status != AttendanceCorrectionRequest.Status.SUBMITTED:
         raise DRFValidationError({"status": "submittedのみ承認できます。"})
@@ -2091,6 +3174,10 @@ def reject_attendance_correction_request(
         AttendanceCorrectionRequest.objects.select_for_update(of=("self",))
         .select_related("attendance_record", "attendance_record__location", "requester")
         .get(pk=correction.pk)
+    )
+    ensure_attendance_record_not_month_closed(
+        correction.attendance_record.location,
+        correction.attendance_record.work_date,
     )
     if correction.status not in {
         AttendanceCorrectionRequest.Status.SUBMITTED,

@@ -162,7 +162,10 @@ export function MyAttendancePage() {
                   <tr key={record.id}>
                     <td><button type="button" className="btn-link" onClick={() => selectRecord(record)}>{record.work_date}</button></td>
                     <td>{record.location_name}</td>
-                    <td>{statusLabel(record.status)}</td>
+                    <td>
+                      {statusLabel(record.status)}
+                      {record.is_month_closed ? <span className="status-badge">締め済み</span> : null}
+                    </td>
                     <td>{record.scheduled_start_offset_minutes == null || record.scheduled_end_offset_minutes == null ? "-" : `${offsetToLabel(record.scheduled_start_offset_minutes)}~${offsetToLabel(record.scheduled_end_offset_minutes)}`}</td>
                     <td>{offsetRange(record)}</td>
                     <td>{record.break_minutes}分</td>
@@ -176,7 +179,10 @@ export function MyAttendancePage() {
           {selected ? (
             <aside className="edit-panel">
               <h3>{selected.work_date}</h3>
-              <p className="subtle-text">{selected.location_name} / {statusLabel(selected.status)}</p>
+              <p className="subtle-text">
+                {selected.location_name} / {statusLabel(selected.status)}
+                {selected.is_month_closed ? ` / ${selected.closing_period_name || "締め済み"}` : ""}
+              </p>
               <dl>
                 <dt>予定</dt><dd>{selected.scheduled_start_offset_minutes == null || selected.scheduled_end_offset_minutes == null ? "-" : `${offsetToLabel(selected.scheduled_start_offset_minutes)}~${offsetToLabel(selected.scheduled_end_offset_minutes)}`}</dd>
                 <dt>実績</dt><dd>{offsetRange(selected)}</dd>
@@ -185,14 +191,14 @@ export function MyAttendancePage() {
               </dl>
               <section className="inline-alert">
                 <h3>修正申請</h3>
-                <label>希望出勤<input type="datetime-local" readOnly={isSubmitting || selected.status === "confirmed"} value={form.requested_clock_in_at} onChange={(event) => setForm({ ...form, requested_clock_in_at: event.target.value })} /></label>
-                <label>希望退勤<input type="datetime-local" readOnly={isSubmitting || selected.status === "confirmed"} value={form.requested_clock_out_at} onChange={(event) => setForm({ ...form, requested_clock_out_at: event.target.value })} /></label>
-                <label>希望休憩分<input type="number" min={0} readOnly={isSubmitting || selected.status === "confirmed"} value={form.requested_break_minutes} onChange={(event) => setForm({ ...form, requested_break_minutes: event.target.value })} /></label>
-                <label>理由<textarea readOnly={isSubmitting || selected.status === "confirmed"} value={form.reason} onChange={(event) => setForm({ ...form, reason: event.target.value })} /></label>
-                <label>備考<textarea readOnly={isSubmitting || selected.status === "confirmed"} value={form.requested_staff_note} onChange={(event) => setForm({ ...form, requested_staff_note: event.target.value })} /></label>
+                <label>希望出勤<input type="datetime-local" disabled={isSubmitting || selected.status === "confirmed" || selected.is_month_closed} value={form.requested_clock_in_at} onChange={(event) => setForm({ ...form, requested_clock_in_at: event.target.value })} /></label>
+                <label>希望退勤<input type="datetime-local" disabled={isSubmitting || selected.status === "confirmed" || selected.is_month_closed} value={form.requested_clock_out_at} onChange={(event) => setForm({ ...form, requested_clock_out_at: event.target.value })} /></label>
+                <label>希望休憩分<input type="number" min={0} disabled={isSubmitting || selected.status === "confirmed" || selected.is_month_closed} value={form.requested_break_minutes} onChange={(event) => setForm({ ...form, requested_break_minutes: event.target.value })} /></label>
+                <label>理由<textarea disabled={isSubmitting || selected.status === "confirmed" || selected.is_month_closed} value={form.reason} onChange={(event) => setForm({ ...form, reason: event.target.value })} /></label>
+                <label>備考<textarea disabled={isSubmitting || selected.status === "confirmed" || selected.is_month_closed} value={form.requested_staff_note} onChange={(event) => setForm({ ...form, requested_staff_note: event.target.value })} /></label>
                 <div className="actions">
-                  <button type="button" disabled={isSubmitting || selected.status === "confirmed"} onClick={() => void saveCorrection(false)}>下書き保存</button>
-                  <button type="button" disabled={isSubmitting || selected.status === "confirmed"} onClick={() => void saveCorrection(true)}>提出</button>
+                  <button type="button" disabled={isSubmitting || selected.status === "confirmed" || selected.is_month_closed} onClick={() => void saveCorrection(false)}>下書き保存</button>
+                  <button type="button" disabled={isSubmitting || selected.status === "confirmed" || selected.is_month_closed} onClick={() => void saveCorrection(true)}>提出</button>
                 </div>
               </section>
               {selected.correction_requests.length ? (

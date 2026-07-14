@@ -251,12 +251,16 @@ export function MyPublishedShiftsPage() {
                       <td>{shift.publication.location_name}</td>
                       <td>{shift.pattern_short_name_snapshot || shift.pattern_name_snapshot}</td>
                       <td>{shift.start_offset_minutes == null || shift.end_offset_minutes == null ? "-" : `${offsetToLabel(shift.start_offset_minutes)}~${offsetToLabel(shift.end_offset_minutes)}`}</td>
-                      <td>{attendanceStatusLabel(shift.attendance?.status)}{shift.attendance?.warning_count ? ` / warning ${shift.attendance.warning_count}` : ""}</td>
                       <td>
-                        {!shift.attendance || shift.attendance.status === "open" ? <button type="button" disabled={isSubmitting} onClick={() => void runAttendanceAction(shift, "clock-in")}>出勤</button> : null}
-                        {shift.attendance?.status === "clocked_in" ? <button type="button" disabled={isSubmitting} onClick={() => void runAttendanceAction(shift, "break-start")}>休憩開始</button> : null}
-                        {shift.attendance?.status === "on_break" ? <button type="button" disabled={isSubmitting} onClick={() => void runAttendanceAction(shift, "break-end")}>休憩終了</button> : null}
-                        {shift.attendance?.status === "clocked_in" ? <button type="button" disabled={isSubmitting} onClick={() => void runAttendanceAction(shift, "clock-out")}>退勤</button> : null}
+                        {attendanceStatusLabel(shift.attendance?.status)}
+                        {shift.attendance?.warning_count ? ` / warning ${shift.attendance.warning_count}` : ""}
+                        {shift.is_month_closed ? <span className="status-badge">締め済み</span> : null}
+                      </td>
+                      <td>
+                        {!shift.attendance || shift.attendance.status === "open" ? <button type="button" disabled={isSubmitting || shift.is_month_closed} onClick={() => void runAttendanceAction(shift, "clock-in")}>出勤</button> : null}
+                        {shift.attendance?.status === "clocked_in" ? <button type="button" disabled={isSubmitting || shift.is_month_closed} onClick={() => void runAttendanceAction(shift, "break-start")}>休憩開始</button> : null}
+                        {shift.attendance?.status === "on_break" ? <button type="button" disabled={isSubmitting || shift.is_month_closed} onClick={() => void runAttendanceAction(shift, "break-end")}>休憩終了</button> : null}
+                        {shift.attendance?.status === "clocked_in" ? <button type="button" disabled={isSubmitting || shift.is_month_closed} onClick={() => void runAttendanceAction(shift, "clock-out")}>退勤</button> : null}
                       </td>
                       <td>{shift.shift_change_requests.length ? shift.shift_change_requests.map((item) => item.status).join(" / ") : <button type="button" onClick={() => chooseShift(shift)}>変更申請</button>}</td>
                       <td>{shift.work_minutes}分</td>
@@ -272,7 +276,10 @@ export function MyPublishedShiftsPage() {
           {selectedShift ? (
             <aside className="edit-panel">
               <h3>{selectedShift.work_date}</h3>
-              <p className="subtle-text">{selectedShift.publication.location_name}</p>
+              <p className="subtle-text">
+                {selectedShift.publication.location_name}
+                {selectedShift.is_month_closed ? ` / ${selectedShift.closing_period?.name ?? "締め済み"}` : ""}
+              </p>
               <dl>
                 <dt>勤務パターン</dt><dd>{selectedShift.pattern_short_name_snapshot || selectedShift.pattern_name_snapshot}</dd>
                 <dt>開始～終了</dt><dd>{selectedShift.start_offset_minutes == null || selectedShift.end_offset_minutes == null ? "-" : `${offsetToLabel(selectedShift.start_offset_minutes)}~${offsetToLabel(selectedShift.end_offset_minutes)}`}</dd>
@@ -299,7 +306,7 @@ export function MyPublishedShiftsPage() {
               ) : null}
               {selectedShift.attendance ? (
                 <div className="actions">
-                  <button type="button" disabled={isSubmitting || selectedShift.attendance.status === "confirmed"} onClick={() => void createAttendanceCorrection(selectedShift)}>勤怠修正申請</button>
+                  <button type="button" disabled={isSubmitting || selectedShift.attendance.status === "confirmed" || selectedShift.is_month_closed} onClick={() => void createAttendanceCorrection(selectedShift)}>勤怠修正申請</button>
                 </div>
               ) : null}
               <section className="inline-alert">

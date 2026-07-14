@@ -133,3 +133,15 @@ Phase 9 adds attendance clocking and actual work records:
 - Manager actions for manual adjustment, confirm, unconfirm, void, approve, reject, and apply
 - Monthly matrix, timeline, and my published shift attendance status indicators
 - Payroll, wage rates, legal labor alerts, notifications, and external clocking devices remain outside this phase
+
+Phase 10 adds monthly attendance closing:
+
+- Monthly closing periods by active location, year, and month
+- Live preview with warning/error details, stable `content_hash`, and `validation_fingerprint`
+- Close flow with warning acknowledgement, fingerprint match, immutable daily snapshots, and staff summaries
+- Closed-month lock for clocking, manual adjustment, confirmation changes, voiding, and attendance correction workflows
+- Reopen and archive actions for manager-controlled operational recovery
+- Manager/supervisor screen at `/attendance/monthly`
+- Staff self-service monthly attendance screen at `/my/attendance-monthly`
+- UTF-8 BOM CSV export from closed snapshots or unclosed live preview
+- Payroll calculation, wage rates, overtime/legal judgement, PDF, Excel, and external integrations remain outside this phase

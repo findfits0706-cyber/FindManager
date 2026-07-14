@@ -1,8 +1,12 @@
 from rest_framework import serializers
 
 from apps.accounts.models import User
+from apps.operations.models import Location
 
 from .models import (
+    AttendanceCorrectionRequest,
+    AttendanceEvent,
+    AttendanceRecord,
     MonthlyShiftAssignment,
     MonthlyShiftPlan,
     MonthlyShiftPublication,
@@ -19,6 +23,7 @@ from .models import (
     WeeklyShiftTemplateEntry,
 )
 from .services import (
+    attendance_record_summary,
     can_cancel_shift_change_request,
     can_edit_shift_change_request,
     can_edit_shift_request_submission,
@@ -764,9 +769,14 @@ class MonthlyShiftPublicationListSerializer(MonthlyShiftPublicationSerializer):
 class MyPublishedShiftSerializer(MonthlyShiftPublicationAssignmentSerializer):
     publication = serializers.SerializerMethodField()
     shift_change_requests = serializers.SerializerMethodField()
+    attendance = serializers.SerializerMethodField()
 
     class Meta(MonthlyShiftPublicationAssignmentSerializer.Meta):
-        fields = MonthlyShiftPublicationAssignmentSerializer.Meta.fields + ["publication", "shift_change_requests"]
+        fields = MonthlyShiftPublicationAssignmentSerializer.Meta.fields + [
+            "publication",
+            "shift_change_requests",
+            "attendance",
+        ]
 
     def get_publication(self, obj):
         publication = obj.publication
@@ -784,6 +794,10 @@ class MyPublishedShiftSerializer(MonthlyShiftPublicationAssignmentSerializer):
     def get_shift_change_requests(self, obj):
         lookup = self.context.get("shift_change_request_lookup", {})
         return shift_change_requests_for_display(lookup.get(str(obj.id), []))
+
+    def get_attendance(self, obj):
+        lookup = self.context.get("attendance_lookup", {})
+        return attendance_record_summary(lookup.get(str(obj.id)))
 
 
 class ShiftChangeRequestSerializer(serializers.ModelSerializer):
@@ -947,6 +961,266 @@ class ShiftChangeRequestActionSerializer(serializers.Serializer):
 
 class ShiftChangeRequestManagerNoteSerializer(serializers.Serializer):
     manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=True)
+
+
+class AttendanceEventSerializer(serializers.ModelSerializer):
+    actor_display_name = serializers.CharField(source="actor.display_name", read_only=True)
+
+    class Meta:
+        model = AttendanceEvent
+        fields = [
+            "id",
+            "attendance_record",
+            "event_type",
+            "occurred_at",
+            "offset_minutes",
+            "source",
+            "actor",
+            "actor_display_name",
+            "note",
+            "metadata",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class AttendanceCorrectionRequestSerializer(serializers.ModelSerializer):
+    location = serializers.UUIDField(source="attendance_record.location_id", read_only=True)
+    location_name = serializers.CharField(source="attendance_record.location.name", read_only=True)
+    work_date = serializers.DateField(source="attendance_record.work_date", read_only=True)
+    staff = serializers.UUIDField(source="attendance_record.staff_id", read_only=True)
+    staff_display_name = serializers.CharField(source="attendance_record.staff.display_name", read_only=True)
+    requester_display_name = serializers.CharField(source="requester.display_name", read_only=True)
+    approved_by_display_name = serializers.CharField(source="approved_by.display_name", read_only=True)
+    rejected_by_display_name = serializers.CharField(source="rejected_by.display_name", read_only=True)
+    cancelled_by_display_name = serializers.CharField(source="cancelled_by.display_name", read_only=True)
+    applied_by_display_name = serializers.CharField(source="applied_by.display_name", read_only=True)
+    can_edit = serializers.SerializerMethodField()
+    can_submit = serializers.SerializerMethodField()
+    can_cancel = serializers.SerializerMethodField()
+    can_approve = serializers.SerializerMethodField()
+    can_apply = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AttendanceCorrectionRequest
+        fields = [
+            "id",
+            "attendance_record",
+            "location",
+            "location_name",
+            "work_date",
+            "staff",
+            "staff_display_name",
+            "requester",
+            "requester_display_name",
+            "status",
+            "requested_clock_in_at",
+            "requested_clock_out_at",
+            "requested_break_minutes",
+            "requested_staff_note",
+            "reason",
+            "manager_note",
+            "submitted_at",
+            "approved_at",
+            "approved_by",
+            "approved_by_display_name",
+            "rejected_at",
+            "rejected_by",
+            "rejected_by_display_name",
+            "cancelled_at",
+            "cancelled_by",
+            "cancelled_by_display_name",
+            "applied_at",
+            "applied_by",
+            "applied_by_display_name",
+            "can_edit",
+            "can_submit",
+            "can_cancel",
+            "can_approve",
+            "can_apply",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+        read_only_fields = fields
+
+    def _actor(self):
+        request = self.context.get("request")
+        return getattr(request, "user", None)
+
+    def _actor_can_manage(self):
+        if not hasattr(self, "_cached_actor_can_manage"):
+            actor = self._actor()
+            self._cached_actor_can_manage = bool(actor and can_manage_shifts(actor))
+        return self._cached_actor_can_manage
+
+    def get_can_edit(self, obj):
+        actor = self._actor()
+        return bool(actor and obj.requester_id == actor.id and obj.status == AttendanceCorrectionRequest.Status.DRAFT)
+
+    def get_can_submit(self, obj):
+        return self.get_can_edit(obj)
+
+    def get_can_cancel(self, obj):
+        actor = self._actor()
+        return bool(
+            actor
+            and obj.requester_id == actor.id
+            and obj.status
+            in {
+                AttendanceCorrectionRequest.Status.DRAFT,
+                AttendanceCorrectionRequest.Status.SUBMITTED,
+                AttendanceCorrectionRequest.Status.APPROVED,
+            }
+        )
+
+    def get_can_approve(self, obj):
+        return self._actor_can_manage() and obj.status == AttendanceCorrectionRequest.Status.SUBMITTED
+
+    def get_can_apply(self, obj):
+        return self._actor_can_manage() and obj.status == AttendanceCorrectionRequest.Status.APPROVED
+
+
+class AttendanceRecordSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source="location.name", read_only=True)
+    staff_display_name = serializers.CharField(source="staff.display_name", read_only=True)
+    employee_code = serializers.CharField(source="staff.employee_code", read_only=True)
+    confirmed_by_display_name = serializers.CharField(source="confirmed_by.display_name", read_only=True)
+    events = AttendanceEventSerializer(many=True, read_only=True)
+    correction_requests = AttendanceCorrectionRequestSerializer(many=True, read_only=True)
+    can_clock_in = serializers.SerializerMethodField()
+    can_break_start = serializers.SerializerMethodField()
+    can_break_end = serializers.SerializerMethodField()
+    can_clock_out = serializers.SerializerMethodField()
+    can_request_correction = serializers.SerializerMethodField()
+    can_manage = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AttendanceRecord
+        fields = [
+            "id",
+            "location",
+            "location_name",
+            "staff",
+            "staff_display_name",
+            "employee_code",
+            "work_date",
+            "monthly_shift_plan",
+            "monthly_shift_assignment",
+            "publication",
+            "publication_assignment",
+            "status",
+            "source",
+            "scheduled_start_offset_minutes",
+            "scheduled_end_offset_minutes",
+            "scheduled_pattern_name_snapshot",
+            "scheduled_pattern_short_name_snapshot",
+            "actual_clock_in_at",
+            "actual_clock_out_at",
+            "actual_start_offset_minutes",
+            "actual_end_offset_minutes",
+            "break_minutes",
+            "worked_minutes",
+            "difference_start_minutes",
+            "difference_end_minutes",
+            "difference_worked_minutes",
+            "warning_count",
+            "warnings",
+            "manager_note",
+            "staff_note",
+            "confirmed_at",
+            "confirmed_by",
+            "confirmed_by_display_name",
+            "events",
+            "correction_requests",
+            "can_clock_in",
+            "can_break_start",
+            "can_break_end",
+            "can_clock_out",
+            "can_request_correction",
+            "can_manage",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+        read_only_fields = fields
+
+    def _actor(self):
+        request = self.context.get("request")
+        return getattr(request, "user", None)
+
+    def _actor_can_manage(self):
+        if not hasattr(self, "_cached_actor_can_manage"):
+            actor = self._actor()
+            self._cached_actor_can_manage = bool(actor and can_manage_shifts(actor))
+        return self._cached_actor_can_manage
+
+    def _self_operable(self, obj):
+        actor = self._actor()
+        return bool(
+            actor
+            and obj.staff_id == actor.id
+            and obj.is_active
+            and obj.status
+            not in {
+                AttendanceRecord.Status.CONFIRMED,
+                AttendanceRecord.Status.VOID,
+            }
+        )
+
+    def get_can_clock_in(self, obj):
+        return self._self_operable(obj) and obj.actual_clock_in_at is None
+
+    def get_can_break_start(self, obj):
+        return self._self_operable(obj) and obj.status == AttendanceRecord.Status.CLOCKED_IN
+
+    def get_can_break_end(self, obj):
+        return self._self_operable(obj) and obj.status == AttendanceRecord.Status.ON_BREAK
+
+    def get_can_clock_out(self, obj):
+        return self._self_operable(obj) and obj.status == AttendanceRecord.Status.CLOCKED_IN
+
+    def get_can_request_correction(self, obj):
+        return self._self_operable(obj)
+
+    def get_can_manage(self, obj):
+        return self._actor_can_manage()
+
+
+class AttendanceClockInSerializer(serializers.Serializer):
+    location = serializers.PrimaryKeyRelatedField(queryset=Location.objects.filter(is_active=True))
+    work_date = serializers.DateField()
+    occurred_at = serializers.DateTimeField(required=False, allow_null=True)
+    note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+
+
+class AttendanceClockEventSerializer(serializers.Serializer):
+    occurred_at = serializers.DateTimeField(required=False, allow_null=True)
+    note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+
+
+class AttendanceManualAdjustSerializer(serializers.Serializer):
+    actual_clock_in_at = serializers.DateTimeField()
+    actual_clock_out_at = serializers.DateTimeField()
+    break_minutes = serializers.IntegerField(min_value=0, default=0)
+    manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+
+
+class AttendanceManagerNoteSerializer(serializers.Serializer):
+    manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+
+
+class AttendanceCorrectionSaveSerializer(serializers.Serializer):
+    attendance_record = serializers.PrimaryKeyRelatedField(
+        queryset=AttendanceRecord.objects.select_related("location", "staff").filter(is_active=True),
+        required=False,
+    )
+    requested_clock_in_at = serializers.DateTimeField(required=False, allow_null=True)
+    requested_clock_out_at = serializers.DateTimeField(required=False, allow_null=True)
+    requested_break_minutes = serializers.IntegerField(required=False, allow_null=True, min_value=0)
+    requested_staff_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+    reason = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+    submit = serializers.BooleanField(required=False, default=False)
 
 
 class ShiftRequestItemSerializer(serializers.ModelSerializer):

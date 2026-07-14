@@ -593,6 +593,314 @@ class MonthlyShiftPublicationSegment(models.Model):
         ordering = ["start_offset_minutes", "display_order", "created_at"]
 
 
+class AttendanceRecord(models.Model):
+    class Status(models.TextChoices):
+        OPEN = "open", "open"
+        CLOCKED_IN = "clocked_in", "clocked_in"
+        ON_BREAK = "on_break", "on_break"
+        CLOCKED_OUT = "clocked_out", "clocked_out"
+        PENDING_CORRECTION = "pending_correction", "pending_correction"
+        CONFIRMED = "confirmed", "confirmed"
+        VOID = "void", "void"
+
+    class Source(models.TextChoices):
+        SCHEDULED = "scheduled", "scheduled"
+        UNSCHEDULED = "unscheduled", "unscheduled"
+        MANUAL = "manual", "manual"
+        CORRECTED = "corrected", "corrected"
+        IMPORTED = "imported", "imported"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="attendance_records")
+    staff = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="attendance_records")
+    work_date = models.DateField()
+    monthly_shift_plan = models.ForeignKey(
+        MonthlyShiftPlan,
+        on_delete=models.PROTECT,
+        related_name="attendance_records",
+        null=True,
+        blank=True,
+    )
+    monthly_shift_assignment = models.ForeignKey(
+        MonthlyShiftAssignment,
+        on_delete=models.PROTECT,
+        related_name="attendance_records",
+        null=True,
+        blank=True,
+    )
+    publication = models.ForeignKey(
+        MonthlyShiftPublication,
+        on_delete=models.PROTECT,
+        related_name="attendance_records",
+        null=True,
+        blank=True,
+    )
+    publication_assignment = models.ForeignKey(
+        MonthlyShiftPublicationAssignment,
+        on_delete=models.PROTECT,
+        related_name="attendance_records",
+        null=True,
+        blank=True,
+    )
+    status = models.CharField(max_length=32, choices=Status.choices, default=Status.OPEN)
+    source = models.CharField(max_length=32, choices=Source.choices, default=Source.UNSCHEDULED)
+    scheduled_start_offset_minutes = models.IntegerField(null=True, blank=True)
+    scheduled_end_offset_minutes = models.IntegerField(null=True, blank=True)
+    scheduled_pattern_name_snapshot = models.CharField(max_length=150, blank=True)
+    scheduled_pattern_short_name_snapshot = models.CharField(max_length=100, blank=True)
+    actual_clock_in_at = models.DateTimeField(null=True, blank=True)
+    actual_clock_out_at = models.DateTimeField(null=True, blank=True)
+    actual_start_offset_minutes = models.IntegerField(null=True, blank=True)
+    actual_end_offset_minutes = models.IntegerField(null=True, blank=True)
+    break_minutes = models.PositiveIntegerField(default=0)
+    worked_minutes = models.PositiveIntegerField(default=0)
+    difference_start_minutes = models.IntegerField(null=True, blank=True)
+    difference_end_minutes = models.IntegerField(null=True, blank=True)
+    difference_worked_minutes = models.IntegerField(null=True, blank=True)
+    warning_count = models.PositiveIntegerField(default=0)
+    warnings = models.JSONField(default=list, blank=True)
+    manager_note = models.TextField(blank=True)
+    staff_note = models.TextField(blank=True)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    confirmed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_records_confirmed",
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["-work_date", "location__display_order", "staff__employee_code", "created_at"]
+        indexes = [
+            models.Index(fields=["location", "work_date"], name="attendance_location_date_idx"),
+            models.Index(fields=["staff", "work_date"], name="attendance_staff_date_idx"),
+            models.Index(fields=["status", "source"], name="attendance_status_source_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["location", "staff", "work_date"],
+                condition=Q(is_active=True),
+                name="unique_active_attendance_record_day",
+            ),
+            models.CheckConstraint(
+                condition=Q(scheduled_start_offset_minutes__isnull=True)
+                | (Q(scheduled_start_offset_minutes__gte=0) & Q(scheduled_start_offset_minutes__lt=2880)),
+                name="attendance_scheduled_start_range",
+            ),
+            models.CheckConstraint(
+                condition=Q(scheduled_end_offset_minutes__isnull=True)
+                | (Q(scheduled_end_offset_minutes__gt=0) & Q(scheduled_end_offset_minutes__lte=2880)),
+                name="attendance_scheduled_end_range",
+            ),
+            models.CheckConstraint(
+                condition=Q(actual_start_offset_minutes__isnull=True)
+                | (Q(actual_start_offset_minutes__gte=0) & Q(actual_start_offset_minutes__lt=2880)),
+                name="attendance_actual_start_range",
+            ),
+            models.CheckConstraint(
+                condition=Q(actual_end_offset_minutes__isnull=True)
+                | (Q(actual_end_offset_minutes__gt=0) & Q(actual_end_offset_minutes__lte=2880)),
+                name="attendance_actual_end_range",
+            ),
+        ]
+
+    def clean(self):
+        errors = {}
+        for field in [
+            "scheduled_start_offset_minutes",
+            "scheduled_end_offset_minutes",
+            "actual_start_offset_minutes",
+            "actual_end_offset_minutes",
+        ]:
+            value = getattr(self, field)
+            if value is not None and value % 15 != 0:
+                errors[field] = "offset must be in 15-minute increments."
+        if (
+            self.actual_start_offset_minutes is not None
+            and self.actual_end_offset_minutes is not None
+            and self.actual_start_offset_minutes >= self.actual_end_offset_minutes
+        ):
+            errors["actual_end_offset_minutes"] = "actual_end_offset_minutes must be after start."
+        if (
+            self.scheduled_start_offset_minutes is not None
+            and self.scheduled_end_offset_minutes is not None
+            and self.scheduled_start_offset_minutes >= self.scheduled_end_offset_minutes
+        ):
+            errors["scheduled_end_offset_minutes"] = "scheduled_end_offset_minutes must be after start."
+        if self.publication_assignment_id:
+            assignment = self.publication_assignment
+            if self.publication_id and assignment.publication_id != self.publication_id:
+                errors["publication_assignment"] = "publication_assignment must belong to publication."
+            if self.location_id and assignment.publication.location_id != self.location_id:
+                errors["location"] = "location must match publication assignment."
+            if self.staff_id and assignment.staff_id != self.staff_id:
+                errors["staff"] = "staff must match publication assignment."
+            if self.work_date and assignment.work_date != self.work_date:
+                errors["work_date"] = "work_date must match publication assignment."
+        if self.monthly_shift_assignment_id:
+            assignment = self.monthly_shift_assignment
+            if self.monthly_shift_plan_id and assignment.monthly_shift_plan_id != self.monthly_shift_plan_id:
+                errors["monthly_shift_assignment"] = "monthly_shift_assignment must belong to monthly_shift_plan."
+            if self.location_id and assignment.monthly_shift_plan.location_id != self.location_id:
+                errors["location"] = "location must match monthly shift assignment."
+            if self.staff_id and assignment.staff_id != self.staff_id:
+                errors["staff"] = "staff must match monthly shift assignment."
+            if self.work_date and assignment.work_date != self.work_date:
+                errors["work_date"] = "work_date must match monthly shift assignment."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.work_date} / {self.staff} / {self.status}"
+
+
+class AttendanceEvent(models.Model):
+    class EventType(models.TextChoices):
+        CLOCK_IN = "clock_in", "clock_in"
+        BREAK_START = "break_start", "break_start"
+        BREAK_END = "break_end", "break_end"
+        CLOCK_OUT = "clock_out", "clock_out"
+        MANUAL_ADJUSTMENT = "manual_adjustment", "manual_adjustment"
+        CORRECTION_APPLIED = "correction_applied", "correction_applied"
+        VOIDED = "voided", "voided"
+        CONFIRMED = "confirmed", "confirmed"
+        UNCONFIRMED = "unconfirmed", "unconfirmed"
+
+    class Source(models.TextChoices):
+        SELF = "self", "self"
+        MANAGER = "manager", "manager"
+        SYSTEM = "system", "system"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    attendance_record = models.ForeignKey(AttendanceRecord, on_delete=models.PROTECT, related_name="events")
+    event_type = models.CharField(max_length=32, choices=EventType.choices)
+    occurred_at = models.DateTimeField()
+    offset_minutes = models.IntegerField()
+    source = models.CharField(max_length=20, choices=Source.choices)
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="attendance_events")
+    note = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["occurred_at", "created_at"]
+        indexes = [
+            models.Index(fields=["attendance_record", "event_type"], name="att_event_record_type_idx"),
+            models.Index(fields=["occurred_at"], name="attendance_event_occurred_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(offset_minutes__gte=0) & Q(offset_minutes__lte=2880),
+                name="attendance_event_offset_range",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.attendance_record_id} / {self.event_type} / {self.occurred_at}"
+
+
+class AttendanceCorrectionRequest(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "draft"
+        SUBMITTED = "submitted", "submitted"
+        APPROVED = "approved", "approved"
+        REJECTED = "rejected", "rejected"
+        CANCELLED = "cancelled", "cancelled"
+        APPLIED = "applied", "applied"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    attendance_record = models.ForeignKey(
+        AttendanceRecord,
+        on_delete=models.PROTECT,
+        related_name="correction_requests",
+    )
+    requester = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_correction_requests",
+    )
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    requested_clock_in_at = models.DateTimeField(null=True, blank=True)
+    requested_clock_out_at = models.DateTimeField(null=True, blank=True)
+    requested_break_minutes = models.PositiveIntegerField(null=True, blank=True)
+    requested_staff_note = models.TextField(blank=True)
+    reason = models.TextField(blank=True)
+    manager_note = models.TextField(blank=True)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_corrections_approved",
+        null=True,
+        blank=True,
+    )
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    rejected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_corrections_rejected",
+        null=True,
+        blank=True,
+    )
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancelled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_corrections_cancelled",
+        null=True,
+        blank=True,
+    )
+    applied_at = models.DateTimeField(null=True, blank=True)
+    applied_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="attendance_corrections_applied",
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status", "created_at"], name="attendance_corr_status_idx"),
+            models.Index(fields=["requester", "created_at"], name="attendance_corr_requester_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["attendance_record"],
+                condition=Q(is_active=True, status__in=["draft", "submitted", "approved"]),
+                name="unique_open_attendance_correction",
+            ),
+            models.CheckConstraint(
+                condition=Q(requested_clock_in_at__isnull=True)
+                | Q(requested_clock_out_at__isnull=True)
+                | Q(requested_clock_out_at__gt=models.F("requested_clock_in_at")),
+                name="attendance_corr_clock_out_after_in",
+            ),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.attendance_record_id and self.requester_id and self.attendance_record.staff_id != self.requester_id:
+            errors["attendance_record"] = "requester must be the attendance record staff."
+        if self.requested_clock_in_at and self.requested_clock_out_at:
+            if self.requested_clock_in_at >= self.requested_clock_out_at:
+                errors["requested_clock_out_at"] = "requested_clock_out_at must be after requested_clock_in_at."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.attendance_record_id} / {self.status}"
+
+
 class ShiftChangeRequest(models.Model):
     class RequestType(models.TextChoices):
         DROP_SHIFT = "drop_shift", "drop_shift"

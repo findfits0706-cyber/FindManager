@@ -2,7 +2,8 @@ import calendar
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
@@ -16,6 +17,9 @@ from apps.accounts.services import create_audit_event
 from apps.operations.models import Location, StaffCapability, StaffLocation, WorkArea, WorkType, WorkTypeAvailability
 
 from .models import (
+    AttendanceCorrectionRequest,
+    AttendanceEvent,
+    AttendanceRecord,
     MonthlyShiftAssignment,
     MonthlyShiftPlan,
     MonthlyShiftPublication,
@@ -125,6 +129,26 @@ EVENT_MAP = {
         "reject": "shift_change_request_rejected",
         "apply": "shift_change_request_applied",
         "close": "shift_change_request_closed",
+    },
+    "attendance_record": {
+        "create": "attendance_record_created",
+        "clock_in": "attendance_clock_in",
+        "break_start": "attendance_break_start",
+        "break_end": "attendance_break_end",
+        "clock_out": "attendance_clock_out",
+        "manual_adjust": "attendance_manual_adjusted",
+        "confirm": "attendance_confirmed",
+        "unconfirm": "attendance_unconfirmed",
+        "void": "attendance_voided",
+    },
+    "attendance_correction": {
+        "create": "attendance_correction_created",
+        "update": "attendance_correction_updated",
+        "submit": "attendance_correction_submitted",
+        "cancel": "attendance_correction_cancelled",
+        "approve": "attendance_correction_approved",
+        "reject": "attendance_correction_rejected",
+        "apply": "attendance_correction_applied",
     },
 }
 
@@ -1359,6 +1383,830 @@ def shift_change_request_summary(plan: MonthlyShiftPlan) -> dict:
         "applied_count": requests.filter(status=ShiftChangeRequest.Status.APPLIED).count(),
         "needs_republish": requests.filter(status=ShiftChangeRequest.Status.APPLIED).exists()
         and not plan.publications.filter(is_active=True).exists(),
+    }
+
+
+ATTENDANCE_CORRECTION_OPEN_STATUSES = {
+    AttendanceCorrectionRequest.Status.DRAFT,
+    AttendanceCorrectionRequest.Status.SUBMITTED,
+    AttendanceCorrectionRequest.Status.APPROVED,
+}
+ATTENDANCE_CORRECTION_TERMINAL_STATUSES = {
+    AttendanceCorrectionRequest.Status.REJECTED,
+    AttendanceCorrectionRequest.Status.CANCELLED,
+    AttendanceCorrectionRequest.Status.APPLIED,
+}
+
+
+def _location_timezone(location: Location) -> ZoneInfo:
+    return ZoneInfo(location.timezone or "Asia/Tokyo")
+
+
+def _normalize_occurred_at(occurred_at: datetime | None) -> datetime:
+    value = occurred_at or timezone.now()
+    if timezone.is_naive(value):
+        return timezone.make_aware(value, timezone.get_current_timezone())
+    return value
+
+
+def _offset_for_datetime(location: Location, work_date: date, occurred_at: datetime) -> int:
+    local_tz = _location_timezone(location)
+    local_value = _normalize_occurred_at(occurred_at).astimezone(local_tz)
+    local_midnight = datetime.combine(work_date, datetime.min.time(), tzinfo=local_tz)
+    offset = int((local_value - local_midnight).total_seconds() // 60)
+    rounded = int(round(offset / 15) * 15)
+    if rounded < 0 or rounded > 2880:
+        raise DRFValidationError({"occurred_at": "打刻時刻が対象勤務日の範囲外です。"})
+    return rounded
+
+
+def _scheduled_values_from_segments(segments) -> dict:
+    items = list(segments)
+    work_items = [item for item in items if not item.work_type_is_break_snapshot]
+    start_values = [item.start_offset_minutes for item in items]
+    end_values = [item.end_offset_minutes for item in items]
+    return {
+        "scheduled_start_offset_minutes": min(start_values, default=None),
+        "scheduled_end_offset_minutes": max(end_values, default=None),
+        "scheduled_worked_minutes": sum(item.end_offset_minutes - item.start_offset_minutes for item in work_items),
+    }
+
+
+def _active_publication_assignment(
+    *,
+    staff: User,
+    location: Location,
+    work_date: date,
+) -> MonthlyShiftPublicationAssignment | None:
+    return (
+        MonthlyShiftPublicationAssignment.objects.filter(
+            staff=staff,
+            work_date=work_date,
+            publication__location=location,
+            publication__is_active=True,
+            publication__withdrawn_at__isnull=True,
+        )
+        .select_related(
+            "publication",
+            "publication__monthly_shift_plan",
+            "source_assignment",
+        )
+        .prefetch_related("segments")
+        .order_by("-publication__version")
+        .first()
+    )
+
+
+def _apply_schedule_snapshot(
+    record: AttendanceRecord,
+    publication_assignment: MonthlyShiftPublicationAssignment | None,
+):
+    if publication_assignment is None:
+        record.monthly_shift_plan = None
+        record.monthly_shift_assignment = None
+        record.publication = None
+        record.publication_assignment = None
+        record.scheduled_start_offset_minutes = None
+        record.scheduled_end_offset_minutes = None
+        record.scheduled_pattern_name_snapshot = ""
+        record.scheduled_pattern_short_name_snapshot = ""
+        if record.source == AttendanceRecord.Source.SCHEDULED:
+            record.source = AttendanceRecord.Source.UNSCHEDULED
+        return
+    record.monthly_shift_plan = publication_assignment.publication.monthly_shift_plan
+    record.monthly_shift_assignment = publication_assignment.source_assignment
+    record.publication = publication_assignment.publication
+    record.publication_assignment = publication_assignment
+    scheduled = _scheduled_values_from_segments(publication_assignment.segments.all())
+    record.scheduled_start_offset_minutes = scheduled["scheduled_start_offset_minutes"]
+    record.scheduled_end_offset_minutes = scheduled["scheduled_end_offset_minutes"]
+    record.scheduled_pattern_name_snapshot = publication_assignment.pattern_name_snapshot
+    record.scheduled_pattern_short_name_snapshot = publication_assignment.pattern_short_name_snapshot
+    if record.source == AttendanceRecord.Source.UNSCHEDULED:
+        record.source = AttendanceRecord.Source.SCHEDULED
+
+
+def _scheduled_worked_minutes(record: AttendanceRecord) -> int | None:
+    if record.publication_assignment_id:
+        return _scheduled_values_from_segments(record.publication_assignment.segments.all())["scheduled_worked_minutes"]
+    if record.monthly_shift_assignment_id:
+        segments = record.monthly_shift_assignment.segments.filter(is_active=True)
+        return sum(
+            segment.end_offset_minutes - segment.start_offset_minutes
+            for segment in segments
+            if not segment.work_type_is_break_snapshot
+        )
+    if record.scheduled_start_offset_minutes is None or record.scheduled_end_offset_minutes is None:
+        return None
+    return max(record.scheduled_end_offset_minutes - record.scheduled_start_offset_minutes, 0)
+
+
+def _record_status_from_actual(record: AttendanceRecord) -> str:
+    if record.actual_clock_out_at:
+        return AttendanceRecord.Status.CLOCKED_OUT
+    if record.actual_clock_in_at:
+        return AttendanceRecord.Status.CLOCKED_IN
+    return AttendanceRecord.Status.OPEN
+
+
+def _attendance_warnings(record: AttendanceRecord, *, open_break: bool = False) -> list[dict]:
+    warnings = []
+    if record.scheduled_start_offset_minutes is None or record.scheduled_end_offset_minutes is None:
+        if record.actual_clock_in_at or record.actual_clock_out_at:
+            warnings.append({"code": "unscheduled_work", "message": "予定外勤務です。"})
+    else:
+        if record.actual_clock_in_at is None:
+            warnings.append({"code": "missing_clock_in", "message": "出勤打刻がありません。"})
+        if record.actual_clock_in_at is not None and record.actual_clock_out_at is None:
+            warnings.append({"code": "missing_clock_out", "message": "退勤打刻がありません。"})
+    if open_break:
+        warnings.append({"code": "open_break", "message": "終了していない休憩があります。"})
+    if (
+        record.scheduled_start_offset_minutes is not None
+        and record.actual_start_offset_minutes is not None
+        and record.actual_start_offset_minutes > record.scheduled_start_offset_minutes
+    ):
+        warnings.append({"code": "late_clock_in", "message": "予定より遅い出勤です。"})
+    if (
+        record.scheduled_end_offset_minutes is not None
+        and record.actual_end_offset_minutes is not None
+        and record.actual_end_offset_minutes < record.scheduled_end_offset_minutes
+    ):
+        warnings.append({"code": "early_clock_out", "message": "予定より早い退勤です。"})
+    if record.difference_worked_minutes is not None and record.actual_clock_out_at is not None:
+        if record.difference_worked_minutes > 0:
+            warnings.append({"code": "longer_worked", "message": "予定より勤務時間が長くなっています。"})
+        if record.difference_worked_minutes < 0:
+            warnings.append({"code": "shorter_worked", "message": "予定より勤務時間が短くなっています。"})
+    if record.status == AttendanceRecord.Status.CONFIRMED and warnings:
+        warnings.append({"code": "confirmed_with_warnings", "message": "警告がある状態で確定されています。"})
+    return warnings
+
+
+def _event_metadata(record: AttendanceRecord) -> dict:
+    return {
+        "attendance_record_id": str(record.id),
+        "location_id": str(record.location_id),
+        "staff_id": str(record.staff_id),
+        "work_date": record.work_date.isoformat(),
+        "status": record.status,
+        "source": record.source,
+        "monthly_shift_assignment_id": (
+            str(record.monthly_shift_assignment_id) if record.monthly_shift_assignment_id else None
+        ),
+        "publication_assignment_id": (
+            str(record.publication_assignment_id) if record.publication_assignment_id else None
+        ),
+    }
+
+
+def attendance_record_metadata(record: AttendanceRecord) -> dict:
+    return _event_metadata(record)
+
+
+def attendance_correction_metadata(correction: AttendanceCorrectionRequest) -> dict:
+    record = correction.attendance_record
+    return _event_metadata(record) | {
+        "attendance_correction_request_id": str(correction.id),
+        "status": correction.status,
+    }
+
+
+def attendance_record_summary(record: AttendanceRecord | None) -> dict | None:
+    if record is None:
+        return None
+    return {
+        "id": str(record.id),
+        "status": record.status,
+        "source": record.source,
+        "actual_start_offset_minutes": record.actual_start_offset_minutes,
+        "actual_end_offset_minutes": record.actual_end_offset_minutes,
+        "break_minutes": record.break_minutes,
+        "worked_minutes": record.worked_minutes,
+        "difference_start_minutes": record.difference_start_minutes,
+        "difference_end_minutes": record.difference_end_minutes,
+        "difference_worked_minutes": record.difference_worked_minutes,
+        "warning_count": record.warning_count,
+        "warnings": record.warnings,
+        "confirmed_at": record.confirmed_at,
+    }
+
+
+def _create_attendance_event(
+    *,
+    record: AttendanceRecord,
+    event_type: str,
+    occurred_at: datetime,
+    source: str,
+    actor: User,
+    note: str = "",
+    metadata: dict | None = None,
+) -> AttendanceEvent:
+    try:
+        offset_minutes = _offset_for_datetime(record.location, record.work_date, occurred_at)
+    except DRFValidationError:
+        if source == AttendanceEvent.Source.SELF:
+            raise
+        offset_minutes = record.actual_start_offset_minutes or 0
+    return AttendanceEvent.objects.create(
+        attendance_record=record,
+        event_type=event_type,
+        occurred_at=_normalize_occurred_at(occurred_at),
+        offset_minutes=offset_minutes,
+        source=source,
+        actor=actor,
+        note=note,
+        metadata=metadata or {},
+    )
+
+
+def build_or_get_attendance_record(
+    *,
+    staff: User,
+    location: Location,
+    work_date: date,
+) -> tuple[AttendanceRecord, bool]:
+    publication_assignment = _active_publication_assignment(staff=staff, location=location, work_date=work_date)
+    defaults = {
+        "source": AttendanceRecord.Source.SCHEDULED if publication_assignment else AttendanceRecord.Source.UNSCHEDULED,
+    }
+    record, created = AttendanceRecord.objects.get_or_create(
+        location=location,
+        staff=staff,
+        work_date=work_date,
+        is_active=True,
+        defaults=defaults,
+    )
+    if publication_assignment and not record.publication_assignment_id:
+        _apply_schedule_snapshot(record, publication_assignment)
+        record.full_clean()
+        record.save()
+    elif created:
+        _apply_schedule_snapshot(record, publication_assignment)
+        record.full_clean()
+        record.save()
+    return record, created
+
+
+def _ensure_attendance_record_self_operable(record: AttendanceRecord):
+    if record.status == AttendanceRecord.Status.CONFIRMED:
+        raise DRFValidationError({"status": "確定済み勤怠は本人操作できません。"})
+    if record.status == AttendanceRecord.Status.VOID or not record.is_active:
+        raise DRFValidationError({"status": "無効な勤怠は操作できません。"})
+
+
+def _ensure_attendance_record_manager_operable(record: AttendanceRecord):
+    if record.status == AttendanceRecord.Status.VOID or not record.is_active:
+        raise DRFValidationError({"status": "無効な勤怠は操作できません。"})
+
+
+def _has_event(record: AttendanceRecord, event_type: str) -> bool:
+    return record.events.filter(event_type=event_type).exists()
+
+
+def _has_open_break(record: AttendanceRecord) -> bool:
+    balance = 0
+    for event in record.events.order_by("occurred_at", "created_at"):
+        if event.event_type == AttendanceEvent.EventType.BREAK_START:
+            balance += 1
+        elif event.event_type == AttendanceEvent.EventType.BREAK_END:
+            balance -= 1
+        if balance < 0:
+            raise DRFValidationError({"event_type": "休憩開始前に休憩終了は登録できません。"})
+    return balance > 0
+
+
+def recalculate_attendance_record(record: AttendanceRecord) -> AttendanceRecord:
+    record = (
+        AttendanceRecord.objects.select_related(
+            "location",
+            "staff",
+            "monthly_shift_assignment",
+            "publication_assignment",
+        )
+        .prefetch_related("events", "publication_assignment__segments", "monthly_shift_assignment__segments")
+        .get(pk=record.pk)
+    )
+    open_break = False
+    if record.source not in {AttendanceRecord.Source.MANUAL, AttendanceRecord.Source.CORRECTED}:
+        clock_in = None
+        clock_out = None
+        breaks: list[tuple[AttendanceEvent, AttendanceEvent]] = []
+        pending_break = None
+        for event in record.events.all():
+            if event.event_type == AttendanceEvent.EventType.CLOCK_IN and clock_in is None:
+                clock_in = event
+            elif event.event_type == AttendanceEvent.EventType.CLOCK_OUT and clock_out is None:
+                clock_out = event
+            elif event.event_type == AttendanceEvent.EventType.BREAK_START:
+                if pending_break is not None:
+                    open_break = True
+                pending_break = event
+            elif event.event_type == AttendanceEvent.EventType.BREAK_END:
+                if pending_break is None:
+                    raise DRFValidationError({"event_type": "休憩開始前に休憩終了は登録できません。"})
+                breaks.append((pending_break, event))
+                pending_break = None
+        if pending_break is not None:
+            open_break = True
+        record.actual_clock_in_at = clock_in.occurred_at if clock_in else None
+        record.actual_clock_out_at = clock_out.occurred_at if clock_out else None
+        record.actual_start_offset_minutes = clock_in.offset_minutes if clock_in else None
+        record.actual_end_offset_minutes = clock_out.offset_minutes if clock_out else None
+        record.break_minutes = sum(max(end.offset_minutes - start.offset_minutes, 0) for start, end in breaks)
+    else:
+        if record.actual_clock_in_at:
+            record.actual_start_offset_minutes = _offset_for_datetime(
+                record.location, record.work_date, record.actual_clock_in_at
+            )
+        if record.actual_clock_out_at:
+            record.actual_end_offset_minutes = _offset_for_datetime(
+                record.location, record.work_date, record.actual_clock_out_at
+            )
+    if record.actual_start_offset_minutes is not None and record.actual_end_offset_minutes is not None:
+        if record.actual_start_offset_minutes >= record.actual_end_offset_minutes:
+            raise DRFValidationError({"actual_clock_out_at": "退勤時刻は出勤時刻より後にしてください。"})
+        duration = record.actual_end_offset_minutes - record.actual_start_offset_minutes
+        if record.break_minutes > duration:
+            raise DRFValidationError({"break_minutes": "休憩時間が勤務時間を超えています。"})
+        record.worked_minutes = max(duration - record.break_minutes, 0)
+    else:
+        record.worked_minutes = 0
+    scheduled_worked = _scheduled_worked_minutes(record)
+    if record.scheduled_start_offset_minutes is not None and record.actual_start_offset_minutes is not None:
+        record.difference_start_minutes = record.actual_start_offset_minutes - record.scheduled_start_offset_minutes
+    else:
+        record.difference_start_minutes = None
+    if record.scheduled_end_offset_minutes is not None and record.actual_end_offset_minutes is not None:
+        record.difference_end_minutes = record.actual_end_offset_minutes - record.scheduled_end_offset_minutes
+    else:
+        record.difference_end_minutes = None
+    if scheduled_worked is not None and record.actual_clock_out_at is not None:
+        record.difference_worked_minutes = record.worked_minutes - scheduled_worked
+    else:
+        record.difference_worked_minutes = None
+    if record.status not in {AttendanceRecord.Status.CONFIRMED, AttendanceRecord.Status.VOID}:
+        if record.correction_requests.filter(status__in=ATTENDANCE_CORRECTION_OPEN_STATUSES, is_active=True).exists():
+            record.status = AttendanceRecord.Status.PENDING_CORRECTION
+        elif open_break:
+            record.status = AttendanceRecord.Status.ON_BREAK
+        else:
+            record.status = _record_status_from_actual(record)
+    record.warnings = _attendance_warnings(record, open_break=open_break)
+    record.warning_count = len(record.warnings)
+    record.full_clean()
+    record.save()
+    return record
+
+
+def add_self_attendance_event(
+    *,
+    record: AttendanceRecord,
+    event_type: str,
+    actor: User,
+    occurred_at: datetime | None,
+    note: str = "",
+) -> AttendanceRecord:
+    record = (
+        AttendanceRecord.objects.select_for_update(of=("self",)).select_related("location", "staff").get(pk=record.pk)
+    )
+    _ensure_attendance_record_self_operable(record)
+    if record.staff_id != actor.id:
+        raise DRFValidationError({"attendance_record": "本人の勤怠のみ操作できます。"})
+    occurred = _normalize_occurred_at(occurred_at)
+    if event_type == AttendanceEvent.EventType.CLOCK_IN and _has_event(record, AttendanceEvent.EventType.CLOCK_IN):
+        raise DRFValidationError({"event_type": "出勤打刻は既に登録されています。"})
+    if event_type == AttendanceEvent.EventType.CLOCK_OUT:
+        if _has_event(record, AttendanceEvent.EventType.CLOCK_OUT):
+            raise DRFValidationError({"event_type": "退勤打刻は既に登録されています。"})
+        if not _has_event(record, AttendanceEvent.EventType.CLOCK_IN):
+            raise DRFValidationError({"event_type": "出勤打刻後に退勤してください。"})
+        if _has_open_break(record):
+            raise DRFValidationError({"event_type": "休憩終了後に退勤してください。"})
+    if event_type == AttendanceEvent.EventType.BREAK_START:
+        if not _has_event(record, AttendanceEvent.EventType.CLOCK_IN):
+            raise DRFValidationError({"event_type": "出勤打刻後に休憩を開始してください。"})
+        if _has_event(record, AttendanceEvent.EventType.CLOCK_OUT):
+            raise DRFValidationError({"event_type": "退勤後は休憩を開始できません。"})
+        if _has_open_break(record):
+            raise DRFValidationError({"event_type": "開始中の休憩があります。"})
+    if event_type == AttendanceEvent.EventType.BREAK_END and not _has_open_break(record):
+        raise DRFValidationError({"event_type": "終了対象の休憩がありません。"})
+    _create_attendance_event(
+        record=record,
+        event_type=event_type,
+        occurred_at=occurred,
+        source=AttendanceEvent.Source.SELF,
+        actor=actor,
+        note=note,
+    )
+    return recalculate_attendance_record(record)
+
+
+def clock_in_attendance(
+    *,
+    staff: User,
+    location: Location,
+    work_date: date,
+    actor: User,
+    occurred_at: datetime | None,
+    note: str = "",
+) -> tuple[AttendanceRecord, bool]:
+    record, created = build_or_get_attendance_record(staff=staff, location=location, work_date=work_date)
+    record = add_self_attendance_event(
+        record=record,
+        event_type=AttendanceEvent.EventType.CLOCK_IN,
+        actor=actor,
+        occurred_at=occurred_at,
+        note=note,
+    )
+    return record, created
+
+
+def _set_manual_actuals(
+    record: AttendanceRecord,
+    *,
+    actual_clock_in_at: datetime,
+    actual_clock_out_at: datetime,
+    break_minutes: int,
+):
+    actual_clock_in_at = _normalize_occurred_at(actual_clock_in_at)
+    actual_clock_out_at = _normalize_occurred_at(actual_clock_out_at)
+    if actual_clock_in_at >= actual_clock_out_at:
+        raise DRFValidationError({"actual_clock_out_at": "退勤時刻は出勤時刻より後にしてください。"})
+    start_offset = _offset_for_datetime(record.location, record.work_date, actual_clock_in_at)
+    end_offset = _offset_for_datetime(record.location, record.work_date, actual_clock_out_at)
+    if start_offset >= end_offset:
+        raise DRFValidationError({"actual_clock_out_at": "退勤時刻は出勤時刻より後にしてください。"})
+    if break_minutes < 0:
+        raise DRFValidationError({"break_minutes": "0以上で指定してください。"})
+    if break_minutes > end_offset - start_offset:
+        raise DRFValidationError({"break_minutes": "休憩時間が勤務時間を超えています。"})
+    record.actual_clock_in_at = actual_clock_in_at
+    record.actual_clock_out_at = actual_clock_out_at
+    record.actual_start_offset_minutes = start_offset
+    record.actual_end_offset_minutes = end_offset
+    record.break_minutes = break_minutes
+
+
+def manual_adjust_attendance_record(
+    *,
+    record: AttendanceRecord,
+    actor: User,
+    actual_clock_in_at: datetime,
+    actual_clock_out_at: datetime,
+    break_minutes: int,
+    manager_note: str = "",
+) -> AttendanceRecord:
+    record = (
+        AttendanceRecord.objects.select_for_update(of=("self",)).select_related("location", "staff").get(pk=record.pk)
+    )
+    _ensure_attendance_record_manager_operable(record)
+    if record.status == AttendanceRecord.Status.CONFIRMED:
+        raise DRFValidationError({"status": "確定済み勤怠は確定解除後に修正してください。"})
+    _set_manual_actuals(
+        record,
+        actual_clock_in_at=actual_clock_in_at,
+        actual_clock_out_at=actual_clock_out_at,
+        break_minutes=break_minutes,
+    )
+    record.source = AttendanceRecord.Source.MANUAL
+    record.manager_note = manager_note
+    record.status = AttendanceRecord.Status.CLOCKED_OUT
+    record.save()
+    _create_attendance_event(
+        record=record,
+        event_type=AttendanceEvent.EventType.MANUAL_ADJUSTMENT,
+        occurred_at=timezone.now(),
+        source=AttendanceEvent.Source.MANAGER,
+        actor=actor,
+        note=manager_note,
+        metadata={
+            "actual_clock_in_at": record.actual_clock_in_at.isoformat(),
+            "actual_clock_out_at": record.actual_clock_out_at.isoformat(),
+            "break_minutes": break_minutes,
+        },
+    )
+    return recalculate_attendance_record(record)
+
+
+def confirm_attendance_record(*, record: AttendanceRecord, actor: User, manager_note: str = "") -> AttendanceRecord:
+    record = (
+        AttendanceRecord.objects.select_for_update(of=("self",)).select_related("location", "staff").get(pk=record.pk)
+    )
+    _ensure_attendance_record_manager_operable(record)
+    record.status = AttendanceRecord.Status.CONFIRMED
+    record.confirmed_at = timezone.now()
+    record.confirmed_by = actor
+    if manager_note:
+        record.manager_note = manager_note
+    record.save(update_fields=["status", "confirmed_at", "confirmed_by", "manager_note", "updated_at"])
+    _create_attendance_event(
+        record=record,
+        event_type=AttendanceEvent.EventType.CONFIRMED,
+        occurred_at=record.confirmed_at,
+        source=AttendanceEvent.Source.MANAGER,
+        actor=actor,
+        note=manager_note,
+    )
+    return recalculate_attendance_record(record)
+
+
+def unconfirm_attendance_record(*, record: AttendanceRecord, actor: User, manager_note: str = "") -> AttendanceRecord:
+    record = (
+        AttendanceRecord.objects.select_for_update(of=("self",)).select_related("location", "staff").get(pk=record.pk)
+    )
+    if record.status != AttendanceRecord.Status.CONFIRMED:
+        raise DRFValidationError({"status": "確定済み勤怠のみ解除できます。"})
+    record.status = _record_status_from_actual(record)
+    record.confirmed_at = None
+    record.confirmed_by = None
+    if manager_note:
+        record.manager_note = manager_note
+    record.save(update_fields=["status", "confirmed_at", "confirmed_by", "manager_note", "updated_at"])
+    _create_attendance_event(
+        record=record,
+        event_type=AttendanceEvent.EventType.UNCONFIRMED,
+        occurred_at=timezone.now(),
+        source=AttendanceEvent.Source.MANAGER,
+        actor=actor,
+        note=manager_note,
+    )
+    return recalculate_attendance_record(record)
+
+
+def void_attendance_record(*, record: AttendanceRecord, actor: User, manager_note: str = "") -> AttendanceRecord:
+    record = (
+        AttendanceRecord.objects.select_for_update(of=("self",)).select_related("location", "staff").get(pk=record.pk)
+    )
+    if record.status == AttendanceRecord.Status.VOID:
+        raise DRFValidationError({"status": "既に無効です。"})
+    record.status = AttendanceRecord.Status.VOID
+    record.is_active = False
+    if manager_note:
+        record.manager_note = manager_note
+    record.save(update_fields=["status", "is_active", "manager_note", "updated_at"])
+    _create_attendance_event(
+        record=record,
+        event_type=AttendanceEvent.EventType.VOIDED,
+        occurred_at=timezone.now(),
+        source=AttendanceEvent.Source.MANAGER,
+        actor=actor,
+        note=manager_note,
+    )
+    return record
+
+
+def save_attendance_correction_request(
+    *,
+    instance: AttendanceCorrectionRequest | None,
+    attendance_record: AttendanceRecord | None,
+    actor: User,
+    validated_data: dict,
+    submit: bool = False,
+) -> AttendanceCorrectionRequest:
+    creating = instance is None
+    if creating:
+        if attendance_record is None:
+            raise DRFValidationError({"attendance_record": "勤怠を指定してください。"})
+        record = (
+            AttendanceRecord.objects.select_for_update(of=("self",))
+            .select_related("location", "staff")
+            .get(pk=attendance_record.pk)
+        )
+        _ensure_attendance_record_self_operable(record)
+        if record.staff_id != actor.id:
+            raise DRFValidationError({"attendance_record": "本人の勤怠のみ申請できます。"})
+        list(
+            AttendanceCorrectionRequest.objects.select_for_update()
+            .filter(attendance_record=record, is_active=True, status__in=ATTENDANCE_CORRECTION_OPEN_STATUSES)
+            .values_list("id", flat=True)
+        )
+        if AttendanceCorrectionRequest.objects.filter(
+            attendance_record=record,
+            is_active=True,
+            status__in=ATTENDANCE_CORRECTION_OPEN_STATUSES,
+        ).exists():
+            raise DRFValidationError({"attendance_record": "未完了の修正申請が既にあります。"})
+        correction = AttendanceCorrectionRequest(attendance_record=record, requester=actor)
+    else:
+        correction = (
+            AttendanceCorrectionRequest.objects.select_for_update(of=("self",))
+            .select_related("attendance_record", "attendance_record__location", "requester")
+            .get(pk=instance.pk)
+        )
+        if correction.requester_id != actor.id:
+            raise DRFValidationError({"attendance_record": "本人の修正申請のみ編集できます。"})
+        if correction.status != AttendanceCorrectionRequest.Status.DRAFT:
+            raise DRFValidationError({"status": "下書きのみ編集できます。"})
+        record = correction.attendance_record
+        _ensure_attendance_record_self_operable(record)
+    for field in [
+        "requested_clock_in_at",
+        "requested_clock_out_at",
+        "requested_break_minutes",
+        "requested_staff_note",
+        "reason",
+    ]:
+        if field in validated_data:
+            setattr(correction, field, validated_data[field])
+    if submit:
+        correction.status = AttendanceCorrectionRequest.Status.SUBMITTED
+        correction.submitted_at = timezone.now()
+    correction.full_clean()
+    correction.save()
+    if submit:
+        record.status = AttendanceRecord.Status.PENDING_CORRECTION
+        record.save(update_fields=["status", "updated_at"])
+    return correction
+
+
+def submit_attendance_correction_request(
+    *, correction: AttendanceCorrectionRequest, actor: User
+) -> AttendanceCorrectionRequest:
+    correction = (
+        AttendanceCorrectionRequest.objects.select_for_update(of=("self",))
+        .select_related("attendance_record", "attendance_record__location", "requester")
+        .get(pk=correction.pk)
+    )
+    if correction.requester_id != actor.id:
+        raise DRFValidationError({"attendance_correction": "本人の修正申請のみ提出できます。"})
+    if correction.status != AttendanceCorrectionRequest.Status.DRAFT:
+        raise DRFValidationError({"status": "下書きのみ提出できます。"})
+    _ensure_attendance_record_self_operable(correction.attendance_record)
+    correction.status = AttendanceCorrectionRequest.Status.SUBMITTED
+    correction.submitted_at = timezone.now()
+    correction.save(update_fields=["status", "submitted_at", "updated_at"])
+    record = correction.attendance_record
+    record.status = AttendanceRecord.Status.PENDING_CORRECTION
+    record.save(update_fields=["status", "updated_at"])
+    return correction
+
+
+def cancel_attendance_correction_request(
+    *, correction: AttendanceCorrectionRequest, actor: User
+) -> AttendanceCorrectionRequest:
+    correction = (
+        AttendanceCorrectionRequest.objects.select_for_update(of=("self",))
+        .select_related("attendance_record", "attendance_record__location", "requester")
+        .get(pk=correction.pk)
+    )
+    if correction.requester_id != actor.id:
+        raise DRFValidationError({"attendance_correction": "本人の修正申請のみ取消できます。"})
+    if correction.status not in ATTENDANCE_CORRECTION_OPEN_STATUSES:
+        raise DRFValidationError({"status": "取消できる状態ではありません。"})
+    correction.status = AttendanceCorrectionRequest.Status.CANCELLED
+    correction.cancelled_at = timezone.now()
+    correction.cancelled_by = actor
+    correction.save(update_fields=["status", "cancelled_at", "cancelled_by", "updated_at"])
+    recalculate_attendance_record(correction.attendance_record)
+    return correction
+
+
+def approve_attendance_correction_request(
+    *, correction: AttendanceCorrectionRequest, actor: User, manager_note: str = ""
+) -> AttendanceCorrectionRequest:
+    correction = (
+        AttendanceCorrectionRequest.objects.select_for_update(of=("self",))
+        .select_related("attendance_record", "attendance_record__location", "requester")
+        .get(pk=correction.pk)
+    )
+    if correction.status != AttendanceCorrectionRequest.Status.SUBMITTED:
+        raise DRFValidationError({"status": "submittedのみ承認できます。"})
+    correction.status = AttendanceCorrectionRequest.Status.APPROVED
+    correction.approved_at = timezone.now()
+    correction.approved_by = actor
+    if manager_note:
+        correction.manager_note = manager_note
+    correction.save(update_fields=["status", "approved_at", "approved_by", "manager_note", "updated_at"])
+    return correction
+
+
+def reject_attendance_correction_request(
+    *, correction: AttendanceCorrectionRequest, actor: User, manager_note: str
+) -> AttendanceCorrectionRequest:
+    if not manager_note.strip():
+        raise DRFValidationError({"manager_note": "却下理由を入力してください。"})
+    correction = (
+        AttendanceCorrectionRequest.objects.select_for_update(of=("self",))
+        .select_related("attendance_record", "attendance_record__location", "requester")
+        .get(pk=correction.pk)
+    )
+    if correction.status not in {
+        AttendanceCorrectionRequest.Status.SUBMITTED,
+        AttendanceCorrectionRequest.Status.APPROVED,
+    }:
+        raise DRFValidationError({"status": "却下できる状態ではありません。"})
+    correction.status = AttendanceCorrectionRequest.Status.REJECTED
+    correction.rejected_at = timezone.now()
+    correction.rejected_by = actor
+    correction.manager_note = manager_note.strip()
+    correction.save(update_fields=["status", "rejected_at", "rejected_by", "manager_note", "updated_at"])
+    recalculate_attendance_record(correction.attendance_record)
+    return correction
+
+
+def apply_attendance_correction_request(
+    *, correction: AttendanceCorrectionRequest, actor: User, manager_note: str = ""
+) -> AttendanceCorrectionRequest:
+    correction = (
+        AttendanceCorrectionRequest.objects.select_for_update(of=("self",))
+        .select_related("attendance_record", "attendance_record__location", "requester")
+        .get(pk=correction.pk)
+    )
+    if correction.status != AttendanceCorrectionRequest.Status.APPROVED:
+        raise DRFValidationError({"status": "approvedのみ反映できます。"})
+    record = (
+        AttendanceRecord.objects.select_for_update(of=("self",))
+        .select_related("location", "staff")
+        .get(pk=correction.attendance_record_id)
+    )
+    _ensure_attendance_record_manager_operable(record)
+    if record.status == AttendanceRecord.Status.CONFIRMED:
+        raise DRFValidationError({"status": "確定済み勤怠は確定解除後に修正してください。"})
+    clock_in = correction.requested_clock_in_at or record.actual_clock_in_at
+    clock_out = correction.requested_clock_out_at or record.actual_clock_out_at
+    if not clock_in or not clock_out:
+        raise DRFValidationError({"requested_clock_out_at": "出勤・退勤時刻を指定してください。"})
+    _set_manual_actuals(
+        record,
+        actual_clock_in_at=clock_in,
+        actual_clock_out_at=clock_out,
+        break_minutes=correction.requested_break_minutes
+        if correction.requested_break_minutes is not None
+        else record.break_minutes,
+    )
+    record.source = AttendanceRecord.Source.CORRECTED
+    if correction.requested_staff_note:
+        record.staff_note = correction.requested_staff_note
+    if manager_note:
+        record.manager_note = manager_note
+        correction.manager_note = manager_note
+    record.status = AttendanceRecord.Status.CLOCKED_OUT
+    record.save()
+    _create_attendance_event(
+        record=record,
+        event_type=AttendanceEvent.EventType.CORRECTION_APPLIED,
+        occurred_at=timezone.now(),
+        source=AttendanceEvent.Source.MANAGER,
+        actor=actor,
+        note=manager_note,
+        metadata={"attendance_correction_request_id": str(correction.id)},
+    )
+    correction.status = AttendanceCorrectionRequest.Status.APPLIED
+    correction.applied_at = timezone.now()
+    correction.applied_by = actor
+    correction.save(update_fields=["status", "applied_at", "applied_by", "manager_note", "updated_at"])
+    recalculate_attendance_record(record)
+    return correction
+
+
+def get_attendance_lookup(
+    *,
+    staff_ids: set | list,
+    date_from: date,
+    date_to: date,
+    location: Location | None = None,
+    monthly_shift_plan: MonthlyShiftPlan | None = None,
+    publication_assignment_ids: list | None = None,
+) -> dict:
+    queryset = AttendanceRecord.objects.filter(
+        staff_id__in=staff_ids,
+        work_date__gte=date_from,
+        work_date__lte=date_to,
+        is_active=True,
+    ).select_related("staff", "location")
+    if location is not None:
+        queryset = queryset.filter(location=location)
+    if monthly_shift_plan is not None:
+        queryset = queryset.filter(Q(monthly_shift_plan=monthly_shift_plan) | Q(monthly_shift_plan__isnull=True))
+    if publication_assignment_ids is not None:
+        queryset = queryset.filter(
+            Q(publication_assignment_id__in=publication_assignment_ids) | Q(publication_assignment_id__isnull=True)
+        )
+    records = list(queryset)
+    by_staff_date = {(str(item.staff_id), item.work_date.isoformat()): item for item in records}
+    by_monthly_assignment = {
+        str(item.monthly_shift_assignment_id): item for item in records if item.monthly_shift_assignment_id
+    }
+    by_publication_assignment = {
+        str(item.publication_assignment_id): item for item in records if item.publication_assignment_id
+    }
+    return {
+        "records": records,
+        "by_staff_date": by_staff_date,
+        "by_monthly_assignment": by_monthly_assignment,
+        "by_publication_assignment": by_publication_assignment,
+    }
+
+
+def get_attendance_summary(records: list[AttendanceRecord]) -> dict:
+    return {
+        "record_count": len(records),
+        "confirmed_count": sum(1 for item in records if item.status == AttendanceRecord.Status.CONFIRMED),
+        "warning_count": sum(item.warning_count for item in records),
+        "worked_minutes": sum(item.worked_minutes for item in records),
+        "break_minutes": sum(item.break_minutes for item in records),
     }
 
 

@@ -31,6 +31,27 @@ const defaultRequestForm = {
   reason: "",
 };
 
+function attendanceStatusLabel(status?: string) {
+  const labels: Record<string, string> = {
+    open: "未打刻",
+    clocked_in: "出勤済み",
+    on_break: "休憩中",
+    clocked_out: "退勤済み",
+    pending_correction: "修正申請中",
+    confirmed: "確定済み",
+    void: "無効",
+  };
+  return status ? labels[status] ?? status : "未打刻";
+}
+
+function attendanceRange(shift: MyPublishedShift) {
+  const attendance = shift.attendance;
+  if (!attendance || attendance.actual_start_offset_minutes == null || attendance.actual_end_offset_minutes == null) {
+    return "-";
+  }
+  return `${offsetToLabel(attendance.actual_start_offset_minutes)}~${offsetToLabel(attendance.actual_end_offset_minutes)}`;
+}
+
 export function MyPublishedShiftsPage() {
   const queryClient = useQueryClient();
   const [year, setYear] = useState(today.getFullYear());
@@ -142,6 +163,56 @@ export function MyPublishedShiftsPage() {
     }
   };
 
+  const runAttendanceAction = async (
+    shift: MyPublishedShift,
+    action: "clock-in" | "break-start" | "break-end" | "clock-out",
+  ) => {
+    setIsSubmitting(true);
+    setError("");
+    setMessage("");
+    try {
+      const path =
+        action === "clock-in"
+          ? "/api/v1/my-attendance/clock-in/"
+          : `/api/v1/my-attendance/${shift.attendance?.id}/${action}/`;
+      const body =
+        action === "clock-in"
+          ? { location: shift.publication.location, work_date: shift.work_date }
+          : {};
+      await api(path, { method: "POST", body: JSON.stringify(body) });
+      setMessage("打刻しました。");
+      await queryClient.invalidateQueries({ queryKey: ["my-published-shifts"] });
+      await queryClient.invalidateQueries({ queryKey: ["my-attendance"] });
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "打刻に失敗しました。");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const createAttendanceCorrection = async (shift: MyPublishedShift) => {
+    if (!shift.attendance) return;
+    setIsSubmitting(true);
+    setError("");
+    setMessage("");
+    try {
+      await api("/api/v1/my-attendance-corrections/", {
+        method: "POST",
+        body: JSON.stringify({
+          attendance_record: shift.attendance.id,
+          reason: "公開シフト画面から作成",
+        }),
+      });
+      setMessage("勤怠修正申請を下書き作成しました。");
+      await queryClient.invalidateQueries({ queryKey: ["my-attendance-corrections"] });
+      await queryClient.invalidateQueries({ queryKey: ["my-published-shifts"] });
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "勤怠修正申請に失敗しました。");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   return (
     <section className="card monthly-page">
       <div className="section-header">
@@ -168,7 +239,7 @@ export function MyPublishedShiftsPage() {
           <div className="monthly-grid-wrap">
             <table className="table">
               <thead>
-                <tr><th>日付</th><th>曜日</th><th>拠点</th><th>勤務パターン</th><th>開始～終了</th><th>変更申請</th><th>勤務時間</th><th>休憩時間</th><th>公開Version</th><th>公開日時</th></tr>
+                <tr><th>日付</th><th>曜日</th><th>拠点</th><th>勤務パターン</th><th>開始～終了</th><th>勤怠</th><th>打刻</th><th>変更申請</th><th>勤務時間</th><th>休憩時間</th><th>公開Version</th><th>公開日時</th></tr>
               </thead>
               <tbody>
                 {shifts.map((shift) => {
@@ -180,6 +251,13 @@ export function MyPublishedShiftsPage() {
                       <td>{shift.publication.location_name}</td>
                       <td>{shift.pattern_short_name_snapshot || shift.pattern_name_snapshot}</td>
                       <td>{shift.start_offset_minutes == null || shift.end_offset_minutes == null ? "-" : `${offsetToLabel(shift.start_offset_minutes)}~${offsetToLabel(shift.end_offset_minutes)}`}</td>
+                      <td>{attendanceStatusLabel(shift.attendance?.status)}{shift.attendance?.warning_count ? ` / warning ${shift.attendance.warning_count}` : ""}</td>
+                      <td>
+                        {!shift.attendance || shift.attendance.status === "open" ? <button type="button" disabled={isSubmitting} onClick={() => void runAttendanceAction(shift, "clock-in")}>出勤</button> : null}
+                        {shift.attendance?.status === "clocked_in" ? <button type="button" disabled={isSubmitting} onClick={() => void runAttendanceAction(shift, "break-start")}>休憩開始</button> : null}
+                        {shift.attendance?.status === "on_break" ? <button type="button" disabled={isSubmitting} onClick={() => void runAttendanceAction(shift, "break-end")}>休憩終了</button> : null}
+                        {shift.attendance?.status === "clocked_in" ? <button type="button" disabled={isSubmitting} onClick={() => void runAttendanceAction(shift, "clock-out")}>退勤</button> : null}
+                      </td>
                       <td>{shift.shift_change_requests.length ? shift.shift_change_requests.map((item) => item.status).join(" / ") : <button type="button" onClick={() => chooseShift(shift)}>変更申請</button>}</td>
                       <td>{shift.work_minutes}分</td>
                       <td>{shift.break_minutes}分</td>
@@ -200,6 +278,11 @@ export function MyPublishedShiftsPage() {
                 <dt>開始～終了</dt><dd>{selectedShift.start_offset_minutes == null || selectedShift.end_offset_minutes == null ? "-" : `${offsetToLabel(selectedShift.start_offset_minutes)}~${offsetToLabel(selectedShift.end_offset_minutes)}`}</dd>
                 <dt>勤務時間</dt><dd>{selectedShift.work_minutes}分</dd>
                 <dt>休憩時間</dt><dd>{selectedShift.break_minutes}分</dd>
+                <dt>勤怠状態</dt><dd>{attendanceStatusLabel(selectedShift.attendance?.status)}</dd>
+                <dt>実績</dt><dd>{attendanceRange(selectedShift)}</dd>
+                <dt>実績休憩</dt><dd>{selectedShift.attendance?.break_minutes ?? 0}分</dd>
+                <dt>実績勤務</dt><dd>{selectedShift.attendance?.worked_minutes ?? 0}分</dd>
+                <dt>勤怠warning</dt><dd>{selectedShift.attendance?.warnings.length ? selectedShift.attendance.warnings.map((item) => item.code).join(" / ") : "-"}</dd>
                 <dt>Assignment備考</dt><dd>{selectedShift.notes}</dd>
                 <dt>公開Version</dt><dd>v{selectedShift.publication.version}</dd>
                 <dt>公開日時</dt><dd>{selectedShift.publication.published_at}</dd>
@@ -213,6 +296,11 @@ export function MyPublishedShiftsPage() {
                     ))}
                   </ul>
                 </section>
+              ) : null}
+              {selectedShift.attendance ? (
+                <div className="actions">
+                  <button type="button" disabled={isSubmitting || selectedShift.attendance.status === "confirmed"} onClick={() => void createAttendanceCorrection(selectedShift)}>勤怠修正申請</button>
+                </div>
               ) : null}
               <section className="inline-alert">
                 <h3>変更申請</h3>

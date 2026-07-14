@@ -20,6 +20,19 @@ type Props = {
   onClose: () => void;
 };
 
+function attendanceStatusLabel(status?: string) {
+  const labels: Record<string, string> = {
+    open: "未打刻",
+    clocked_in: "出勤済み",
+    on_break: "休憩中",
+    clocked_out: "退勤済み",
+    pending_correction: "修正申請中",
+    confirmed: "確定済み",
+    void: "無効",
+  };
+  return status ? labels[status] ?? status : "なし";
+}
+
 export function ShiftDetailPanel({ plan, selection, assignmentDetail, isLoading, isError, canManage, onClose }: Props) {
   if (!selection) return null;
   const detailSegments = (assignmentDetail?.segments ?? []).filter((segment) => segment.is_active);
@@ -44,6 +57,7 @@ export function ShiftDetailPanel({ plan, selection, assignmentDetail, isLoading,
   const sourceType = assignmentDetail?.source_type ?? assignment?.source_type;
   const isCustomized = assignmentDetail?.is_customized ?? assignment?.is_customized;
   const notes = assignmentDetail?.notes ?? assignment?.notes;
+  const attendance = assignment?.attendance;
   const startOffset = assignmentDetail?.start_offset_minutes ?? Math.min(...visibleSegments.map((segment) => segment.start_offset_minutes));
   const endOffset = assignmentDetail?.end_offset_minutes ?? Math.max(...visibleSegments.map((segment) => segment.end_offset_minutes));
   return (
@@ -78,6 +92,12 @@ export function ShiftDetailPanel({ plan, selection, assignmentDetail, isLoading,
             <dd>{isCustomized ? "あり" : "なし"}</dd>
             <dt>warning</dt>
             <dd>{selection.assignment.warning_count ? `${selection.assignment.warning_count}件` : "なし"}</dd>
+            <dt>勤怠</dt>
+            <dd>{attendanceStatusLabel(attendance?.status)}</dd>
+            <dt>実績</dt>
+            <dd>{attendance?.actual_start_offset_minutes == null || attendance.actual_end_offset_minutes == null ? "-" : `${offsetToLabel(attendance.actual_start_offset_minutes)}-${offsetToLabel(attendance.actual_end_offset_minutes)}`}</dd>
+            <dt>勤怠warning</dt>
+            <dd>{attendance?.warning_count ? attendance.warnings.map((item) => item.code).join(" / ") : "なし"}</dd>
             <dt>備考</dt>
             <dd>{notes || "-"}</dd>
           </dl>

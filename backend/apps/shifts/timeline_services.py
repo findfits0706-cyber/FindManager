@@ -10,7 +10,13 @@ from apps.accounts.models import User
 from apps.operations.models import StaffLocation
 
 from .models import MonthlyShiftAssignment, MonthlyShiftPlan, MonthlyShiftSegment
-from .services import build_capability_lookup, month_dates, monthly_assignment_warning_count
+from .services import (
+    attendance_record_summary,
+    build_capability_lookup,
+    get_attendance_lookup,
+    month_dates,
+    monthly_assignment_warning_count,
+)
 
 WEEKDAY_LABELS = ["月", "火", "水", "木", "金", "土", "日"]
 
@@ -203,6 +209,13 @@ def build_timeline_response(plan: MonthlyShiftPlan, params) -> dict:
         end_date=end_date,
         segments_attr="all_active_segments",
     )
+    attendance_lookup = get_attendance_lookup(
+        staff_ids=staff_id_set,
+        date_from=start_date,
+        date_to=end_date,
+        location=plan.location,
+        monthly_shift_plan=plan,
+    )
 
     assignments_by_staff_date = {
         (assignment.staff_id, assignment.work_date.isoformat()): assignment for assignment in assignments
@@ -270,6 +283,12 @@ def build_timeline_response(plan: MonthlyShiftPlan, params) -> dict:
                         assignment,
                         capability_lookup,
                         segments_attr="all_active_segments",
+                    ),
+                    "attendance": attendance_record_summary(
+                        attendance_lookup["by_monthly_assignment"].get(
+                            str(assignment.id),
+                            attendance_lookup["by_staff_date"].get((str(staff.id), date_key)),
+                        )
                     ),
                 },
                 "segments": segment_payloads,

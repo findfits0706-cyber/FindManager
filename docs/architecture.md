@@ -42,6 +42,7 @@
   - Monthly shift publications and staff self-service snapshots
   - Shift request periods, submissions, and request items
   - Shift change requests for published shifts
+  - Attendance records, immutable attendance events, and attendance correction requests
 
 ## Phase 2 Domain Rules
 
@@ -118,6 +119,18 @@
 - Applying an approved request changes the monthly plan row, never the publication snapshot.
 - After apply, the active publication is withdrawn and the plan returns to `confirmed`, so publication preview and republishing are required.
 - Monthly matrix and my published shift responses include change request summaries without per-row follow-up queries.
+
+## Attendance
+
+- Attendance actuals are stored in `AttendanceRecord` as one active row per location, staff, and work date.
+- Staff clocking creates immutable `AttendanceEvent` rows; corrections add manager adjustment or correction-applied events instead of rewriting the original clock events.
+- Records can link to `MonthlyShiftPlan`, `MonthlyShiftAssignment`, `MonthlyShiftPublication`, and `MonthlyShiftPublicationAssignment` when a published shift exists.
+- Published-shift assignment is preferred when staff clock in, but unscheduled work is allowed and marked with warnings.
+- Actual and scheduled comparisons use the same 0-2880 offset-minute convention as shifts; raw clock timestamps remain DateTime values.
+- Staff APIs are scoped to `request.user`; management APIs allow `system_admin` and `shift_manager` operations, while `supervisor` is read-only.
+- Correction requests move through draft, submitted, approved, rejected, cancelled, and applied. Applying a correction updates the attendance record and leaves an immutable event.
+- Confirmed attendance blocks staff clocking and staff correction requests until a manager unconfirms it.
+- Payroll, wage rates, statutory break enforcement, notifications, and external clocking integrations are intentionally outside the attendance foundation.
 
 ## Quality Gates
 

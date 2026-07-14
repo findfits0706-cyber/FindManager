@@ -1,11 +1,14 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
+import { AttendanceCorrectionRequestsPage } from "./pages/AttendanceCorrectionRequestsPage";
+import { AttendancePage } from "./pages/AttendancePage";
 import { AuthProvider } from "./features/auth/AuthContext";
 import { ProtectedRoute } from "./routes/ProtectedRoute";
 import { ChangePasswordPage } from "./pages/ChangePasswordPage";
 import { ForbiddenPage } from "./pages/ForbiddenPage";
 import { LoginPage } from "./pages/LoginPage";
 import { MyCapabilitiesPage } from "./pages/MyCapabilitiesPage";
+import { MyAttendancePage } from "./pages/MyAttendancePage";
 import { MyPublishedShiftsPage } from "./pages/MyPublishedShiftsPage";
 import { MyShiftChangeRequestsPage } from "./pages/MyShiftChangeRequestsPage";
 import { MyShiftRequestsPage } from "./pages/MyShiftRequestsPage";
@@ -56,8 +59,11 @@ export function App() {
           <Route path="operations/my-staff-locations" element={<MyCapabilitiesPage section="locations" />} />
           <Route path="operations/my-capabilities" element={<MyCapabilitiesPage />} />
           <Route path="my/shift-requests" element={<MyShiftRequestsPage />} />
+          <Route path="my/attendance" element={<MyAttendancePage />} />
           <Route path="my/shift-change-requests" element={<MyShiftChangeRequestsPage />} />
           <Route path="shifts/my-published" element={<MyPublishedShiftsPage />} />
+          <Route path="attendance" element={<AttendancePage />} />
+          <Route path="attendance/corrections" element={<AttendanceCorrectionRequestsPage />} />
           <Route path="shifts/monthly" element={<MonthlyShiftsPage />} />
           <Route path="shifts/timeline" element={<ShiftTimelinePage />} />
           <Route path="shifts/change-requests" element={<ShiftChangeRequestsPage />} />

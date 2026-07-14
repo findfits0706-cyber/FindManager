@@ -122,3 +122,14 @@ Phase 8 adds post-publication shift change requests:
 - Apply flow that updates the monthly plan, withdraws the active publication snapshot, and requires republishing
 - Monthly matrix and my published shift indicators for open or applied change requests
 - Self-service APIs scoped to the authenticated user under `/api/v1/my-shift-change-requests/`
+
+Phase 9 adds attendance clocking and actual work records:
+
+- Daily `AttendanceRecord` rows linked to staff, location, and work date
+- Immutable `AttendanceEvent` rows for clock-in, break, clock-out, manager adjustments, confirmation, and voiding
+- Staff self-service attendance at `/my/attendance` and clock buttons on `/shifts/my-published`
+- Staff correction requests under `/api/v1/my-attendance-corrections/`
+- Manager/supervisor attendance review at `/attendance` and correction review at `/attendance/corrections`
+- Manager actions for manual adjustment, confirm, unconfirm, void, approve, reject, and apply
+- Monthly matrix, timeline, and my published shift attendance status indicators
+- Payroll, wage rates, legal labor alerts, notifications, and external clocking devices remain outside this phase

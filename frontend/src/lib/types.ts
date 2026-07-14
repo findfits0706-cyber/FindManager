@@ -202,6 +202,7 @@ export type MonthlyMatrixAssignment = {
   issues?: Array<{ severity: "info" | "warning" | "error"; code: string; message: string }>;
   shift_requests?: ShiftRequestItem[];
   shift_change_requests?: ShiftChangeRequestSummary[];
+  attendance?: AttendanceSummary | null;
 };
 
 export type MonthlyMatrixInactiveAssignment = {
@@ -260,6 +261,7 @@ export type TimelineAssignment = {
   is_customized: boolean;
   notes: string;
   warning_count: number;
+  attendance?: AttendanceSummary | null;
 };
 
 export type ShiftTimelineResponse = {
@@ -439,6 +441,7 @@ export type MyPublishedShift = {
   break_minutes: number;
   segments: MonthlyShiftPublicationSegment[];
   shift_change_requests: ShiftChangeRequestSummary[];
+  attendance: AttendanceSummary | null;
   publication: {
     id: string;
     version: number;
@@ -449,6 +452,135 @@ export type MyPublishedShift = {
     month: number;
     published_at: string;
   };
+};
+
+export type AttendanceStatus =
+  | "open"
+  | "clocked_in"
+  | "on_break"
+  | "clocked_out"
+  | "pending_correction"
+  | "confirmed"
+  | "void";
+
+export type AttendanceSource = "scheduled" | "unscheduled" | "manual" | "corrected" | "imported";
+
+export type AttendanceWarning = {
+  code: string;
+  message: string;
+};
+
+export type AttendanceSummary = {
+  id: string;
+  status: AttendanceStatus;
+  source: AttendanceSource;
+  actual_start_offset_minutes: number | null;
+  actual_end_offset_minutes: number | null;
+  break_minutes: number;
+  worked_minutes: number;
+  difference_start_minutes: number | null;
+  difference_end_minutes: number | null;
+  difference_worked_minutes: number | null;
+  warning_count: number;
+  warnings: AttendanceWarning[];
+  confirmed_at: string | null;
+};
+
+export type AttendanceEvent = {
+  id: string;
+  attendance_record: string;
+  event_type:
+    | "clock_in"
+    | "break_start"
+    | "break_end"
+    | "clock_out"
+    | "manual_adjustment"
+    | "correction_applied"
+    | "voided"
+    | "confirmed"
+    | "unconfirmed";
+  occurred_at: string;
+  offset_minutes: number;
+  source: "self" | "manager" | "system";
+  actor: string;
+  actor_display_name: string;
+  note: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
+export type AttendanceCorrectionRequest = {
+  id: string;
+  attendance_record: string;
+  location: string;
+  location_name: string;
+  work_date: string;
+  staff: string;
+  staff_display_name: string;
+  requester: string;
+  requester_display_name: string;
+  status: "draft" | "submitted" | "approved" | "rejected" | "cancelled" | "applied";
+  requested_clock_in_at: string | null;
+  requested_clock_out_at: string | null;
+  requested_break_minutes: number | null;
+  requested_staff_note: string;
+  reason: string;
+  manager_note: string;
+  submitted_at: string | null;
+  approved_at: string | null;
+  approved_by: string | null;
+  approved_by_display_name?: string | null;
+  rejected_at: string | null;
+  rejected_by: string | null;
+  rejected_by_display_name?: string | null;
+  cancelled_at: string | null;
+  cancelled_by: string | null;
+  cancelled_by_display_name?: string | null;
+  applied_at: string | null;
+  applied_by: string | null;
+  applied_by_display_name?: string | null;
+  can_edit: boolean;
+  can_submit: boolean;
+  can_cancel: boolean;
+  can_approve: boolean;
+  can_apply: boolean;
+  created_at: string;
+  updated_at: string;
+  is_active: boolean;
+};
+
+export type AttendanceRecord = AttendanceSummary & {
+  location: string;
+  location_name: string;
+  staff: string;
+  staff_display_name: string;
+  employee_code: string;
+  work_date: string;
+  monthly_shift_plan: string | null;
+  monthly_shift_assignment: string | null;
+  publication: string | null;
+  publication_assignment: string | null;
+  scheduled_start_offset_minutes: number | null;
+  scheduled_end_offset_minutes: number | null;
+  scheduled_pattern_name_snapshot: string;
+  scheduled_pattern_short_name_snapshot: string;
+  actual_clock_in_at: string | null;
+  actual_clock_out_at: string | null;
+  manager_note: string;
+  staff_note: string;
+  confirmed_by: string | null;
+  confirmed_by_display_name?: string | null;
+  events: AttendanceEvent[];
+  correction_requests: AttendanceCorrectionRequest[];
+  can_clock_in: boolean;
+  can_break_start: boolean;
+  can_break_end: boolean;
+  can_clock_out: boolean;
+  can_request_correction: boolean;
+  can_manage: boolean;
+  created_at: string;
+  updated_at: string;
+  is_active: boolean;
 };
 
 export type MyPublishedShiftsResponse = {

@@ -117,6 +117,19 @@ function publicationWarningFingerprint(preview: PublicationPreview | null): stri
   );
 }
 
+function attendanceStatusLabel(status: string) {
+  const labels: Record<string, string> = {
+    open: "未打刻",
+    clocked_in: "出勤済み",
+    on_break: "休憩中",
+    clocked_out: "退勤済み",
+    pending_correction: "修正申請中",
+    confirmed: "確定済み",
+    void: "無効",
+  };
+  return labels[status] ?? status;
+}
+
 export function MonthlyShiftsPage() {
   const { user, loading } = useAuth();
   const queryClient = useQueryClient();
@@ -830,7 +843,7 @@ export function MonthlyShiftsPage() {
                     return (
                       <td key={`${row.staff}-${item.date}`} className={item.is_saturday ? "saturday" : item.is_sunday ? "sunday" : ""}>
                         <button type="button" className="shift-cell" disabled={!cell && !inactive && !isPlanEditable} onClick={() => void loadAssignment({ staff: row.staff, staffName: row.staff_display_name, workDate: item.date, assignmentId: cell?.id ?? undefined, inactiveAssignmentId: inactive?.id, inactivePatternShortName: inactive?.pattern_short_name })}>
-                          {cell ? <><strong>{cell.pattern_short_name || "希望"}</strong><span>{cell.start_offset_minutes != null ? offsetToLabel(cell.start_offset_minutes) : ""}~{cell.end_offset_minutes != null ? offsetToLabel(cell.end_offset_minutes) : ""}</span>{cell.is_customized ? <em>調整</em> : null}{cell.warning_count ? <em>警告</em> : null}{cell.issues?.some((issue) => issue.code.startsWith("requested_")) ? <em>希望</em> : null}{cell.shift_change_requests?.length ? <em>変更</em> : null}</> : inactive ? <span className="subtle-text">解除済み {inactive.pattern_short_name}</span> : <span className="subtle-text">+</span>}
+                          {cell ? <><strong>{cell.pattern_short_name || "希望"}</strong><span>{cell.start_offset_minutes != null ? offsetToLabel(cell.start_offset_minutes) : ""}~{cell.end_offset_minutes != null ? offsetToLabel(cell.end_offset_minutes) : ""}</span>{cell.is_customized ? <em>調整</em> : null}{cell.warning_count ? <em>警告</em> : null}{cell.issues?.some((issue) => issue.code.startsWith("requested_")) ? <em>希望</em> : null}{cell.shift_change_requests?.length ? <em>変更</em> : null}{cell.attendance ? <em>{attendanceStatusLabel(cell.attendance.status)}</em> : null}{cell.attendance?.warning_count ? <em>勤怠警告</em> : null}</> : inactive ? <span className="subtle-text">解除済み {inactive.pattern_short_name}</span> : <span className="subtle-text">+</span>}
                         </button>
                       </td>
                     );
@@ -867,6 +880,24 @@ export function MonthlyShiftsPage() {
               </div>
             ))}
             {isPlanEditable ? <div className="actions"><button type="button" disabled={isSubmitting || (!assignment && !selectedPattern)} onClick={() => void saveAssignment()}>{isSubmitting ? "保存中..." : "保存"}</button>{assignment ? <button type="button" disabled={isSubmitting} onClick={() => void deactivateAssignment()}>勤務解除</button> : null}</div> : null}
+            {selected ? (() => {
+              const row = matrixQuery.data?.rows.find((item) => item.staff === selected.staff);
+              const cell = row?.assignments[selected.workDate];
+              const attendance = cell?.attendance;
+              return attendance ? (
+                <section className="inline-alert">
+                  <h3>勤怠</h3>
+                  <dl>
+                    <dt>状態</dt><dd>{attendanceStatusLabel(attendance.status)}</dd>
+                    <dt>実績</dt><dd>{attendance.actual_start_offset_minutes == null || attendance.actual_end_offset_minutes == null ? "-" : `${offsetToLabel(attendance.actual_start_offset_minutes)}~${offsetToLabel(attendance.actual_end_offset_minutes)}`}</dd>
+                    <dt>休憩</dt><dd>{attendance.break_minutes}分</dd>
+                    <dt>勤務</dt><dd>{attendance.worked_minutes}分</dd>
+                    <dt>差異</dt><dd>開始 {attendance.difference_start_minutes ?? "-"} / 終了 {attendance.difference_end_minutes ?? "-"} / 勤務 {attendance.difference_worked_minutes ?? "-"}</dd>
+                    <dt>warning</dt><dd>{attendance.warnings.length ? attendance.warnings.map((item) => item.code).join(" / ") : "-"}</dd>
+                  </dl>
+                </section>
+              ) : null;
+            })() : null}
             {selected ? (() => {
               const row = matrixQuery.data?.rows.find((item) => item.staff === selected.staff);
               const cell = row?.assignments[selected.workDate];

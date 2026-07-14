@@ -12,6 +12,9 @@ from apps.accounts.models import User
 from apps.operations.models import StaffLocation
 
 from .models import (
+    AttendanceCorrectionRequest,
+    AttendanceEvent,
+    AttendanceRecord,
     MonthlyShiftAssignment,
     MonthlyShiftPlan,
     MonthlyShiftPublication,
@@ -26,6 +29,13 @@ from .models import (
     WeeklyShiftTemplate,
 )
 from .serializers import (
+    AttendanceClockEventSerializer,
+    AttendanceClockInSerializer,
+    AttendanceCorrectionRequestSerializer,
+    AttendanceCorrectionSaveSerializer,
+    AttendanceManagerNoteSerializer,
+    AttendanceManualAdjustSerializer,
+    AttendanceRecordSerializer,
     MonthlyShiftAssignmentListSerializer,
     MonthlyShiftAssignmentSerializer,
     MonthlyShiftPlanListSerializer,
@@ -53,21 +63,31 @@ from .serializers import (
     WeeklyShiftTemplateSerializer,
 )
 from .services import (
+    add_self_attendance_event,
+    apply_attendance_correction_request,
     apply_shift_change_request,
     apply_template_generation,
+    approve_attendance_correction_request,
     approve_shift_change_request,
+    attendance_correction_metadata,
+    attendance_record_metadata,
+    attendance_record_summary,
     build_capability_lookup,
     build_publication_preview,
     can_manage_shifts,
     can_view_shifts,
+    cancel_attendance_correction_request,
     cancel_shift_change_request,
+    clock_in_attendance,
     close_shift_change_request,
+    confirm_attendance_record,
     confirm_monthly_shift_plan,
     deactivate_instance,
     deactivate_monthly_instance,
     duplicate_shift_pattern,
     duplicate_weekly_template,
     ensure_monthly_plan_editable,
+    get_attendance_lookup,
     get_or_create_shift_request_submission,
     get_shift_change_request_assignment_lookup,
     get_shift_change_request_lookup,
@@ -75,6 +95,7 @@ from .services import (
     get_shift_request_lookup,
     get_shift_request_target_staff_counts,
     lock_shift_request_submission,
+    manual_adjust_attendance_record,
     month_dates,
     monthly_assignment_metadata,
     monthly_assignment_warning_count,
@@ -82,9 +103,11 @@ from .services import (
     preview_template_generation,
     publish_monthly_shift_plan,
     record_shift_event,
+    reject_attendance_correction_request,
     reject_shift_change_request,
     reopen_monthly_shift_plan,
     return_shift_request_submission,
+    save_attendance_correction_request,
     save_shift_change_request,
     save_shift_request_period,
     save_shift_request_submission,
@@ -97,8 +120,10 @@ from .services import (
     shift_request_items_for_display,
     shift_request_period_metadata,
     shift_request_submission_metadata,
+    submit_attendance_correction_request,
     submit_shift_change_request,
     submit_shift_request_submission,
+    unconfirm_attendance_record,
     unlock_shift_request_submission,
     unsubmit_shift_request_submission,
     validate_and_reactivate_monthly_assignment,
@@ -106,6 +131,7 @@ from .services import (
     validate_and_reactivate_pattern,
     validate_and_reactivate_template,
     validate_assignment_against_shift_requests,
+    void_attendance_record,
     weekly_template_metadata,
     withdraw_monthly_shift_publication,
 )
@@ -175,6 +201,49 @@ def get_shift_change_request_for_update(pk):
     )
 
 
+def attendance_record_queryset():
+    return AttendanceRecord.objects.select_related(
+        "location",
+        "staff",
+        "monthly_shift_plan",
+        "monthly_shift_assignment",
+        "publication",
+        "publication_assignment",
+        "confirmed_by",
+    ).prefetch_related(
+        Prefetch(
+            "events",
+            queryset=AttendanceEvent.objects.select_related("actor").order_by("occurred_at", "created_at"),
+        ),
+        Prefetch(
+            "correction_requests",
+            queryset=AttendanceCorrectionRequest.objects.select_related(
+                "requester",
+                "approved_by",
+                "rejected_by",
+                "cancelled_by",
+                "applied_by",
+                "attendance_record",
+                "attendance_record__location",
+                "attendance_record__staff",
+            ).order_by("-created_at"),
+        ),
+    )
+
+
+def attendance_correction_queryset():
+    return AttendanceCorrectionRequest.objects.select_related(
+        "attendance_record",
+        "attendance_record__location",
+        "attendance_record__staff",
+        "requester",
+        "approved_by",
+        "rejected_by",
+        "cancelled_by",
+        "applied_by",
+    )
+
+
 def validate_change_request_date_range(params, *, max_days=92):
     date_from = params.get("date_from")
     date_to = params.get("date_to")
@@ -189,6 +258,10 @@ def validate_change_request_date_range(params, *, max_days=92):
         if (parsed_to - parsed_from).days > max_days:
             raise ValidationError({"date_to": f"検索範囲は最大{max_days + 1}日です。"})
     return parsed_from, parsed_to
+
+
+def validate_attendance_date_range(params):
+    return validate_change_request_date_range(params, max_days=91)
 
 
 class ShiftSettingsPermission(permissions.BasePermission):
@@ -564,6 +637,13 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
         request_info_lookup = get_shift_request_info_lookup(plan.location, plan.year, plan.month, staff_ids)
         shift_change_lookup = get_shift_change_request_lookup(plan, staff_ids)
         shift_change_summary = shift_change_request_summary(plan)
+        attendance_lookup = get_attendance_lookup(
+            staff_ids=staff_ids,
+            date_from=start_date,
+            date_to=end_date,
+            location=plan.location,
+            monthly_shift_plan=plan,
+        )
         request_period = (
             ShiftRequestPeriod.objects.select_related("location")
             .annotate(
@@ -632,6 +712,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                 assignment = assignments_by_staff_date.get((str(staff.id), work_date.isoformat()))
                 request_items = request_info_lookup.get((str(staff.id), work_date.isoformat()), [])
                 change_requests = shift_change_lookup.get((str(staff.id), work_date.isoformat()), [])
+                attendance_record = attendance_lookup["by_staff_date"].get((str(staff.id), work_date.isoformat()))
                 if assignment is not None:
                     active_segments = list(assignment.segments.all())
                     request_issues = validate_assignment_against_shift_requests(
@@ -654,6 +735,9 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                         "issues": request_issues,
                         "shift_requests": shift_request_items_for_display(request_items),
                         "shift_change_requests": shift_change_requests_for_display(change_requests),
+                        "attendance": attendance_record_summary(
+                            attendance_lookup["by_monthly_assignment"].get(str(assignment.id), attendance_record)
+                        ),
                     }
                     continue
                 prefer_issues = [
@@ -671,7 +755,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                         "id": str(inactive.id),
                         "pattern_short_name": inactive.pattern_short_name_snapshot,
                     }
-                if request_items or prefer_issues or change_requests:
+                if request_items or prefer_issues or change_requests or attendance_record:
                     assignments.setdefault(
                         work_date.isoformat(),
                         {
@@ -685,6 +769,7 @@ class MonthlyShiftPlanViewSet(ShiftManagementBaseViewSet):
                             "issues": prefer_issues,
                             "shift_requests": shift_request_items_for_display(request_items),
                             "shift_change_requests": shift_change_requests_for_display(change_requests),
+                            "attendance": attendance_record_summary(attendance_record),
                         },
                     )
             rows.append(
@@ -1514,6 +1599,420 @@ class ShiftChangeRequestManagementPermission(permissions.BasePermission):
         return self.has_permission(request, view)
 
 
+class MyAttendancePermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_authenticated)
+
+    def has_object_permission(self, request, view, obj):
+        if hasattr(obj, "staff_id"):
+            return obj.staff_id == request.user.id
+        if hasattr(obj, "requester_id"):
+            return obj.requester_id == request.user.id
+        return False
+
+
+class AttendanceManagementPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if request.method in permissions.SAFE_METHODS:
+            return can_view_shifts(request.user)
+        return can_manage_shifts(request.user)
+
+    def has_object_permission(self, request, view, obj):
+        return self.has_permission(request, view)
+
+
+class MyAttendanceViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [MyAttendancePermission]
+    serializer_class = AttendanceRecordSerializer
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_queryset(self):
+        params = self.request.query_params
+        if "staff" in params:
+            raise ValidationError({"staff": "本人APIでは指定できません。"})
+        date_from, date_to = validate_attendance_date_range(params)
+        queryset = attendance_record_queryset().filter(staff=self.request.user)
+        if date_from:
+            queryset = queryset.filter(work_date__gte=date_from)
+        if date_to:
+            queryset = queryset.filter(work_date__lte=date_to)
+        if params.get("location"):
+            queryset = queryset.filter(location_id=params["location"])
+        if params.get("status"):
+            queryset = queryset.filter(status=params["status"])
+        return queryset.order_by("-work_date", "-created_at")
+
+    @action(detail=False, methods=["post"], url_path="clock-in")
+    def clock_in(self, request):
+        serializer = AttendanceClockInSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            record, created = clock_in_attendance(
+                staff=request.user,
+                location=serializer.validated_data["location"],
+                work_date=serializer.validated_data["work_date"],
+                actor=request.user,
+                occurred_at=serializer.validated_data.get("occurred_at"),
+                note=serializer.validated_data.get("note", ""),
+            )
+            if created:
+                record_shift_event(
+                    entity="attendance_record",
+                    action="create",
+                    actor=request.user,
+                    request=request,
+                    metadata=attendance_record_metadata(record),
+                )
+            record_shift_event(
+                entity="attendance_record",
+                action="clock_in",
+                actor=request.user,
+                request=request,
+                metadata=attendance_record_metadata(record),
+            )
+        return Response(self.get_serializer(attendance_record_queryset().get(pk=record.pk)).data, status=201)
+
+    def _clock_action(self, request, pk, *, event_type: str, audit_action: str):
+        serializer = AttendanceClockEventSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            record = self.get_object()
+            record = add_self_attendance_event(
+                record=record,
+                event_type=event_type,
+                actor=request.user,
+                occurred_at=serializer.validated_data.get("occurred_at"),
+                note=serializer.validated_data.get("note", ""),
+            )
+            record_shift_event(
+                entity="attendance_record",
+                action=audit_action,
+                actor=request.user,
+                request=request,
+                metadata=attendance_record_metadata(record),
+            )
+        return Response(self.get_serializer(attendance_record_queryset().get(pk=record.pk)).data)
+
+    @action(detail=True, methods=["post"], url_path="break-start")
+    def break_start(self, request, pk=None):
+        return self._clock_action(
+            request,
+            pk,
+            event_type=AttendanceEvent.EventType.BREAK_START,
+            audit_action="break_start",
+        )
+
+    @action(detail=True, methods=["post"], url_path="break-end")
+    def break_end(self, request, pk=None):
+        return self._clock_action(
+            request,
+            pk,
+            event_type=AttendanceEvent.EventType.BREAK_END,
+            audit_action="break_end",
+        )
+
+    @action(detail=True, methods=["post"], url_path="clock-out")
+    def clock_out(self, request, pk=None):
+        return self._clock_action(
+            request,
+            pk,
+            event_type=AttendanceEvent.EventType.CLOCK_OUT,
+            audit_action="clock_out",
+        )
+
+
+class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [AttendanceManagementPermission]
+    serializer_class = AttendanceRecordSerializer
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_queryset(self):
+        params = self.request.query_params
+        date_from, date_to = validate_attendance_date_range(params)
+        queryset = attendance_record_queryset()
+        if params.get("location"):
+            queryset = queryset.filter(location_id=params["location"])
+        if date_from:
+            queryset = queryset.filter(work_date__gte=date_from)
+        if date_to:
+            queryset = queryset.filter(work_date__lte=date_to)
+        if params.get("staff"):
+            queryset = queryset.filter(staff_id=params["staff"])
+        if params.get("status"):
+            queryset = queryset.filter(status=params["status"])
+        if params.get("source"):
+            queryset = queryset.filter(source=params["source"])
+        if params.get("has_warnings") == "true":
+            queryset = queryset.filter(warning_count__gt=0)
+        if params.get("has_warnings") == "false":
+            queryset = queryset.filter(warning_count=0)
+        if params.get("confirmed") == "true":
+            queryset = queryset.filter(status=AttendanceRecord.Status.CONFIRMED)
+        if params.get("confirmed") == "false":
+            queryset = queryset.exclude(status=AttendanceRecord.Status.CONFIRMED)
+        return queryset.order_by("-work_date", "location__display_order", "staff__employee_code")
+
+    @action(detail=True, methods=["post"], url_path="manual-adjust")
+    def manual_adjust(self, request, pk=None):
+        serializer = AttendanceManualAdjustSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            record = manual_adjust_attendance_record(
+                record=self.get_object(),
+                actor=request.user,
+                actual_clock_in_at=serializer.validated_data["actual_clock_in_at"],
+                actual_clock_out_at=serializer.validated_data["actual_clock_out_at"],
+                break_minutes=serializer.validated_data["break_minutes"],
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="attendance_record",
+                action="manual_adjust",
+                actor=request.user,
+                request=request,
+                metadata=attendance_record_metadata(record),
+            )
+        return Response(self.get_serializer(attendance_record_queryset().get(pk=record.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def confirm(self, request, pk=None):
+        serializer = AttendanceManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            record = confirm_attendance_record(
+                record=self.get_object(),
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="attendance_record",
+                action="confirm",
+                actor=request.user,
+                request=request,
+                metadata=attendance_record_metadata(record),
+            )
+        return Response(self.get_serializer(attendance_record_queryset().get(pk=record.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def unconfirm(self, request, pk=None):
+        serializer = AttendanceManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            record = unconfirm_attendance_record(
+                record=self.get_object(),
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="attendance_record",
+                action="unconfirm",
+                actor=request.user,
+                request=request,
+                metadata=attendance_record_metadata(record),
+            )
+        return Response(self.get_serializer(attendance_record_queryset().get(pk=record.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def void(self, request, pk=None):
+        serializer = AttendanceManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            record = void_attendance_record(
+                record=self.get_object(),
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="attendance_record",
+                action="void",
+                actor=request.user,
+                request=request,
+                metadata=attendance_record_metadata(record),
+            )
+        return Response(self.get_serializer(record).data)
+
+
+class MyAttendanceCorrectionRequestViewSet(viewsets.ModelViewSet):
+    permission_classes = [MyAttendancePermission]
+    serializer_class = AttendanceCorrectionRequestSerializer
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_queryset(self):
+        params = self.request.query_params
+        forbidden = {"staff", "requester"}.intersection(params)
+        if forbidden:
+            raise ValidationError({field: "本人APIでは指定できません。" for field in forbidden})
+        date_from, date_to = validate_attendance_date_range(params)
+        queryset = attendance_correction_queryset().filter(requester=self.request.user, is_active=True)
+        if date_from:
+            queryset = queryset.filter(attendance_record__work_date__gte=date_from)
+        if date_to:
+            queryset = queryset.filter(attendance_record__work_date__lte=date_to)
+        if params.get("location"):
+            queryset = queryset.filter(attendance_record__location_id=params["location"])
+        if params.get("status"):
+            queryset = queryset.filter(status=params["status"])
+        return queryset.order_by("-created_at")
+
+    def create(self, request, *args, **kwargs):
+        serializer = AttendanceCorrectionSaveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        submit = serializer.validated_data.pop("submit", False)
+        attendance_record = serializer.validated_data.pop("attendance_record", None)
+        with transaction.atomic():
+            correction = save_attendance_correction_request(
+                instance=None,
+                attendance_record=attendance_record,
+                actor=request.user,
+                validated_data=serializer.validated_data,
+                submit=submit,
+            )
+            record_shift_event(
+                entity="attendance_correction",
+                action="create",
+                actor=request.user,
+                request=request,
+                metadata=attendance_correction_metadata(correction),
+            )
+            if submit:
+                record_shift_event(
+                    entity="attendance_correction",
+                    action="submit",
+                    actor=request.user,
+                    request=request,
+                    metadata=attendance_correction_metadata(correction),
+                )
+        return Response(self.get_serializer(attendance_correction_queryset().get(pk=correction.pk)).data, status=201)
+
+    def partial_update(self, request, *args, **kwargs):
+        serializer = AttendanceCorrectionSaveSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.validated_data.pop("attendance_record", None)
+        serializer.validated_data.pop("submit", None)
+        with transaction.atomic():
+            correction = save_attendance_correction_request(
+                instance=self.get_object(),
+                attendance_record=None,
+                actor=request.user,
+                validated_data=serializer.validated_data,
+            )
+            record_shift_event(
+                entity="attendance_correction",
+                action="update",
+                actor=request.user,
+                request=request,
+                metadata=attendance_correction_metadata(correction),
+            )
+        return Response(self.get_serializer(attendance_correction_queryset().get(pk=correction.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        with transaction.atomic():
+            correction = submit_attendance_correction_request(correction=self.get_object(), actor=request.user)
+            record_shift_event(
+                entity="attendance_correction",
+                action="submit",
+                actor=request.user,
+                request=request,
+                metadata=attendance_correction_metadata(correction),
+            )
+        return Response(self.get_serializer(attendance_correction_queryset().get(pk=correction.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        with transaction.atomic():
+            correction = cancel_attendance_correction_request(correction=self.get_object(), actor=request.user)
+            record_shift_event(
+                entity="attendance_correction",
+                action="cancel",
+                actor=request.user,
+                request=request,
+                metadata=attendance_correction_metadata(correction),
+            )
+        return Response(self.get_serializer(attendance_correction_queryset().get(pk=correction.pk)).data)
+
+
+class AttendanceCorrectionRequestViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [AttendanceManagementPermission]
+    serializer_class = AttendanceCorrectionRequestSerializer
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_queryset(self):
+        params = self.request.query_params
+        date_from, date_to = validate_attendance_date_range(params)
+        queryset = attendance_correction_queryset().filter(is_active=True)
+        if params.get("location"):
+            queryset = queryset.filter(attendance_record__location_id=params["location"])
+        if date_from:
+            queryset = queryset.filter(attendance_record__work_date__gte=date_from)
+        if date_to:
+            queryset = queryset.filter(attendance_record__work_date__lte=date_to)
+        if params.get("staff"):
+            queryset = queryset.filter(attendance_record__staff_id=params["staff"])
+        if params.get("status"):
+            queryset = queryset.filter(status=params["status"])
+        return queryset.order_by("-created_at")
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        serializer = AttendanceManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            correction = approve_attendance_correction_request(
+                correction=self.get_object(),
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="attendance_correction",
+                action="approve",
+                actor=request.user,
+                request=request,
+                metadata=attendance_correction_metadata(correction),
+            )
+        return Response(self.get_serializer(attendance_correction_queryset().get(pk=correction.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        serializer = AttendanceManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            correction = reject_attendance_correction_request(
+                correction=self.get_object(),
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="attendance_correction",
+                action="reject",
+                actor=request.user,
+                request=request,
+                metadata=attendance_correction_metadata(correction),
+            )
+        return Response(self.get_serializer(attendance_correction_queryset().get(pk=correction.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def apply(self, request, pk=None):
+        serializer = AttendanceManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            correction = apply_attendance_correction_request(
+                correction=self.get_object(),
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="attendance_correction",
+                action="apply",
+                actor=request.user,
+                request=request,
+                metadata=attendance_correction_metadata(correction),
+            )
+        return Response(self.get_serializer(attendance_correction_queryset().get(pk=correction.pk)).data)
+
+
 class MyShiftChangeRequestViewSet(viewsets.ModelViewSet):
     permission_classes = [MyShiftChangeRequestPermission]
     serializer_class = ShiftChangeRequestSerializer
@@ -1910,10 +2409,20 @@ class MyPublishedShiftViewSet(viewsets.GenericViewSet):
             current = date.fromordinal(current.toordinal() + 1)
         shifts = list(self.get_queryset())
         change_request_lookup = get_shift_change_request_assignment_lookup([item.id for item in shifts])
+        attendance_lookup = get_attendance_lookup(
+            staff_ids={item.staff_id for item in shifts},
+            date_from=date_from,
+            date_to=date_to,
+            publication_assignment_ids=[item.id for item in shifts],
+        )["by_publication_assignment"]
         serializer = self.get_serializer(
             shifts,
             many=True,
-            context={**self.get_serializer_context(), "shift_change_request_lookup": change_request_lookup},
+            context={
+                **self.get_serializer_context(),
+                "shift_change_request_lookup": change_request_lookup,
+                "attendance_lookup": attendance_lookup,
+            },
         )
         return Response(
             {

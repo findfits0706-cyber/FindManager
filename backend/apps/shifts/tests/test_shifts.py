@@ -1,5 +1,5 @@
 import uuid
-from datetime import date
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
@@ -19,6 +19,9 @@ from apps.operations.services import seed_operations
 
 from .. import views as shift_views
 from ..models import (
+    AttendanceCorrectionRequest,
+    AttendanceEvent,
+    AttendanceRecord,
     MonthlyShiftAssignment,
     MonthlyShiftPlan,
     MonthlyShiftPublication,
@@ -944,6 +947,383 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
 
     def select_query_count(self, queries):
         return sum(1 for query in queries if query["sql"].lstrip().upper().startswith("SELECT"))
+
+    def test_attendance_self_clocking_links_to_publication_and_surfaces_in_shift_views(self):
+        plan = self.create_plan()
+        assignment = self.create_assignment_record(plan, work_date="2026-07-01", end_offset_minutes=600)
+        publication = self.publish_plan(plan)
+        snapshot = publication.assignments.get(source_assignment=assignment)
+        staff_client = self.force_client(self.staff)
+
+        clock_in = staff_client.post(
+            "/api/v1/my-attendance/clock-in/",
+            {
+                "location": str(self.location.id),
+                "work_date": "2026-07-01",
+                "occurred_at": "2026-07-01T09:00:00+09:00",
+            },
+            format="json",
+        )
+        self.assertEqual(clock_in.status_code, 201, clock_in.data)
+        self.assertEqual(clock_in.data["status"], AttendanceRecord.Status.CLOCKED_IN)
+        self.assertEqual(clock_in.data["source"], AttendanceRecord.Source.SCHEDULED)
+        self.assertEqual(str(clock_in.data["publication_assignment"]), str(snapshot.id))
+        self.assertEqual(
+            staff_client.post(
+                "/api/v1/my-attendance/clock-in/",
+                {
+                    "location": str(self.location.id),
+                    "work_date": "2026-07-01",
+                    "occurred_at": "2026-07-01T09:00:00+09:00",
+                },
+                format="json",
+            ).status_code,
+            400,
+        )
+        record_id = clock_in.data["id"]
+        self.assertEqual(
+            staff_client.post(
+                f"/api/v1/my-attendance/{record_id}/break-start/",
+                {"occurred_at": "2026-07-01T09:15:00+09:00"},
+                format="json",
+            ).data["status"],
+            AttendanceRecord.Status.ON_BREAK,
+        )
+        self.assertEqual(
+            staff_client.post(
+                f"/api/v1/my-attendance/{record_id}/break-start/",
+                {"occurred_at": "2026-07-01T09:15:00+09:00"},
+                format="json",
+            ).status_code,
+            400,
+        )
+        self.assertEqual(
+            staff_client.post(
+                f"/api/v1/my-attendance/{record_id}/break-end/",
+                {"occurred_at": "2026-07-01T09:30:00+09:00"},
+                format="json",
+            ).data["status"],
+            AttendanceRecord.Status.CLOCKED_IN,
+        )
+        clock_out = staff_client.post(
+            f"/api/v1/my-attendance/{record_id}/clock-out/",
+            {"occurred_at": "2026-07-01T10:00:00+09:00"},
+            format="json",
+        )
+        self.assertEqual(clock_out.status_code, 200, clock_out.data)
+        self.assertEqual(clock_out.data["status"], AttendanceRecord.Status.CLOCKED_OUT)
+        self.assertEqual(clock_out.data["break_minutes"], 15)
+        self.assertEqual(clock_out.data["worked_minutes"], 45)
+        self.assertIn("shorter_worked", [item["code"] for item in clock_out.data["warnings"]])
+        self.assertEqual(staff_client.get("/api/v1/my-attendance/?staff=x").status_code, 400)
+
+        my_published = staff_client.get("/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-07-01")
+        self.assertEqual(my_published.status_code, 200, my_published.data)
+        self.assertEqual(my_published.data["shifts"][0]["attendance"]["status"], AttendanceRecord.Status.CLOCKED_OUT)
+
+        matrix = self.force_client(self.supervisor).get(f"/api/v1/monthly-shift-plans/{plan.id}/matrix/")
+        self.assertEqual(matrix.status_code, 200, matrix.data)
+        row = next(item for item in matrix.data["rows"] if item["staff"] == str(self.staff.id))
+        self.assertEqual(row["assignments"]["2026-07-01"]["attendance"]["worked_minutes"], 45)
+
+        timeline = self.force_client(self.system_admin).get(
+            f"/api/v1/monthly-shift-plans/{plan.id}/timeline/?date_from=2026-07-01&date_to=2026-07-01"
+        )
+        self.assertEqual(timeline.status_code, 200, timeline.data)
+        self.assertEqual(
+            timeline.data["rows"][0]["days"]["2026-07-01"]["assignment"]["attendance"]["status"],
+            AttendanceRecord.Status.CLOCKED_OUT,
+        )
+        self.assertTrue(AuditEvent.objects.filter(event_type="attendance_clock_out").exists())
+
+    def test_attendance_manager_permissions_manual_confirm_void_and_audit_rollback(self):
+        staff_client = self.force_client(self.staff)
+        clock_in = staff_client.post(
+            "/api/v1/my-attendance/clock-in/",
+            {
+                "location": str(self.location.id),
+                "work_date": "2026-07-02",
+                "occurred_at": "2026-07-02T09:00:00+09:00",
+            },
+            format="json",
+        )
+        self.assertEqual(clock_in.status_code, 201, clock_in.data)
+        record_id = clock_in.data["id"]
+        self.assertEqual(
+            staff_client.post(
+                f"/api/v1/my-attendance/{record_id}/clock-out/",
+                {"occurred_at": "2026-07-02T10:00:00+09:00"},
+                format="json",
+            ).status_code,
+            200,
+        )
+        admin = self.force_client(self.system_admin)
+        supervisor = self.force_client(self.supervisor)
+        self.assertEqual(admin.get("/api/v1/attendance-records/").status_code, 200)
+        self.assertEqual(supervisor.get("/api/v1/attendance-records/").status_code, 200)
+        self.assertEqual(
+            supervisor.post(
+                f"/api/v1/attendance-records/{record_id}/manual-adjust/",
+                {
+                    "actual_clock_in_at": "2026-07-02T09:15:00+09:00",
+                    "actual_clock_out_at": "2026-07-02T10:00:00+09:00",
+                    "break_minutes": 0,
+                },
+                format="json",
+            ).status_code,
+            403,
+        )
+        self.assertEqual(self.force_client(self.viewer).get("/api/v1/attendance-records/").status_code, 403)
+        adjusted = admin.post(
+            f"/api/v1/attendance-records/{record_id}/manual-adjust/",
+            {
+                "actual_clock_in_at": "2026-07-02T09:15:00+09:00",
+                "actual_clock_out_at": "2026-07-02T10:00:00+09:00",
+                "break_minutes": 0,
+                "manager_note": "打刻漏れ修正",
+            },
+            format="json",
+        )
+        self.assertEqual(adjusted.status_code, 200, adjusted.data)
+        self.assertEqual(adjusted.data["source"], AttendanceRecord.Source.MANUAL)
+        confirmed = admin.post(
+            f"/api/v1/attendance-records/{record_id}/confirm/",
+            {"manager_note": "確認済み"},
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.data)
+        self.assertEqual(confirmed.data["status"], AttendanceRecord.Status.CONFIRMED)
+        self.assertEqual(
+            staff_client.post(
+                f"/api/v1/my-attendance/{record_id}/break-start/",
+                {"occurred_at": "2026-07-02T10:15:00+09:00"},
+                format="json",
+            ).status_code,
+            400,
+        )
+        self.assertEqual(
+            staff_client.post(
+                "/api/v1/my-attendance-corrections/",
+                {"attendance_record": record_id, "reason": "修正したいです。"},
+                format="json",
+            ).status_code,
+            400,
+        )
+        self.assertEqual(
+            admin.post(
+                f"/api/v1/attendance-records/{record_id}/manual-adjust/",
+                {
+                    "actual_clock_in_at": "2026-07-02T09:00:00+09:00",
+                    "actual_clock_out_at": "2026-07-02T10:00:00+09:00",
+                    "break_minutes": 0,
+                },
+                format="json",
+            ).status_code,
+            400,
+        )
+        self.assertEqual(
+            admin.post(f"/api/v1/attendance-records/{record_id}/unconfirm/", {}, format="json").status_code, 200
+        )
+        voided = admin.post(
+            f"/api/v1/attendance-records/{record_id}/void/",
+            {"manager_note": "重複"},
+            format="json",
+        )
+        self.assertEqual(voided.status_code, 200, voided.data)
+        self.assertEqual(voided.data["status"], AttendanceRecord.Status.VOID)
+        self.assertTrue(AuditEvent.objects.filter(event_type="attendance_voided").exists())
+
+        rollback = staff_client.post(
+            "/api/v1/my-attendance/clock-in/",
+            {
+                "location": str(self.location.id),
+                "work_date": "2026-07-03",
+                "occurred_at": "2026-07-03T09:00:00+09:00",
+            },
+            format="json",
+        )
+        admin.raise_request_exception = False
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = admin.post(f"/api/v1/attendance-records/{rollback.data['id']}/confirm/", {}, format="json")
+        self.assertEqual(response.status_code, 500)
+        self.assertNotEqual(
+            AttendanceRecord.objects.get(id=rollback.data["id"]).status, AttendanceRecord.Status.CONFIRMED
+        )
+
+    def test_attendance_correction_request_workflow_and_permissions(self):
+        staff_client = self.force_client(self.staff)
+        clock_in = staff_client.post(
+            "/api/v1/my-attendance/clock-in/",
+            {
+                "location": str(self.location.id),
+                "work_date": "2026-07-04",
+                "occurred_at": "2026-07-04T09:00:00+09:00",
+            },
+            format="json",
+        )
+        record_id = clock_in.data["id"]
+        self.assertEqual(
+            staff_client.post(
+                f"/api/v1/my-attendance/{record_id}/clock-out/",
+                {"occurred_at": "2026-07-04T10:00:00+09:00"},
+                format="json",
+            ).status_code,
+            200,
+        )
+        created = staff_client.post(
+            "/api/v1/my-attendance-corrections/",
+            {
+                "attendance_record": record_id,
+                "requested_clock_in_at": "2026-07-04T09:15:00+09:00",
+                "requested_clock_out_at": "2026-07-04T10:15:00+09:00",
+                "requested_break_minutes": 0,
+                "reason": "打刻時刻を直したいです。",
+            },
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        self.assertEqual(created.data["status"], AttendanceCorrectionRequest.Status.DRAFT)
+        self.assertEqual(
+            staff_client.post(
+                "/api/v1/my-attendance-corrections/",
+                {"attendance_record": record_id, "reason": "duplicate"},
+                format="json",
+            ).status_code,
+            400,
+        )
+        patched = staff_client.patch(
+            f"/api/v1/my-attendance-corrections/{created.data['id']}/",
+            {"requested_staff_note": "補足"},
+            format="json",
+        )
+        self.assertEqual(patched.status_code, 200, patched.data)
+        submitted = staff_client.post(
+            f"/api/v1/my-attendance-corrections/{created.data['id']}/submit/", {}, format="json"
+        )
+        self.assertEqual(submitted.status_code, 200, submitted.data)
+        self.assertEqual(submitted.data["status"], AttendanceCorrectionRequest.Status.SUBMITTED)
+        self.assertEqual(
+            staff_client.patch(
+                f"/api/v1/my-attendance-corrections/{created.data['id']}/",
+                {"reason": "submitted edit"},
+                format="json",
+            ).status_code,
+            400,
+        )
+        admin = self.force_client(self.system_admin)
+        self.assertEqual(
+            self.force_client(self.supervisor).get("/api/v1/attendance-correction-requests/").status_code, 200
+        )
+        self.assertEqual(
+            self.force_client(self.supervisor)
+            .post(f"/api/v1/attendance-correction-requests/{created.data['id']}/approve/", {}, format="json")
+            .status_code,
+            403,
+        )
+        self.assertEqual(
+            admin.post(
+                f"/api/v1/attendance-correction-requests/{created.data['id']}/reject/",
+                {},
+                format="json",
+            ).status_code,
+            400,
+        )
+        approved = admin.post(
+            f"/api/v1/attendance-correction-requests/{created.data['id']}/approve/",
+            {"manager_note": "承認"},
+            format="json",
+        )
+        self.assertEqual(approved.status_code, 200, approved.data)
+        applied = admin.post(
+            f"/api/v1/attendance-correction-requests/{created.data['id']}/apply/",
+            {"manager_note": "反映"},
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 200, applied.data)
+        self.assertEqual(applied.data["status"], AttendanceCorrectionRequest.Status.APPLIED)
+        record = AttendanceRecord.objects.get(id=record_id)
+        self.assertEqual(record.source, AttendanceRecord.Source.CORRECTED)
+        self.assertEqual(record.actual_start_offset_minutes, 555)
+        self.assertTrue(AuditEvent.objects.filter(event_type="attendance_correction_applied").exists())
+
+        other_clock = self.force_client(self.shift_manager).post(
+            "/api/v1/my-attendance/clock-in/",
+            {
+                "location": str(self.location.id),
+                "work_date": "2026-07-04",
+                "occurred_at": "2026-07-04T09:00:00+09:00",
+            },
+            format="json",
+        )
+        self.assertEqual(
+            staff_client.post(
+                "/api/v1/my-attendance-corrections/",
+                {"attendance_record": other_clock.data["id"], "reason": "other"},
+                format="json",
+            ).status_code,
+            400,
+        )
+
+    def test_attendance_list_query_counts_are_bounded(self):
+        client = self.force_client(self.system_admin)
+        base = date(2026, 7, 1)
+        small_record = AttendanceRecord.objects.create(
+            location=self.location,
+            staff=self.staff,
+            work_date=base,
+            status=AttendanceRecord.Status.CLOCKED_OUT,
+            source=AttendanceRecord.Source.UNSCHEDULED,
+            actual_clock_in_at=datetime(2026, 7, 1, 9, 0, tzinfo=timezone.get_current_timezone()),
+            actual_clock_out_at=datetime(2026, 7, 1, 10, 0, tzinfo=timezone.get_current_timezone()),
+            actual_start_offset_minutes=540,
+            actual_end_offset_minutes=600,
+            worked_minutes=60,
+        )
+        for event_type, offset in [
+            (AttendanceEvent.EventType.CLOCK_IN, 540),
+            (AttendanceEvent.EventType.CLOCK_OUT, 600),
+        ]:
+            AttendanceEvent.objects.create(
+                attendance_record=small_record,
+                event_type=event_type,
+                occurred_at=timezone.now(),
+                offset_minutes=offset,
+                source=AttendanceEvent.Source.SELF,
+                actor=self.staff,
+            )
+        for index in range(1, 90):
+            work_date = base + timedelta(days=index)
+            record = AttendanceRecord.objects.create(
+                location=self.location,
+                staff=self.staff,
+                work_date=work_date,
+                status=AttendanceRecord.Status.CLOCKED_OUT,
+                source=AttendanceRecord.Source.UNSCHEDULED,
+                actual_clock_in_at=timezone.now(),
+                actual_clock_out_at=timezone.now(),
+                actual_start_offset_minutes=540,
+                actual_end_offset_minutes=600,
+                worked_minutes=60,
+            )
+            for event_type, offset in [
+                (AttendanceEvent.EventType.CLOCK_IN, 540),
+                (AttendanceEvent.EventType.CLOCK_OUT, 600),
+            ]:
+                AttendanceEvent.objects.create(
+                    attendance_record=record,
+                    event_type=event_type,
+                    occurred_at=timezone.now(),
+                    offset_minutes=offset,
+                    source=AttendanceEvent.Source.SELF,
+                    actor=self.staff,
+                )
+        with CaptureQueriesContext(connection) as small_context:
+            small = client.get("/api/v1/attendance-records/?date_from=2026-07-01&date_to=2026-07-01&page_size=100")
+        with CaptureQueriesContext(connection) as large_context:
+            large = client.get("/api/v1/attendance-records/?date_from=2026-07-01&date_to=2026-09-28&page_size=100")
+        self.assertEqual(small.status_code, 200, small.data)
+        self.assertEqual(large.status_code, 200, large.data)
+        self.assertLessEqual(self.select_query_count(large_context) - self.select_query_count(small_context), 3)
 
     def test_shift_change_request_my_api_manager_apply_and_matrix_badges(self):
         plan = self.create_plan()

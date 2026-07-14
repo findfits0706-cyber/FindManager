@@ -99,6 +99,22 @@ class AuditEvent(models.Model):
         SHIFT_CHANGE_REQUEST_REJECTED = "shift_change_request_rejected", "Shift change request rejected"
         SHIFT_CHANGE_REQUEST_APPLIED = "shift_change_request_applied", "Shift change request applied"
         SHIFT_CHANGE_REQUEST_CLOSED = "shift_change_request_closed", "Shift change request closed"
+        ATTENDANCE_RECORD_CREATED = "attendance_record_created", "Attendance record created"
+        ATTENDANCE_CLOCK_IN = "attendance_clock_in", "Attendance clock in"
+        ATTENDANCE_BREAK_START = "attendance_break_start", "Attendance break start"
+        ATTENDANCE_BREAK_END = "attendance_break_end", "Attendance break end"
+        ATTENDANCE_CLOCK_OUT = "attendance_clock_out", "Attendance clock out"
+        ATTENDANCE_MANUAL_ADJUSTED = "attendance_manual_adjusted", "Attendance manual adjusted"
+        ATTENDANCE_CONFIRMED = "attendance_confirmed", "Attendance confirmed"
+        ATTENDANCE_UNCONFIRMED = "attendance_unconfirmed", "Attendance unconfirmed"
+        ATTENDANCE_VOIDED = "attendance_voided", "Attendance voided"
+        ATTENDANCE_CORRECTION_CREATED = "attendance_correction_created", "Attendance correction created"
+        ATTENDANCE_CORRECTION_UPDATED = "attendance_correction_updated", "Attendance correction updated"
+        ATTENDANCE_CORRECTION_SUBMITTED = "attendance_correction_submitted", "Attendance correction submitted"
+        ATTENDANCE_CORRECTION_CANCELLED = "attendance_correction_cancelled", "Attendance correction cancelled"
+        ATTENDANCE_CORRECTION_APPROVED = "attendance_correction_approved", "Attendance correction approved"
+        ATTENDANCE_CORRECTION_REJECTED = "attendance_correction_rejected", "Attendance correction rejected"
+        ATTENDANCE_CORRECTION_APPLIED = "attendance_correction_applied", "Attendance correction applied"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     event_type = models.CharField(max_length=64, choices=EventType.choices)

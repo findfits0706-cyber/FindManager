@@ -2,9 +2,13 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
+    AttendanceCorrectionRequestViewSet,
+    AttendanceRecordViewSet,
     MonthlyShiftAssignmentViewSet,
     MonthlyShiftPlanViewSet,
     MonthlyShiftPublicationViewSet,
+    MyAttendanceCorrectionRequestViewSet,
+    MyAttendanceViewSet,
     MyPublishedShiftViewSet,
     MyShiftChangeRequestViewSet,
     MyShiftRequestPeriodViewSet,
@@ -24,6 +28,18 @@ router.register("monthly-shift-publications", MonthlyShiftPublicationViewSet, ba
 router.register("shift-request-periods", ShiftRequestPeriodViewSet, basename="shift-request-period")
 router.register("shift-request-submissions", ShiftRequestSubmissionViewSet, basename="shift-request-submission")
 router.register("shift-change-requests", ShiftChangeRequestViewSet, basename="shift-change-request")
+router.register("attendance-records", AttendanceRecordViewSet, basename="attendance-record")
+router.register(
+    "attendance-correction-requests",
+    AttendanceCorrectionRequestViewSet,
+    basename="attendance-correction-request",
+)
+router.register("my-attendance", MyAttendanceViewSet, basename="my-attendance")
+router.register(
+    "my-attendance-corrections",
+    MyAttendanceCorrectionRequestViewSet,
+    basename="my-attendance-correction",
+)
 router.register("my-shift-request-periods", MyShiftRequestPeriodViewSet, basename="my-shift-request-period")
 router.register("my-shift-change-requests", MyShiftChangeRequestViewSet, basename="my-shift-change-request")
 router.register("my-published-shifts", MyPublishedShiftViewSet, basename="my-published-shift")

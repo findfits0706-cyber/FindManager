@@ -11,7 +11,10 @@ import { addDaysToIsoDate, formatLocalIsoDate } from "../lib/localDate";
 import { labelToOffset, offsetToLabel } from "../lib/timeOffsets";
 import { clampSegmentToRange, durationToWidth, offsetToPosition, type TimelineRange } from "../lib/timeline";
 import { chunkRowsForPrint, estimatePrintRowHeight, printSlotWidthForRange } from "../lib/timelinePrint";
+import { AttendanceCorrectionRequestsPage } from "./AttendanceCorrectionRequestsPage";
+import { AttendancePage } from "./AttendancePage";
 import { MonthlyShiftsPage } from "./MonthlyShiftsPage";
+import { MyAttendancePage } from "./MyAttendancePage";
 import { MyPublishedShiftsPage } from "./MyPublishedShiftsPage";
 import { MyShiftChangeRequestsPage } from "./MyShiftChangeRequestsPage";
 import { MyShiftRequestsPage } from "./MyShiftRequestsPage";
@@ -120,6 +123,21 @@ const confirmedMonthlyPlan = {
   workflow_status: "confirmed" as const,
   confirmed_content_hash: "hash-current",
   is_editable: false,
+};
+const attendanceSummary = {
+  id: "ar1",
+  status: "clocked_out" as const,
+  source: "scheduled" as const,
+  actual_start_offset_minutes: 525,
+  actual_end_offset_minutes: 1005,
+  break_minutes: 60,
+  worked_minutes: 420,
+  difference_start_minutes: 15,
+  difference_end_minutes: -15,
+  difference_worked_minutes: -30,
+  warning_count: 1,
+  warnings: [{ code: "shorter_worked", message: "予定より勤務時間が短くなっています。" }],
+  confirmed_at: null,
 };
 function publicationPreview(overrides: Partial<PublicationPreview> = {}): PublicationPreview {
   return {
@@ -284,6 +302,7 @@ const monthlyMatrix = {
           source_type: "template" as const,
           is_customized: false,
           warning_count: 0,
+          attendance: attendanceSummary,
           shift_change_requests: [
             {
               id: "cr1",
@@ -335,6 +354,7 @@ const shiftTimeline = {
             is_customized: true,
             notes: "note",
             warning_count: 1,
+            attendance: attendanceSummary,
           },
           segments: [
             {
@@ -750,6 +770,7 @@ describe("shift settings pages", () => {
             end_offset_minutes: 1020,
             work_minutes: 450,
             break_minutes: 60,
+            attendance: { ...attendanceSummary, status: "clocked_in" },
             shift_change_requests: [],
             segments: [
               {
@@ -789,8 +810,14 @@ describe("shift settings pages", () => {
     expect(screen.getAllByText("本館").length).toBeGreaterThan(0);
     expect(screen.getByText("08:30~17:00")).toBeInTheDocument();
     expect(screen.getByText("火")).toBeInTheDocument();
+    expect(screen.getByText("出勤済み / warning 1")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "退勤" }));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/my-attendance/ar1/clock-out/"), expect.anything());
     await userEvent.click(screen.getByRole("button", { name: "2028-02-01" }));
     expect(screen.getByText("公開備考")).toBeInTheDocument();
+    expect(screen.getByText("勤怠状態")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "勤怠修正申請" }));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/my-attendance-corrections/"), expect.anything());
     await userEvent.type(screen.getByLabelText("理由"), "急用");
     await userEvent.click(screen.getByRole("button", { name: "提出" }));
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/my-shift-change-requests/"), expect.anything());
@@ -803,6 +830,179 @@ describe("shift settings pages", () => {
     await userEvent.clear(screen.getByLabelText("年"));
     await userEvent.type(screen.getByLabelText("年"), "2029");
     expect(screen.queryByText("公開備考")).not.toBeInTheDocument();
+  });
+
+  it("lists my attendance and creates a correction request", async () => {
+    const record = {
+      ...attendanceSummary,
+      location: "l1",
+      location_name: "本館",
+      staff: "u1",
+      staff_display_name: "表示ユーザー",
+      employee_code: "EMP-1",
+      work_date: "2028-02-01",
+      monthly_shift_plan: "m1",
+      monthly_shift_assignment: "ma1",
+      publication: "pub1",
+      publication_assignment: "pub-a1",
+      scheduled_start_offset_minutes: 510,
+      scheduled_end_offset_minutes: 1020,
+      scheduled_pattern_name_snapshot: "早番",
+      scheduled_pattern_short_name_snapshot: "早",
+      actual_clock_in_at: "2028-02-01T08:45:00+09:00",
+      actual_clock_out_at: "2028-02-01T16:45:00+09:00",
+      manager_note: "",
+      staff_note: "",
+      confirmed_by: null,
+      events: [
+        {
+          id: "ev1",
+          attendance_record: "ar1",
+          event_type: "clock_in",
+          occurred_at: "2028-02-01T08:45:00+09:00",
+          offset_minutes: 525,
+          source: "self",
+          actor: "u1",
+          actor_display_name: "表示ユーザー",
+          note: "",
+          metadata: {},
+          created_at: "2028-02-01T08:45:00+09:00",
+        },
+      ],
+      correction_requests: [],
+      can_clock_in: false,
+      can_break_start: false,
+      can_break_end: false,
+      can_clock_out: false,
+      can_request_correction: true,
+      can_manage: false,
+      created_at: "2028-02-01T08:45:00+09:00",
+      updated_at: "2028-02-01T16:45:00+09:00",
+      is_active: true,
+    };
+    mockAuthAndApi(["staff"], {
+      "/api/v1/my-attendance/": { count: 1, next: null, previous: null, results: [record] },
+      "/api/v1/locations/": locations,
+      "/api/v1/my-attendance-corrections/": { id: "acr1", status: "submitted" },
+    });
+    renderWithAuth(<MyAttendancePage />);
+    expect(await screen.findByText("自分の勤怠")).toBeInTheDocument();
+    expect(await screen.findByText("shorter_worked")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "2028-02-01" }));
+    expect(screen.getByText("打刻履歴")).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("理由"), "打刻修正");
+    await userEvent.click(screen.getByRole("button", { name: "提出" }));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/my-attendance-corrections/"), expect.anything());
+  });
+
+  it("shows attendance management operations only to managers", async () => {
+    const record = {
+      ...attendanceSummary,
+      location: "l1",
+      location_name: "本館",
+      staff: "staff1",
+      staff_display_name: "スタッフA",
+      employee_code: "EMP-A",
+      work_date: "2028-02-01",
+      monthly_shift_plan: "m1",
+      monthly_shift_assignment: "ma1",
+      publication: "pub1",
+      publication_assignment: "pub-a1",
+      scheduled_start_offset_minutes: 510,
+      scheduled_end_offset_minutes: 1020,
+      scheduled_pattern_name_snapshot: "早番",
+      scheduled_pattern_short_name_snapshot: "早",
+      actual_clock_in_at: "2028-02-01T08:45:00+09:00",
+      actual_clock_out_at: "2028-02-01T16:45:00+09:00",
+      manager_note: "",
+      staff_note: "",
+      confirmed_by: null,
+      events: [],
+      correction_requests: [],
+      can_clock_in: false,
+      can_break_start: false,
+      can_break_end: false,
+      can_clock_out: false,
+      can_request_correction: true,
+      can_manage: true,
+      created_at: "2028-02-01T08:45:00+09:00",
+      updated_at: "2028-02-01T16:45:00+09:00",
+      is_active: true,
+    };
+    mockAuthAndApi(["system_admin"], {
+      "/api/v1/attendance-records/": { count: 1, next: null, previous: null, results: [record] },
+      "/api/v1/locations/": locations,
+      "/api/v1/staff/": { count: 1, next: null, previous: null, results: [{ id: "staff1", display_name: "スタッフA" }] },
+    });
+    renderWithAuth(<AttendancePage />);
+    expect(await screen.findByText("勤怠管理")).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("button", { name: "2028-02-01" }));
+    expect(screen.getByText("管理操作")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "confirm" }));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/attendance-records/ar1/confirm/"), expect.anything());
+
+    cleanup();
+    fetchMock.mockReset();
+    mockAuthAndApi(["supervisor"], {
+      "/api/v1/attendance-records/": { count: 1, next: null, previous: null, results: [record] },
+      "/api/v1/locations/": locations,
+      "/api/v1/staff/": { count: 1, next: null, previous: null, results: [{ id: "staff1", display_name: "スタッフA" }] },
+    });
+    renderWithAuth(<AttendancePage />);
+    await userEvent.click(await screen.findByRole("button", { name: "2028-02-01" }));
+    expect(screen.getByText("閲覧のみです。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "confirm" })).not.toBeInTheDocument();
+  });
+
+  it("manages attendance correction requests and requires reject reason", async () => {
+    const correction = {
+      id: "acr1",
+      attendance_record: "ar1",
+      location: "l1",
+      location_name: "本館",
+      work_date: "2028-02-01",
+      staff: "staff1",
+      staff_display_name: "スタッフA",
+      requester: "staff1",
+      requester_display_name: "スタッフA",
+      status: "submitted",
+      requested_clock_in_at: "2028-02-01T09:00:00+09:00",
+      requested_clock_out_at: "2028-02-01T17:00:00+09:00",
+      requested_break_minutes: 60,
+      requested_staff_note: "補足",
+      reason: "打刻漏れ",
+      manager_note: "",
+      submitted_at: "2028-02-01T18:00:00+09:00",
+      approved_at: null,
+      approved_by: null,
+      rejected_at: null,
+      rejected_by: null,
+      cancelled_at: null,
+      cancelled_by: null,
+      applied_at: null,
+      applied_by: null,
+      can_edit: false,
+      can_submit: false,
+      can_cancel: false,
+      can_approve: true,
+      can_apply: false,
+      created_at: "2028-02-01T18:00:00+09:00",
+      updated_at: "2028-02-01T18:00:00+09:00",
+      is_active: true,
+    };
+    mockAuthAndApi(["shift_manager"], {
+      "/api/v1/attendance-correction-requests/": { count: 1, next: null, previous: null, results: [correction] },
+      "/api/v1/locations/": locations,
+      "/api/v1/staff/": { count: 1, next: null, previous: null, results: [{ id: "staff1", display_name: "スタッフA" }] },
+    });
+    renderWithAuth(<AttendanceCorrectionRequestsPage />);
+    expect(await screen.findByText("勤怠修正申請")).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("button", { name: "2028-02-01" }));
+    await userEvent.click(screen.getByRole("button", { name: "reject" }));
+    expect(screen.getByText("却下理由を入力してください。")).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("管理メモ"), "理由不足");
+    await userEvent.click(screen.getByRole("button", { name: "approve" }));
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/attendance-correction-requests/acr1/approve/"), expect.anything());
   });
 
   it("lists and edits my shift change requests", async () => {

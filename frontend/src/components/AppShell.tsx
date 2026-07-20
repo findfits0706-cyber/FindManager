@@ -61,6 +61,7 @@ export function AppShell() {
           { to: "/labor-cost/allowances", label: "手当設定" },
           { to: "/labor-cost/monthly", label: "概算人件費" },
           { to: "/labor-cost/budget", label: "人件費予算・予実" },
+          { to: "/finance/performance", label: "売上・人件費率" },
         ]
       : []),
     ...(canViewSelfPages

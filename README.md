@@ -170,3 +170,14 @@ Phase 12 adds monthly labor cost budget and variance management:
 - Management screen at `/labor-cost/budget` and budget context on `/labor-cost/monthly`
 - Budget, planned cost, actual estimate, rates, and allowances remain restricted to `system_admin` and `shift_manager`
 - Sales, labor-cost ratios, automatic shift optimization, and formal payroll remain outside this phase
+
+Phase 13 adds monthly revenue performance management:
+
+- Location-specific revenue categories and monthly revenue budget/actual lines
+- Revenue budget approval and revenue actual finalization with warning acknowledgement and validation fingerprint checks
+- Immutable monthly performance snapshots covering revenue variance, attainment, labor-cost ratios, and labor-cost variance
+- Approved/finalized source priority with explicit live fallbacks and visible warnings
+- UTF-8 BOM CSV exports for revenue budgets, actuals, and performance summaries
+- Financial management screen at `/finance/performance` and revenue context on `/labor-cost/budget`
+- All revenue, budget, labor-cost, and ratio information remains restricted to `system_admin` and `shift_manager`
+- Formal accounting, tax, payroll, member-system integration, forecasting, PDF, and Excel remain outside this phase

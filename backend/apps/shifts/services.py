@@ -83,6 +83,10 @@ def can_manage_labor_costs(user: User) -> bool:
     return user_has_any_role(user, MANAGE_ROLES)
 
 
+def can_manage_financial_performance(user: User) -> bool:
+    return user_has_any_role(user, MANAGE_ROLES)
+
+
 def can_view_shifts(user: User) -> bool:
     return user_has_any_role(user, VIEW_ROLES)
 
@@ -203,6 +207,29 @@ EVENT_MAP = {
         "reopen": "labor_cost_budget_reopened",
         "archive": "labor_cost_budget_archived",
         "export": "labor_cost_budget_exported",
+    },
+    "revenue_category": {
+        "create": "revenue_category_created",
+        "update": "revenue_category_updated",
+        "deactivate": "revenue_category_deactivated",
+    },
+    "revenue_budget_period": {
+        "create": "revenue_budget_period_created",
+        "update": "revenue_budget_period_updated",
+        "preview": "revenue_budget_previewed",
+        "approve": "revenue_budget_approved",
+        "reopen": "revenue_budget_reopened",
+        "archive": "revenue_budget_archived",
+        "export": "revenue_budget_exported",
+    },
+    "revenue_actual_period": {
+        "create": "revenue_actual_period_created",
+        "update": "revenue_actual_period_updated",
+        "preview": "revenue_actual_previewed",
+        "finalize": "revenue_actual_finalized",
+        "reopen": "revenue_actual_reopened",
+        "archive": "revenue_actual_archived",
+        "export": "revenue_actual_exported",
     },
 }
 

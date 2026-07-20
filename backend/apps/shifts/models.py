@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.core.validators import RegexValidator
 from django.db import models
 from django.db.models import Q
 
@@ -30,6 +31,170 @@ class ShiftPattern(ActiveOrderedModel):
 
     def __str__(self):
         return f"{self.location.short_name} / {self.name}"
+
+
+revenue_code_validator = RegexValidator(
+    regex=r"^[A-Za-z0-9_-]+$",
+    message="code must contain only letters, numbers, hyphens, and underscores.",
+)
+
+
+class RevenueCategory(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="revenue_categories")
+    code = models.CharField(max_length=50, validators=[revenue_code_validator])
+    name = models.CharField(max_length=150)
+    short_name = models.CharField(max_length=100)
+    description = models.TextField(blank=True)
+    display_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="revenue_categories_created",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="revenue_categories_updated",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["location__display_order", "display_order", "code", "created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["location", "code"], name="uniq_revenue_category_code"),
+            models.CheckConstraint(condition=Q(display_order__gte=0), name="revenue_category_order_gte0"),
+        ]
+
+    def clean(self):
+        if self.location_id and not self.location.is_active:
+            raise ValidationError({"location": "Inactive locations cannot be assigned."})
+
+    def __str__(self):
+        return f"{self.location.short_name} / {self.name}"
+
+
+class RevenueBudgetPeriod(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "draft"
+        REVIEW = "review", "review"
+        APPROVED = "approved", "approved"
+        REOPENED = "reopened", "reopened"
+        ARCHIVED = "archived", "archived"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="revenue_budget_periods")
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField()
+    name = models.CharField(max_length=150)
+    description = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    content_hash = models.CharField(max_length=64, blank=True)
+    validation_fingerprint = models.CharField(max_length=64, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="revenue_budget_periods_approved",
+        null=True,
+        blank=True,
+    )
+    reopened_at = models.DateTimeField(null=True, blank=True)
+    reopened_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="revenue_budget_periods_reopened",
+        null=True,
+        blank=True,
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="revenue_budget_periods_created",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="revenue_budget_periods_updated",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["-year", "-month", "location__display_order", "created_at"]
+        indexes = [
+            models.Index(fields=["location", "year", "month"], name="revenue_budget_lookup_idx"),
+            models.Index(fields=["status", "is_active"], name="revenue_budget_status_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["location", "year", "month"],
+                condition=Q(is_active=True),
+                name="uniq_active_revenue_budget",
+            ),
+            models.CheckConstraint(condition=Q(year__gte=2000) & Q(year__lte=2100), name="revenue_budget_year_range"),
+            models.CheckConstraint(condition=Q(month__gte=1) & Q(month__lte=12), name="revenue_budget_month_range"),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.location_id and not self.location.is_active:
+            errors["location"] = "Inactive locations cannot be assigned."
+        if self.year < 2000 or self.year > 2100:
+            errors["year"] = "year must be between 2000 and 2100."
+        if self.month < 1 or self.month > 12:
+            errors["month"] = "month must be between 1 and 12."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.location.short_name} / {self.year}-{self.month:02d} / {self.status}"
+
+
+class RevenueBudgetLine(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    budget_period = models.ForeignKey(RevenueBudgetPeriod, on_delete=models.CASCADE, related_name="lines")
+    category = models.ForeignKey(RevenueCategory, on_delete=models.PROTECT, related_name="budget_lines")
+    category_code_snapshot = models.CharField(max_length=50)
+    category_name_snapshot = models.CharField(max_length=150)
+    budget_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    notes = models.TextField(blank=True)
+    display_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["display_order", "category_code_snapshot", "created_at"]
+        indexes = [models.Index(fields=["budget_period", "is_active"], name="revenue_budget_line_idx")]
+        constraints = [
+            models.UniqueConstraint(fields=["budget_period", "category"], name="uniq_revenue_budget_line"),
+            models.CheckConstraint(condition=Q(budget_amount__gte=0), name="revenue_budget_amount_gte0"),
+            models.CheckConstraint(condition=Q(display_order__gte=0), name="revenue_budget_order_gte0"),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.budget_amount is not None and self.budget_amount < 0:
+            errors["budget_amount"] = "budget_amount must be greater than or equal to 0."
+        if self.budget_period_id and self.category_id:
+            if self.budget_period.location_id != self.category.location_id:
+                errors["category"] = "category must belong to the budget period location."
+            if self._state.adding and not self.category.is_active:
+                errors["category"] = "Inactive categories cannot be used for new monthly input."
+        if self.budget_period_id and self.budget_period.status in {
+            RevenueBudgetPeriod.Status.APPROVED,
+            RevenueBudgetPeriod.Status.ARCHIVED,
+        }:
+            errors["budget_period"] = "Approved or archived budget periods are read-only."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.budget_period_id} / {self.category_code_snapshot}"
 
 
 class ShiftPatternSegment(models.Model):
@@ -2278,3 +2443,265 @@ class ShiftRequestItem(models.Model):
                 errors["work_area"] = "work_area must belong to the request period location."
         if errors:
             raise ValidationError(errors)
+
+
+class RevenueActualPeriod(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "draft"
+        REVIEW = "review", "review"
+        FINALIZED = "finalized", "finalized"
+        REOPENED = "reopened", "reopened"
+        ARCHIVED = "archived", "archived"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="revenue_actual_periods")
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField()
+    revenue_budget_period = models.ForeignKey(
+        RevenueBudgetPeriod,
+        on_delete=models.PROTECT,
+        related_name="revenue_actual_periods",
+        null=True,
+        blank=True,
+    )
+    labor_cost_budget_period = models.ForeignKey(
+        LaborCostBudgetPeriod,
+        on_delete=models.PROTECT,
+        related_name="revenue_actual_periods",
+        null=True,
+        blank=True,
+    )
+    labor_cost_estimate_period = models.ForeignKey(
+        LaborCostEstimatePeriod,
+        on_delete=models.PROTECT,
+        related_name="revenue_actual_periods",
+        null=True,
+        blank=True,
+    )
+    name = models.CharField(max_length=150)
+    description = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    content_hash = models.CharField(max_length=64, blank=True)
+    validation_fingerprint = models.CharField(max_length=64, blank=True)
+    finalized_at = models.DateTimeField(null=True, blank=True)
+    finalized_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="revenue_actual_periods_finalized",
+        null=True,
+        blank=True,
+    )
+    reopened_at = models.DateTimeField(null=True, blank=True)
+    reopened_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="revenue_actual_periods_reopened",
+        null=True,
+        blank=True,
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="revenue_actual_periods_created",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="revenue_actual_periods_updated",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["-year", "-month", "location__display_order", "created_at"]
+        indexes = [
+            models.Index(fields=["location", "year", "month"], name="revenue_actual_lookup_idx"),
+            models.Index(fields=["status", "is_active"], name="revenue_actual_status_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["location", "year", "month"],
+                condition=Q(is_active=True),
+                name="uniq_active_revenue_actual",
+            ),
+            models.CheckConstraint(condition=Q(year__gte=2000) & Q(year__lte=2100), name="revenue_actual_year_range"),
+            models.CheckConstraint(condition=Q(month__gte=1) & Q(month__lte=12), name="revenue_actual_month_range"),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.location_id and not self.location.is_active:
+            errors["location"] = "Inactive locations cannot be assigned."
+        if self.year < 2000 or self.year > 2100:
+            errors["year"] = "year must be between 2000 and 2100."
+        if self.month < 1 or self.month > 12:
+            errors["month"] = "month must be between 1 and 12."
+        for field_name in [
+            "revenue_budget_period",
+            "labor_cost_budget_period",
+            "labor_cost_estimate_period",
+        ]:
+            related = getattr(self, field_name, None)
+            if related and (
+                related.location_id != self.location_id or related.year != self.year or related.month != self.month
+            ):
+                errors[field_name] = f"{field_name} must match location/year/month."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.location.short_name} / {self.year}-{self.month:02d} / {self.status}"
+
+
+class RevenueActualLine(models.Model):
+    class Source(models.TextChoices):
+        MANUAL = "manual", "manual"
+        IMPORTED = "imported", "imported"
+        ADJUSTED = "adjusted", "adjusted"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    actual_period = models.ForeignKey(RevenueActualPeriod, on_delete=models.CASCADE, related_name="lines")
+    category = models.ForeignKey(RevenueCategory, on_delete=models.PROTECT, related_name="actual_lines")
+    category_code_snapshot = models.CharField(max_length=50)
+    category_name_snapshot = models.CharField(max_length=150)
+    actual_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    source = models.CharField(max_length=20, choices=Source.choices, default=Source.MANUAL)
+    notes = models.TextField(blank=True)
+    display_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["display_order", "category_code_snapshot", "created_at"]
+        indexes = [models.Index(fields=["actual_period", "is_active"], name="revenue_actual_line_idx")]
+        constraints = [
+            models.UniqueConstraint(fields=["actual_period", "category"], name="uniq_revenue_actual_line"),
+            models.CheckConstraint(condition=Q(actual_amount__gte=0), name="revenue_actual_amount_gte0"),
+            models.CheckConstraint(condition=Q(display_order__gte=0), name="revenue_actual_order_gte0"),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.actual_amount is not None and self.actual_amount < 0:
+            errors["actual_amount"] = "actual_amount must be greater than or equal to 0."
+        if self.actual_period_id and self.category_id:
+            if self.actual_period.location_id != self.category.location_id:
+                errors["category"] = "category must belong to the actual period location."
+            if self._state.adding and not self.category.is_active:
+                errors["category"] = "Inactive categories cannot be used for new monthly input."
+        if self.actual_period_id and self.actual_period.status in {
+            RevenueActualPeriod.Status.FINALIZED,
+            RevenueActualPeriod.Status.ARCHIVED,
+        }:
+            errors["actual_period"] = "Finalized or archived actual periods are read-only."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.actual_period_id} / {self.category_code_snapshot}"
+
+
+class RevenuePerformanceSnapshot(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    actual_period = models.OneToOneField(
+        RevenueActualPeriod,
+        on_delete=models.CASCADE,
+        related_name="performance_snapshot",
+    )
+    revenue_budget_period = models.ForeignKey(
+        RevenueBudgetPeriod,
+        on_delete=models.PROTECT,
+        related_name="performance_snapshots",
+    )
+    labor_cost_budget_period = models.ForeignKey(
+        LaborCostBudgetPeriod,
+        on_delete=models.PROTECT,
+        related_name="revenue_performance_snapshots",
+    )
+    labor_cost_estimate_period = models.ForeignKey(
+        LaborCostEstimatePeriod,
+        on_delete=models.PROTECT,
+        related_name="revenue_performance_snapshots",
+    )
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="revenue_performance_snapshots")
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField()
+    location_code_snapshot = models.CharField(max_length=50)
+    location_name_snapshot = models.CharField(max_length=150)
+    revenue_budget_total = models.DecimalField(max_digits=14, decimal_places=2)
+    revenue_actual_total = models.DecimalField(max_digits=14, decimal_places=2)
+    revenue_variance_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    revenue_attainment_percent = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    labor_budget_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    planned_labor_cost = models.DecimalField(max_digits=14, decimal_places=2)
+    actual_labor_cost_estimate = models.DecimalField(max_digits=14, decimal_places=2)
+    budget_labor_cost_ratio = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    planned_labor_cost_ratio_to_budget_revenue = models.DecimalField(
+        max_digits=9, decimal_places=2, null=True, blank=True
+    )
+    planned_labor_cost_ratio_to_actual_revenue = models.DecimalField(
+        max_digits=9, decimal_places=2, null=True, blank=True
+    )
+    actual_labor_cost_ratio = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    planned_vs_labor_budget_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    actual_vs_labor_budget_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    actual_vs_planned_labor_cost_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    budget_content_hash = models.CharField(max_length=64, blank=True)
+    labor_budget_content_hash = models.CharField(max_length=64, blank=True)
+    labor_estimate_content_hash = models.CharField(max_length=64, blank=True)
+    content_hash = models.CharField(max_length=64)
+    validation_fingerprint = models.CharField(max_length=64)
+    warning_count = models.PositiveIntegerField(default=0)
+    warnings = models.JSONField(default=list, blank=True)
+    error_count = models.PositiveIntegerField(default=0)
+    errors = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-year", "-month", "location_code_snapshot"]
+        indexes = [models.Index(fields=["location", "year", "month"], name="revenue_perf_lookup_idx")]
+
+    def __str__(self):
+        return f"{self.location_code_snapshot} / {self.year}-{self.month:02d}"
+
+
+class RevenuePerformanceLineSnapshot(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    performance_snapshot = models.ForeignKey(
+        RevenuePerformanceSnapshot,
+        on_delete=models.CASCADE,
+        related_name="line_snapshots",
+    )
+    category = models.ForeignKey(
+        RevenueCategory,
+        on_delete=models.SET_NULL,
+        related_name="performance_line_snapshots",
+        null=True,
+        blank=True,
+    )
+    category_code_snapshot = models.CharField(max_length=50)
+    category_name_snapshot = models.CharField(max_length=150)
+    budget_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    actual_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    variance_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    attainment_percent = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    warning_count = models.PositiveIntegerField(default=0)
+    warnings = models.JSONField(default=list, blank=True)
+    error_count = models.PositiveIntegerField(default=0)
+    errors = models.JSONField(default=list, blank=True)
+    display_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["display_order", "category_code_snapshot", "created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["performance_snapshot", "category_code_snapshot"],
+                name="uniq_revenue_perf_line",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.performance_snapshot_id} / {self.category_code_snapshot}"

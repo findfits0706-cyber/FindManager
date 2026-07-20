@@ -159,6 +159,23 @@ class AuditEvent(models.Model):
         LABOR_COST_BUDGET_REOPENED = "labor_cost_budget_reopened", "Labor cost budget reopened"
         LABOR_COST_BUDGET_ARCHIVED = "labor_cost_budget_archived", "Labor cost budget archived"
         LABOR_COST_BUDGET_EXPORTED = "labor_cost_budget_exported", "Labor cost budget exported"
+        REVENUE_CATEGORY_CREATED = "revenue_category_created", "Revenue category created"
+        REVENUE_CATEGORY_UPDATED = "revenue_category_updated", "Revenue category updated"
+        REVENUE_CATEGORY_DEACTIVATED = "revenue_category_deactivated", "Revenue category deactivated"
+        REVENUE_BUDGET_PERIOD_CREATED = "revenue_budget_period_created", "Revenue budget period created"
+        REVENUE_BUDGET_PERIOD_UPDATED = "revenue_budget_period_updated", "Revenue budget period updated"
+        REVENUE_BUDGET_PREVIEWED = "revenue_budget_previewed", "Revenue budget previewed"
+        REVENUE_BUDGET_APPROVED = "revenue_budget_approved", "Revenue budget approved"
+        REVENUE_BUDGET_REOPENED = "revenue_budget_reopened", "Revenue budget reopened"
+        REVENUE_BUDGET_ARCHIVED = "revenue_budget_archived", "Revenue budget archived"
+        REVENUE_BUDGET_EXPORTED = "revenue_budget_exported", "Revenue budget exported"
+        REVENUE_ACTUAL_PERIOD_CREATED = "revenue_actual_period_created", "Revenue actual period created"
+        REVENUE_ACTUAL_PERIOD_UPDATED = "revenue_actual_period_updated", "Revenue actual period updated"
+        REVENUE_ACTUAL_PREVIEWED = "revenue_actual_previewed", "Revenue actual previewed"
+        REVENUE_ACTUAL_FINALIZED = "revenue_actual_finalized", "Revenue actual finalized"
+        REVENUE_ACTUAL_REOPENED = "revenue_actual_reopened", "Revenue actual reopened"
+        REVENUE_ACTUAL_ARCHIVED = "revenue_actual_archived", "Revenue actual archived"
+        REVENUE_ACTUAL_EXPORTED = "revenue_actual_exported", "Revenue actual exported"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     event_type = models.CharField(max_length=64, choices=EventType.choices)

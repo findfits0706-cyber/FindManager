@@ -13,6 +13,13 @@ from .models import (
     LaborCostEstimatePeriod,
     LaborCostEstimateRecordSnapshot,
     LaborCostEstimateStaffSummary,
+    RevenueActualLine,
+    RevenueActualPeriod,
+    RevenueBudgetLine,
+    RevenueBudgetPeriod,
+    RevenueCategory,
+    RevenuePerformanceLineSnapshot,
+    RevenuePerformanceSnapshot,
     ShiftPattern,
     ShiftPatternSegment,
     StaffAllowanceAssignment,
@@ -150,3 +157,57 @@ class LaborCostBudgetAllowanceSnapshotAdmin(admin.ModelAdmin):
     list_display = ("budget_period", "employee_code_snapshot", "code_snapshot", "planned_amount")
     list_filter = ("budget_period__location", "allowance_type_snapshot")
     search_fields = ("staff_display_name_snapshot", "employee_code_snapshot", "code_snapshot", "name_snapshot")
+
+
+@admin.register(RevenueCategory)
+class RevenueCategoryAdmin(admin.ModelAdmin):
+    list_display = ("location", "code", "name", "display_order", "is_active")
+    list_filter = ("location", "is_active")
+    search_fields = ("code", "name", "short_name")
+
+
+class RevenueBudgetLineInline(admin.TabularInline):
+    model = RevenueBudgetLine
+    extra = 0
+
+
+@admin.register(RevenueBudgetPeriod)
+class RevenueBudgetPeriodAdmin(admin.ModelAdmin):
+    list_display = ("location", "year", "month", "status", "approved_at", "is_active")
+    list_filter = ("location", "status", "is_active")
+    search_fields = ("name", "location__code", "location__name")
+    inlines = [RevenueBudgetLineInline]
+
+
+class RevenueActualLineInline(admin.TabularInline):
+    model = RevenueActualLine
+    extra = 0
+
+
+@admin.register(RevenueActualPeriod)
+class RevenueActualPeriodAdmin(admin.ModelAdmin):
+    list_display = ("location", "year", "month", "status", "finalized_at", "is_active")
+    list_filter = ("location", "status", "is_active")
+    search_fields = ("name", "location__code", "location__name")
+    inlines = [RevenueActualLineInline]
+
+
+class RevenuePerformanceLineSnapshotInline(admin.TabularInline):
+    model = RevenuePerformanceLineSnapshot
+    extra = 0
+    readonly_fields = ("category_code_snapshot", "category_name_snapshot", "budget_amount", "actual_amount")
+
+
+@admin.register(RevenuePerformanceSnapshot)
+class RevenuePerformanceSnapshotAdmin(admin.ModelAdmin):
+    list_display = (
+        "location",
+        "year",
+        "month",
+        "revenue_budget_total",
+        "revenue_actual_total",
+        "actual_labor_cost_ratio",
+    )
+    list_filter = ("location", "year", "month")
+    search_fields = ("location_code_snapshot", "location_name_snapshot")
+    inlines = [RevenuePerformanceLineSnapshotInline]

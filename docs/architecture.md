@@ -182,3 +182,16 @@
 
 - Backend: `ruff`, `pytest`, `manage.py check`, `makemigrations --check`
 - Frontend: `eslint`, `tsc --noEmit`, `vitest --run`, `vite build`
+
+## Revenue Performance
+
+- Revenue performance APIs and `/finance/performance` require `system_admin` or `shift_manager` through `can_manage_financial_performance`.
+- `RevenueCategory` belongs to one location. Revenue budget and actual lines retain category code and name snapshots so historical exports remain meaningful after master changes.
+- `RevenueBudgetPeriod` approval and `RevenueActualPeriod` finalization both require the latest validation fingerprint. Warnings require explicit acknowledgement and errors block the transition.
+- Actual preview resolves approved or finalized sources first. Draft, review, or reopened sources are available only as live fallback values with explicit warnings.
+- Actual finalization locks the period and all selected source periods, then recreates the one-to-one performance snapshot and category line snapshots atomically.
+- Revenue, labor-cost, and ratio calculations use `Decimal` and shared `ROUND_HALF_UP` helpers. Ratios with a zero denominator are unavailable; revenue attainment is `0.00` only when both budget and actual are zero.
+- `content_hash` is generated from stable, sorted business inputs. `validation_fingerprint` is generated from the sorted warning/error set and therefore detects a stale preview.
+- The fixed high labor-cost ratio warning threshold is 40 percent. It is advisory and does not change stored financial values.
+- List, preview, dashboard, snapshot, and CSV paths load related rows in bulk so query counts do not grow with revenue line count.
+- CSV uses UTF-8 with BOM. Formal accounting, tax, payroll, member integration, forecasting, and optimization are outside this domain.

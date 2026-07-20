@@ -66,6 +66,7 @@
 - Daily/weekly shift timeline page
 - Monthly attendance closing page and self-service monthly attendance page
 - Labor cost estimate pages for rates, allowances, and monthly estimate review
+- Labor cost budget and planned-versus-actual variance management page
 
 ## Phase 3 Domain Rules
 
@@ -161,6 +162,21 @@
 - CSV export uses UTF-8 with BOM and always labels values as estimates. Finalized periods export saved snapshots; unfinalized periods export preview data.
 - Attendance monthly closing responses expose only labor estimate ID/status/name for navigation. Wage amounts and estimate totals are not shown on attendance or staff self-service screens.
 - Payroll finalization, payslips, taxes, social insurance, statutory premiums, paid leave balances, PDF/Excel, notifications, and external payroll/accounting integrations remain outside this phase.
+
+## Labor Cost Budgets And Variance
+
+- Labor cost budget APIs and `/labor-cost/budget` require `system_admin` or `shift_manager` through the shared `can_manage_labor_costs` authorization rule.
+- `LaborCostBudgetPeriod` is unique for each active location/year/month and moves through `draft`, `review`, `approved`, `reopened`, and `archived`.
+- Planned labor cost source priority is active `MonthlyShiftPublication`, confirmed `MonthlyShiftPlan`, then draft plan. Draft is previewable but is an approval error.
+- Planned minute calculation excludes break and inactive plan segments and keeps the existing 0-2880 offset convention. Hourly values use Decimal and `ROUND_HALF_UP` per daily row.
+- Monthly-fixed compensation and fixed-monthly allowances are added once per staff summary. They are never duplicated into each daily plan record.
+- Approval recreates plan-record, staff, daily, and allowance snapshots in one transaction after locking the budget period, source plan/publication, assignments, segments, compensation profiles, and allowances.
+- Approved variance reads planned values from snapshots. Actual estimates remain current: finalized Phase 11 snapshots are preferred, with unfinalized live preview as fallback.
+- `content_hash` covers stable sorted budget, shift source, segments, compensation, allowance, planned calculation, and approval issue content. Current actual estimate values are excluded.
+- `validation_fingerprint` covers only approval issues. Actual estimate availability and actual threshold messages are comparison issues and do not invalidate approval.
+- List/detail/snapshot/preview/variance/CSV querysets use relation loading and bulk master lookups so query counts do not grow with staff or assignment count.
+- `/labor-cost/monthly` may show budget amount and variance because it has the same restricted roles. Attendance, shift, and staff self-service screens do not expose budget or labor-cost amounts.
+- Budget CSV uses UTF-8 with BOM. Formal payroll, sales, labor-cost ratio, automatic shift reduction, and automatic optimization remain outside this phase.
 
 ## Quality Gates
 

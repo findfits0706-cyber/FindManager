@@ -3,7 +3,8 @@ from uuid import UUID
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
-from django.db.models import Count, Prefetch, Q
+from django.db.models import Count, IntegerField, OuterRef, Prefetch, Q, Subquery, Value
+from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
@@ -13,6 +14,15 @@ from rest_framework.response import Response
 from apps.accounts.models import User
 from apps.operations.models import StaffLocation
 
+from .labor_budget_services import (
+    approve_labor_cost_budget,
+    archive_labor_cost_budget,
+    build_labor_cost_budget_preview,
+    export_labor_cost_budget_csv,
+    get_labor_cost_budget_variance,
+    labor_cost_budget_period_metadata,
+    reopen_labor_cost_budget,
+)
 from .models import (
     AttendanceClosingPeriod,
     AttendanceClosingRecordSnapshot,
@@ -20,6 +30,11 @@ from .models import (
     AttendanceCorrectionRequest,
     AttendanceEvent,
     AttendanceRecord,
+    LaborCostBudgetAllowanceSnapshot,
+    LaborCostBudgetDailySummary,
+    LaborCostBudgetPeriod,
+    LaborCostBudgetPlanRecordSnapshot,
+    LaborCostBudgetStaffSummary,
     LaborCostEstimateAllowanceSnapshot,
     LaborCostEstimatePeriod,
     LaborCostEstimateRecordSnapshot,
@@ -52,6 +67,13 @@ from .serializers import (
     AttendanceManagerNoteSerializer,
     AttendanceManualAdjustSerializer,
     AttendanceRecordSerializer,
+    LaborCostBudgetAllowanceSnapshotSerializer,
+    LaborCostBudgetApproveSerializer,
+    LaborCostBudgetDailySummarySerializer,
+    LaborCostBudgetManagerNoteSerializer,
+    LaborCostBudgetPeriodSerializer,
+    LaborCostBudgetPlanRecordSnapshotSerializer,
+    LaborCostBudgetStaffSummarySerializer,
     LaborCostEstimateAllowanceSnapshotSerializer,
     LaborCostEstimateFinalizeSerializer,
     LaborCostEstimateManagerNoteSerializer,
@@ -368,6 +390,77 @@ def labor_cost_staff_summary_queryset():
 def labor_cost_allowance_snapshot_queryset():
     return LaborCostEstimateAllowanceSnapshot.objects.select_related(
         "estimate_period",
+        "staff",
+        "allowance_assignment",
+    )
+
+
+def labor_cost_budget_period_queryset():
+    plan_record_count = (
+        LaborCostBudgetPlanRecordSnapshot.objects.filter(budget_period_id=OuterRef("pk"))
+        .values("budget_period_id")
+        .annotate(total=Count("pk"))
+        .values("total")
+    )
+    staff_summary_count = (
+        LaborCostBudgetStaffSummary.objects.filter(budget_period_id=OuterRef("pk"))
+        .values("budget_period_id")
+        .annotate(total=Count("pk"))
+        .values("total")
+    )
+    daily_summary_count = (
+        LaborCostBudgetDailySummary.objects.filter(budget_period_id=OuterRef("pk"))
+        .values("budget_period_id")
+        .annotate(total=Count("pk"))
+        .values("total")
+    )
+    allowance_snapshot_count = (
+        LaborCostBudgetAllowanceSnapshot.objects.filter(budget_period_id=OuterRef("pk"))
+        .values("budget_period_id")
+        .annotate(total=Count("pk"))
+        .values("total")
+    )
+    return LaborCostBudgetPeriod.objects.select_related(
+        "location",
+        "source_monthly_shift_plan",
+        "source_publication",
+        "approved_by",
+        "reopened_by",
+        "created_by",
+        "updated_by",
+    ).annotate(
+        plan_record_snapshot_total=Coalesce(Subquery(plan_record_count, output_field=IntegerField()), Value(0)),
+        budget_staff_summary_total=Coalesce(Subquery(staff_summary_count, output_field=IntegerField()), Value(0)),
+        daily_summary_total=Coalesce(Subquery(daily_summary_count, output_field=IntegerField()), Value(0)),
+        budget_allowance_snapshot_total=Coalesce(
+            Subquery(allowance_snapshot_count, output_field=IntegerField()), Value(0)
+        ),
+    )
+
+
+def labor_cost_budget_plan_record_queryset():
+    return LaborCostBudgetPlanRecordSnapshot.objects.select_related(
+        "budget_period",
+        "location",
+        "staff",
+        "monthly_shift_plan",
+        "monthly_shift_assignment",
+        "publication",
+        "publication_assignment",
+    )
+
+
+def labor_cost_budget_staff_summary_queryset():
+    return LaborCostBudgetStaffSummary.objects.select_related("budget_period", "staff")
+
+
+def labor_cost_budget_daily_summary_queryset():
+    return LaborCostBudgetDailySummary.objects.select_related("budget_period")
+
+
+def labor_cost_budget_allowance_snapshot_queryset():
+    return LaborCostBudgetAllowanceSnapshot.objects.select_related(
+        "budget_period",
         "staff",
         "allowance_assignment",
     )
@@ -2310,6 +2403,220 @@ class LaborCostEstimatePeriodViewSet(viewsets.ModelViewSet):
                     "record_snapshot_count": summary.get("record_snapshot_count", 0),
                     "warning_count": summary.get("warning_count", 0),
                     "error_count": summary.get("error_count", 0),
+                },
+            )
+        response = HttpResponse(data, content_type="text/csv; charset=utf-8")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+
+class LaborCostBudgetPeriodViewSet(viewsets.ModelViewSet):
+    permission_classes = [LaborCostManagementPermission]
+    serializer_class = LaborCostBudgetPeriodSerializer
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_queryset(self):
+        params = self.request.query_params
+        queryset = labor_cost_budget_period_queryset()
+        if params.get("location"):
+            queryset = queryset.filter(location_id=params["location"])
+        if params.get("year"):
+            queryset = queryset.filter(year=params["year"])
+        if params.get("month"):
+            queryset = queryset.filter(month=params["month"])
+        if params.get("status"):
+            queryset = queryset.filter(status=params["status"])
+        if params.get("is_active") == "true":
+            queryset = queryset.filter(is_active=True)
+        if params.get("is_active") == "false":
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("-year", "-month", "location__display_order", "created_at")
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                period = serializer.save()
+                record_shift_event(
+                    entity="labor_cost_budget_period",
+                    action="create",
+                    actor=request.user,
+                    request=request,
+                    metadata=labor_cost_budget_period_metadata(period),
+                )
+        except (DjangoValidationError, IntegrityError) as exc:
+            raise drf_validation_from_django(exc) from exc
+        return Response(self.get_serializer(labor_cost_budget_period_queryset().get(pk=period.pk)).data, status=201)
+
+    def partial_update(self, request, *args, **kwargs):
+        serializer = self.get_serializer(self.get_object(), data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                period = serializer.save()
+                record_shift_event(
+                    entity="labor_cost_budget_period",
+                    action="update",
+                    actor=request.user,
+                    request=request,
+                    metadata=labor_cost_budget_period_metadata(period),
+                )
+        except (DjangoValidationError, IntegrityError) as exc:
+            raise drf_validation_from_django(exc) from exc
+        return Response(self.get_serializer(labor_cost_budget_period_queryset().get(pk=period.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def preview(self, request, pk=None):
+        with transaction.atomic():
+            period = (
+                LaborCostBudgetPeriod.objects.select_for_update(of=("self",))
+                .select_related("location", "source_monthly_shift_plan", "source_publication")
+                .get(pk=self.get_object().pk)
+            )
+            if period.status == LaborCostBudgetPeriod.Status.ARCHIVED or not period.is_active:
+                raise ValidationError({"status": "アーカイブ済みの予算periodは操作できません。"})
+            if period.status in {LaborCostBudgetPeriod.Status.DRAFT, LaborCostBudgetPeriod.Status.REOPENED}:
+                period.status = LaborCostBudgetPeriod.Status.REVIEW
+                period.updated_by = request.user
+                period.full_clean()
+                period.save(update_fields=["status", "updated_by", "updated_at"])
+            preview = build_labor_cost_budget_preview(period)
+            if period.status != LaborCostBudgetPeriod.Status.APPROVED:
+                period.source_monthly_shift_plan_id = preview["source_monthly_shift_plan"]
+                period.source_publication_id = preview["source_publication"]
+                period.updated_by = request.user
+                period.full_clean()
+                period.save(
+                    update_fields=[
+                        "source_monthly_shift_plan",
+                        "source_publication",
+                        "updated_by",
+                        "updated_at",
+                    ]
+                )
+            record_shift_event(
+                entity="labor_cost_budget_period",
+                action="preview",
+                actor=request.user,
+                request=request,
+                metadata=labor_cost_budget_period_metadata(period, preview),
+            )
+        return Response(preview)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        serializer = LaborCostBudgetApproveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            period, preview = approve_labor_cost_budget(
+                period=self.get_object(),
+                actor=request.user,
+                acknowledge_warnings=serializer.validated_data["acknowledge_warnings"],
+                validation_fingerprint=serializer.validated_data["validation_fingerprint"],
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="labor_cost_budget_period",
+                action="approve",
+                actor=request.user,
+                request=request,
+                metadata=labor_cost_budget_period_metadata(period, preview),
+            )
+        return Response(self.get_serializer(labor_cost_budget_period_queryset().get(pk=period.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def reopen(self, request, pk=None):
+        serializer = LaborCostBudgetManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            period = reopen_labor_cost_budget(
+                period=self.get_object(),
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="labor_cost_budget_period",
+                action="reopen",
+                actor=request.user,
+                request=request,
+                metadata=labor_cost_budget_period_metadata(period),
+            )
+        return Response(self.get_serializer(labor_cost_budget_period_queryset().get(pk=period.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def archive(self, request, pk=None):
+        serializer = LaborCostBudgetManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            period = archive_labor_cost_budget(
+                period=self.get_object(),
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="labor_cost_budget_period",
+                action="archive",
+                actor=request.user,
+                request=request,
+                metadata=labor_cost_budget_period_metadata(period),
+            )
+        return Response(self.get_serializer(labor_cost_budget_period_queryset().get(pk=period.pk)).data)
+
+    @action(detail=True, methods=["get"], url_path="plan-record-snapshots")
+    def plan_record_snapshots(self, request, pk=None):
+        queryset = (
+            labor_cost_budget_plan_record_queryset()
+            .filter(budget_period=self.get_object())
+            .order_by("work_date", "staff_id")
+        )
+        return Response(LaborCostBudgetPlanRecordSnapshotSerializer(queryset, many=True).data)
+
+    @action(detail=True, methods=["get"], url_path="staff-summaries")
+    def staff_summaries(self, request, pk=None):
+        queryset = (
+            labor_cost_budget_staff_summary_queryset().filter(budget_period=self.get_object()).order_by("staff_id")
+        )
+        return Response(LaborCostBudgetStaffSummarySerializer(queryset, many=True).data)
+
+    @action(detail=True, methods=["get"], url_path="daily-summaries")
+    def daily_summaries(self, request, pk=None):
+        queryset = (
+            labor_cost_budget_daily_summary_queryset().filter(budget_period=self.get_object()).order_by("work_date")
+        )
+        return Response(LaborCostBudgetDailySummarySerializer(queryset, many=True).data)
+
+    @action(detail=True, methods=["get"], url_path="allowance-snapshots")
+    def allowance_snapshots(self, request, pk=None):
+        queryset = (
+            labor_cost_budget_allowance_snapshot_queryset()
+            .filter(budget_period=self.get_object())
+            .order_by("staff_id", "code_snapshot")
+        )
+        return Response(LaborCostBudgetAllowanceSnapshotSerializer(queryset, many=True).data)
+
+    @action(detail=True, methods=["get"])
+    def variance(self, request, pk=None):
+        return Response(get_labor_cost_budget_variance(self.get_object()))
+
+    @action(detail=True, methods=["get"], url_path="export-csv")
+    def export_csv(self, request, pk=None):
+        period = self.get_object()
+        with transaction.atomic():
+            data, filename, summary = export_labor_cost_budget_csv(period)
+            record_shift_event(
+                entity="labor_cost_budget_period",
+                action="export",
+                actor=request.user,
+                request=request,
+                metadata=labor_cost_budget_period_metadata(period)
+                | {
+                    "plan_record_snapshot_count": summary["plan_record_snapshot_count"],
+                    "staff_summary_count": summary["staff_summary_count"],
+                    "daily_summary_count": summary["daily_summary_count"],
+                    "allowance_snapshot_count": summary["allowance_snapshot_count"],
+                    "warning_count": summary["warning_count"],
+                    "error_count": summary["error_count"],
                 },
             )
         response = HttpResponse(data, content_type="text/csv; charset=utf-8")

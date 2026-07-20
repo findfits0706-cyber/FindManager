@@ -5,6 +5,7 @@ from .views import (
     AttendanceClosingPeriodViewSet,
     AttendanceCorrectionRequestViewSet,
     AttendanceRecordViewSet,
+    LaborCostBudgetPeriodViewSet,
     LaborCostEstimatePeriodViewSet,
     MonthlyShiftAssignmentViewSet,
     MonthlyShiftPlanViewSet,
@@ -38,6 +39,7 @@ router.register("attendance-closing-periods", AttendanceClosingPeriodViewSet, ba
 router.register("staff-compensation-profiles", StaffCompensationProfileViewSet, basename="staff-compensation-profile")
 router.register("staff-allowance-assignments", StaffAllowanceAssignmentViewSet, basename="staff-allowance-assignment")
 router.register("labor-cost-estimate-periods", LaborCostEstimatePeriodViewSet, basename="labor-cost-estimate-period")
+router.register("labor-cost-budget-periods", LaborCostBudgetPeriodViewSet, basename="labor-cost-budget-period")
 router.register(
     "attendance-correction-requests",
     AttendanceCorrectionRequestViewSet,

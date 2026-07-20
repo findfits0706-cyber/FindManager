@@ -4,6 +4,11 @@ from .models import (
     AttendanceClosingPeriod,
     AttendanceClosingRecordSnapshot,
     AttendanceClosingStaffSummary,
+    LaborCostBudgetAllowanceSnapshot,
+    LaborCostBudgetDailySummary,
+    LaborCostBudgetPeriod,
+    LaborCostBudgetPlanRecordSnapshot,
+    LaborCostBudgetStaffSummary,
     LaborCostEstimateAllowanceSnapshot,
     LaborCostEstimatePeriod,
     LaborCostEstimateRecordSnapshot,
@@ -110,4 +115,38 @@ class LaborCostEstimateStaffSummaryAdmin(admin.ModelAdmin):
 class LaborCostEstimateAllowanceSnapshotAdmin(admin.ModelAdmin):
     list_display = ("estimate_period", "employee_code_snapshot", "code_snapshot", "estimated_amount", "warning_count")
     list_filter = ("estimate_period__location", "allowance_type_snapshot")
+    search_fields = ("staff_display_name_snapshot", "employee_code_snapshot", "code_snapshot", "name_snapshot")
+
+
+@admin.register(LaborCostBudgetPeriod)
+class LaborCostBudgetPeriodAdmin(admin.ModelAdmin):
+    list_display = ("location", "year", "month", "budget_amount", "status", "approved_at", "is_active")
+    list_filter = ("location", "status", "is_active")
+    search_fields = ("name", "location__code", "location__name")
+
+
+@admin.register(LaborCostBudgetPlanRecordSnapshot)
+class LaborCostBudgetPlanRecordSnapshotAdmin(admin.ModelAdmin):
+    list_display = ("budget_period", "work_date", "employee_code_snapshot", "planned_total", "warning_count")
+    list_filter = ("budget_period__location", "plan_source_snapshot", "employment_type_snapshot")
+    search_fields = ("staff_display_name_snapshot", "employee_code_snapshot")
+
+
+@admin.register(LaborCostBudgetStaffSummary)
+class LaborCostBudgetStaffSummaryAdmin(admin.ModelAdmin):
+    list_display = ("budget_period", "employee_code_snapshot", "planned_total", "actual_estimated_total")
+    list_filter = ("budget_period__location", "employment_type_snapshot")
+    search_fields = ("staff_display_name_snapshot", "employee_code_snapshot")
+
+
+@admin.register(LaborCostBudgetDailySummary)
+class LaborCostBudgetDailySummaryAdmin(admin.ModelAdmin):
+    list_display = ("budget_period", "work_date", "planned_total", "actual_estimated_total")
+    list_filter = ("budget_period__location",)
+
+
+@admin.register(LaborCostBudgetAllowanceSnapshot)
+class LaborCostBudgetAllowanceSnapshotAdmin(admin.ModelAdmin):
+    list_display = ("budget_period", "employee_code_snapshot", "code_snapshot", "planned_amount")
+    list_filter = ("budget_period__location", "allowance_type_snapshot")
     search_fields = ("staff_display_name_snapshot", "employee_code_snapshot", "code_snapshot", "name_snapshot")

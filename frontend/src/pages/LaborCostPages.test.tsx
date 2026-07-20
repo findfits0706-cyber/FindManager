@@ -6,6 +6,7 @@ import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider } from "../features/auth/AuthContext";
+import { LaborCostBudgetPage } from "./LaborCostBudgetPage";
 import { LaborCostMonthlyPage } from "./LaborCostMonthlyPage";
 import { LaborCostSettingsPage } from "./LaborCostSettingsPage";
 
@@ -209,6 +210,166 @@ const preview = {
   ],
   can_finalize: true,
 };
+const budgetPeriod = {
+  id: "b1",
+  location: "l1",
+  location_name: "本館",
+  location_code: "main",
+  year: 2026,
+  month: 7,
+  name: "2026年7月 人件費予算",
+  description: "",
+  budget_amount: "1000000.00",
+  warning_threshold_percent: "90.00",
+  critical_threshold_percent: "100.00",
+  source_monthly_shift_plan: "plan1",
+  source_monthly_shift_plan_name: "7月シフト",
+  source_publication: "pub1",
+  source_publication_version: 1,
+  status: "review",
+  content_hash: "",
+  validation_fingerprint: "",
+  approved_at: null,
+  approved_by: null,
+  approved_by_display_name: "",
+  reopened_at: null,
+  reopened_by: null,
+  reopened_by_display_name: "",
+  plan_record_snapshot_count: 0,
+  staff_summary_count: 0,
+  daily_summary_count: 0,
+  allowance_snapshot_count: 0,
+  created_at: "",
+  updated_at: "",
+  is_active: true,
+};
+const budgetPreview = {
+  period: "b1",
+  location: "l1",
+  location_name: "本館",
+  location_code: "main",
+  year: 2026,
+  month: 7,
+  status: "review",
+  plan_source: "published",
+  source_monthly_shift_plan: "plan1",
+  source_publication: "pub1",
+  actual_source_status: "finalized",
+  actual_estimate_period: "p1",
+  actual_content_hash: "actual-hash",
+  content_hash: "budget-hash",
+  validation_fingerprint: "budget-fingerprint",
+  approval_issues: [
+    { severity: "warning", code: "planned_budget_warning_threshold", message: "予定原価が警戒閾値です。" },
+  ],
+  comparison_issues: [],
+  summary: {
+    budget_amount: "1000000.00",
+    planned_total: "920000.00",
+    actual_estimated_total: "870000.00",
+    planned_budget_variance_amount: "-80000.00",
+    planned_budget_variance_percent: "-8.00",
+    actual_budget_variance_amount: "-130000.00",
+    actual_budget_variance_percent: "-13.00",
+    actual_plan_variance_amount: "-50000.00",
+    actual_plan_variance_percent: "-5.43",
+    planned_budget_ratio_percent: "92.00",
+    actual_budget_ratio_percent: "87.00",
+    planned_budget_status: "warning",
+    actual_budget_status: "normal",
+    plan_record_count: 1,
+    staff_summary_count: 1,
+    daily_summary_count: 1,
+    allowance_snapshot_count: 1,
+    approval_warning_count: 1,
+    approval_error_count: 0,
+  },
+  plan_records: [
+    {
+      location: "l1",
+      staff: "s1",
+      staff_display_name: "スタッフA",
+      employee_code: "EMP-1",
+      work_date: "2026-07-01",
+      monthly_shift_plan: "plan1",
+      monthly_shift_assignment: "assignment1",
+      publication: "pub1",
+      publication_assignment: "pa1",
+      plan_source_snapshot: "published",
+      employment_type_snapshot: "hourly",
+      base_hourly_rate_snapshot: "1200.00",
+      fixed_monthly_amount_snapshot: null,
+      planned_start_offset_minutes: 540,
+      planned_end_offset_minutes: 960,
+      planned_worked_minutes: 420,
+      planned_hours_decimal: "7.00",
+      planned_base_pay: "8400.00",
+      planned_daily_allowance: "500.00",
+      planned_total: "8900.00",
+      warning_count: 0,
+      warnings: [],
+      error_count: 0,
+      errors: [],
+    },
+  ],
+  staff_summaries: [
+    {
+      staff: "s1",
+      staff_display_name_snapshot: "スタッフA",
+      employee_code_snapshot: "EMP-1",
+      employment_type_snapshot: "hourly",
+      base_hourly_rate_snapshot: "1200.00",
+      fixed_monthly_amount_snapshot: null,
+      planned_worked_days: 1,
+      planned_worked_minutes: 420,
+      planned_hours_decimal: "7.00",
+      planned_hourly_base_pay: "8400.00",
+      planned_fixed_monthly_pay: "0.00",
+      planned_allowance_total: "500.00",
+      planned_total: "8900.00",
+      actual_worked_minutes: 400,
+      actual_base_pay_total: "8000.00",
+      actual_allowance_total: "500.00",
+      actual_estimated_total: "8500.00",
+      actual_plan_variance_amount: "-400.00",
+      actual_plan_variance_percent: "-4.49",
+      warning_count: 0,
+      error_count: 0,
+    },
+  ],
+  daily_summaries: [
+    {
+      work_date: "2026-07-01",
+      planned_staff_count: 1,
+      planned_worked_minutes: 420,
+      planned_total: "8900.00",
+      actual_staff_count: 1,
+      actual_worked_minutes: 400,
+      actual_estimated_total: "8500.00",
+      actual_plan_variance_amount: "-400.00",
+      actual_plan_variance_percent: "-4.49",
+      warning_count: 0,
+      error_count: 0,
+    },
+  ],
+  allowance_snapshots: [
+    {
+      staff: "s1",
+      staff_display_name_snapshot: "スタッフA",
+      employee_code_snapshot: "EMP-1",
+      allowance_assignment: "a1",
+      code_snapshot: "day",
+      name_snapshot: "日額手当",
+      allowance_type_snapshot: "per_worked_day",
+      amount_snapshot: "500.00",
+      quantity: "1.00",
+      planned_amount: "500.00",
+      warning_count: 0,
+      warnings: [],
+    },
+  ],
+  can_approve: true,
+};
 
 function renderWithAuth(element: ReactNode, roles = ["system_admin"]) {
   render(
@@ -249,6 +410,18 @@ function mockApi(roles = ["system_admin"]) {
     if (url.endsWith("/api/v1/auth/csrf/")) return { ok: true, json: async () => ({}) } as Response;
     if (url.includes("/api/v1/locations/")) return { ok: true, json: async () => locations } as Response;
     if (url.includes("/api/v1/staff/?")) return { ok: true, json: async () => staff } as Response;
+    if (url.includes("/labor-cost-budget-periods/") && url.includes("/preview/")) {
+      return { ok: true, json: async () => budgetPreview } as Response;
+    }
+    if (url.includes("/labor-cost-budget-periods/") && url.includes("/variance/")) {
+      return { ok: true, json: async () => budgetPreview } as Response;
+    }
+    if (url.includes("/labor-cost-budget-periods/") && url.includes("/approve/")) {
+      return { ok: true, json: async () => ({ ...budgetPeriod, status: "approved" }) } as Response;
+    }
+    if (url.includes("/labor-cost-budget-periods/") && method === "GET") {
+      return { ok: true, json: async () => paginated([budgetPeriod]) } as Response;
+    }
     if (url.includes("/preview/")) return { ok: true, json: async () => preview } as Response;
     if (url.includes("/finalize/")) {
       return { ok: true, json: async () => ({ ...estimatePeriod, status: "finalized" }) } as Response;
@@ -319,6 +492,11 @@ describe("LaborCost pages", () => {
 
     expect(await screen.findByRole("heading", { name: "概算人件費" })).toBeInTheDocument();
     await user.click(await screen.findByRole("button", { name: "2026-07" }));
+    expect(await screen.findByText(/1,000,000円/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "人件費予算・予実へ進む" })).toHaveAttribute(
+      "href",
+      "/labor-cost/budget?location=l1&year=2026&month=7&period=b1",
+    );
     await user.click(screen.getByRole("button", { name: "preview" }));
     expect(await screen.findByText("概算合計 10600")).toBeInTheDocument();
     expect(screen.getByText("manual_allowance_not_calculated")).toBeInTheDocument();
@@ -332,5 +510,40 @@ describe("LaborCost pages", () => {
     );
     await user.click(screen.getByRole("button", { name: "CSV出力" }));
     expect(openMock).toHaveBeenCalledWith("/api/v1/labor-cost-estimate-periods/p1/export-csv/", "_blank", "noopener");
+  });
+
+  it("manages labor budgets, shows variance labels, requires warning acknowledgement, and exports CSV", async () => {
+    mockApi();
+    const user = userEvent.setup();
+    renderWithAuth(<LaborCostBudgetPage />);
+
+    expect(await screen.findByRole("heading", { name: "人件費予算・予実" })).toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: "2026-07" }));
+    await user.click(screen.getByRole("button", { name: "プレビュー" }));
+    expect(await screen.findByText("予定: 警戒")).toBeInTheDocument();
+    expect(screen.getByText(/planned_budget_warning_threshold/)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "スタッフ別予実" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "日別予実" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "予定原価明細" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "予定手当" })).toBeInTheDocument();
+    const approveButton = screen.getByRole("button", { name: "承認" });
+    expect(approveButton).toBeDisabled();
+    await user.click(screen.getByLabelText("warning確認済み"));
+    expect(approveButton).toBeEnabled();
+    await user.click(approveButton);
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/labor-cost-budget-periods/b1/approve/",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+    await user.click(screen.getByRole("button", { name: "CSV出力" }));
+    expect(openMock).toHaveBeenCalledWith("/api/v1/labor-cost-budget-periods/b1/export-csv/", "_blank", "noopener");
+  });
+
+  it("keeps the labor budget screen inaccessible to supervisors", async () => {
+    mockApi(["supervisor"]);
+    renderWithAuth(<LaborCostBudgetPage />, ["supervisor"]);
+    expect(await screen.findByText("forbidden")).toBeInTheDocument();
   });
 });

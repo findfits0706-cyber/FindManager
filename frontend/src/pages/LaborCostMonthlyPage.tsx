@@ -1,10 +1,12 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { Navigate } from "react-router-dom";
+import { Link, Navigate } from "react-router-dom";
 import { api } from "../api/client";
 import { useAuth } from "../features/auth/AuthContext";
 import type {
   AttendanceClosingPeriod,
+  LaborCostBudgetPeriod,
+  LaborCostBudgetPreview,
   LaborCostEstimatePeriod,
   LaborCostEstimatePreview,
   Location,
@@ -62,6 +64,7 @@ export function LaborCostMonthlyPage() {
     if (location) params.set("location", location);
     return params.toString();
   }, [location, month, year]);
+  const budgetQueryString = closingQueryString;
 
   const locationsQuery = useQuery({
     queryKey: ["labor-cost-monthly-locations"],
@@ -77,6 +80,22 @@ export function LaborCostMonthlyPage() {
     queryKey: ["labor-cost-closing-periods", closingQueryString],
     queryFn: () => api<Paginated<AttendanceClosingPeriod>>(`/api/v1/attendance-closing-periods/?${closingQueryString}`),
     enabled: canManage,
+  });
+  const budgetPeriodsQuery = useQuery({
+    queryKey: ["labor-cost-budget-periods", budgetQueryString],
+    queryFn: () => api<Paginated<LaborCostBudgetPeriod>>(`/api/v1/labor-cost-budget-periods/?${budgetQueryString}`),
+    enabled: canManage,
+  });
+  const selectedBudget = selected
+    ? budgetPeriodsQuery.data?.results.find(
+        (item) => item.location === selected.location && item.year === selected.year && item.month === selected.month,
+      )
+    : undefined;
+  const budgetVarianceQuery = useQuery({
+    queryKey: ["labor-cost-budget-variance", selectedBudget?.id],
+    queryFn: () =>
+      api<LaborCostBudgetPreview>(`/api/v1/labor-cost-budget-periods/${selectedBudget?.id}/variance/`),
+    enabled: canManage && Boolean(selectedBudget),
   });
 
   if (!loading && !canManage) return <Navigate to="/403" replace />;
@@ -338,7 +357,19 @@ export function LaborCostMonthlyPage() {
               <dd>{preview?.validation_fingerprint ?? selected.validation_fingerprint ?? "-"}</dd>
               <dt>source</dt>
               <dd>{preview ? `${preview.source_status} / ${preview.attendance_closing_status}` : "-"}</dd>
+              <dt>人件費予算</dt>
+              <dd>{selectedBudget ? `${statusLabel(selectedBudget.status)} / ${Number(selectedBudget.budget_amount).toLocaleString("ja-JP")}円` : "未登録"}</dd>
+              <dt>予算との差異</dt>
+              <dd>{budgetVarianceQuery.data ? `${Number(budgetVarianceQuery.data.summary.actual_budget_variance_amount).toLocaleString("ja-JP")}円` : "-"}</dd>
+              <dt>予算消化率</dt>
+              <dd>{budgetVarianceQuery.data?.summary.actual_budget_ratio_percent === null || !budgetVarianceQuery.data ? "-" : `${Number(budgetVarianceQuery.data.summary.actual_budget_ratio_percent).toFixed(2)}%`}</dd>
             </dl>
+            <Link
+              className="button-link"
+              to={`/labor-cost/budget?location=${selected.location}&year=${selected.year}&month=${selected.month}${selectedBudget ? `&period=${selectedBudget.id}` : ""}`}
+            >
+              人件費予算・予実へ進む
+            </Link>
             <div className="actions">
               <button type="button" disabled={isSubmitting} onClick={() => void runPreview()}>
                 preview

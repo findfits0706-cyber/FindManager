@@ -152,6 +152,13 @@ class AuditEvent(models.Model):
         LABOR_COST_ESTIMATE_REOPENED = "labor_cost_estimate_reopened", "Labor cost estimate reopened"
         LABOR_COST_ESTIMATE_ARCHIVED = "labor_cost_estimate_archived", "Labor cost estimate archived"
         LABOR_COST_ESTIMATE_EXPORTED = "labor_cost_estimate_exported", "Labor cost estimate exported"
+        LABOR_COST_BUDGET_PERIOD_CREATED = "labor_cost_budget_period_created", "Labor cost budget period created"
+        LABOR_COST_BUDGET_PERIOD_UPDATED = "labor_cost_budget_period_updated", "Labor cost budget period updated"
+        LABOR_COST_BUDGET_PREVIEWED = "labor_cost_budget_previewed", "Labor cost budget previewed"
+        LABOR_COST_BUDGET_APPROVED = "labor_cost_budget_approved", "Labor cost budget approved"
+        LABOR_COST_BUDGET_REOPENED = "labor_cost_budget_reopened", "Labor cost budget reopened"
+        LABOR_COST_BUDGET_ARCHIVED = "labor_cost_budget_archived", "Labor cost budget archived"
+        LABOR_COST_BUDGET_EXPORTED = "labor_cost_budget_exported", "Labor cost budget exported"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     event_type = models.CharField(max_length=64, choices=EventType.choices)

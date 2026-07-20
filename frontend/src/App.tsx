@@ -9,6 +9,7 @@ import { ChangePasswordPage } from "./pages/ChangePasswordPage";
 import { ForbiddenPage } from "./pages/ForbiddenPage";
 import { LoginPage } from "./pages/LoginPage";
 import { LaborCostMonthlyPage } from "./pages/LaborCostMonthlyPage";
+import { LaborCostBudgetPage } from "./pages/LaborCostBudgetPage";
 import { LaborCostSettingsPage } from "./pages/LaborCostSettingsPage";
 import { MyCapabilitiesPage } from "./pages/MyCapabilitiesPage";
 import { MyAttendancePage } from "./pages/MyAttendancePage";
@@ -73,6 +74,7 @@ export function App() {
           <Route path="labor-cost/rates" element={<LaborCostSettingsPage resource="rates" />} />
           <Route path="labor-cost/allowances" element={<LaborCostSettingsPage resource="allowances" />} />
           <Route path="labor-cost/monthly" element={<LaborCostMonthlyPage />} />
+          <Route path="labor-cost/budget" element={<LaborCostBudgetPage />} />
           <Route path="shifts/monthly" element={<MonthlyShiftsPage />} />
           <Route path="shifts/timeline" element={<ShiftTimelinePage />} />
           <Route path="shifts/change-requests" element={<ShiftChangeRequestsPage />} />

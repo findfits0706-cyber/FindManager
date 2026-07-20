@@ -60,6 +60,7 @@ export function AppShell() {
           { to: "/labor-cost/rates", label: "勤務単価設定" },
           { to: "/labor-cost/allowances", label: "手当設定" },
           { to: "/labor-cost/monthly", label: "概算人件費" },
+          { to: "/labor-cost/budget", label: "人件費予算・予実" },
         ]
       : []),
     ...(canViewSelfPages

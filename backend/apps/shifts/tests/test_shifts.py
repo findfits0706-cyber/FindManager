@@ -19,6 +19,7 @@ from apps.operations.models import Location, StaffCapability, StaffLocation, Wor
 from apps.operations.services import seed_operations
 
 from .. import views as shift_views
+from ..labor_budget_services import build_labor_cost_budget_preview
 from ..models import (
     AttendanceClosingPeriod,
     AttendanceClosingRecordSnapshot,
@@ -26,6 +27,11 @@ from ..models import (
     AttendanceCorrectionRequest,
     AttendanceEvent,
     AttendanceRecord,
+    LaborCostBudgetAllowanceSnapshot,
+    LaborCostBudgetDailySummary,
+    LaborCostBudgetPeriod,
+    LaborCostBudgetPlanRecordSnapshot,
+    LaborCostBudgetStaffSummary,
     LaborCostEstimateAllowanceSnapshot,
     LaborCostEstimatePeriod,
     LaborCostEstimateRecordSnapshot,
@@ -1934,6 +1940,511 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         self.assertEqual(large_response.status_code, 200, large_response.data)
         self.assertGreaterEqual(large_response.data["summary"]["record_snapshot_count"], 40)
         self.assertLessEqual(self.select_query_count(large_queries) - self.select_query_count(small_queries), 4)
+
+    def test_labor_cost_budget_models_sources_calculation_approval_variance_and_csv(self):
+        plan = self.create_plan(month=8)
+        self.create_assignment_record(
+            plan,
+            work_date="2026-08-01",
+            start_offset_minutes=540,
+            end_offset_minutes=600,
+        )
+        publication = self.publish_plan(plan)
+        StaffCompensationProfile.objects.create(
+            location=self.location,
+            staff=self.staff,
+            employment_type=StaffCompensationProfile.EmploymentType.HOURLY,
+            base_hourly_rate="1200.00",
+            valid_from="2026-08-01",
+            valid_to="2026-08-31",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        for code, allowance_type, amount in [
+            ("day", StaffAllowanceAssignment.AllowanceType.PER_WORKED_DAY, "500.00"),
+            ("hour", StaffAllowanceAssignment.AllowanceType.PER_WORKED_HOUR, "100.00"),
+            ("fixed", StaffAllowanceAssignment.AllowanceType.FIXED_MONTHLY, "1000.00"),
+        ]:
+            StaffAllowanceAssignment.objects.create(
+                location=self.location,
+                staff=self.staff,
+                code=code,
+                name=code,
+                allowance_type=allowance_type,
+                amount=amount,
+                valid_from="2026-08-01",
+                valid_to="2026-08-31",
+                created_by=self.system_admin,
+                updated_by=self.system_admin,
+            )
+        client = self.force_client(self.system_admin)
+        created = client.post(
+            "/api/v1/labor-cost-budget-periods/",
+            {
+                "location": str(self.location.id),
+                "year": 2026,
+                "month": 8,
+                "budget_amount": "5000.00",
+                "warning_threshold_percent": "90.00",
+                "critical_threshold_percent": "100.00",
+            },
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        period_id = created.data["id"]
+        preview = client.post(f"/api/v1/labor-cost-budget-periods/{period_id}/preview/", {}, format="json")
+        self.assertEqual(preview.status_code, 200, preview.data)
+        self.assertEqual(preview.data["plan_source"], "published")
+        self.assertEqual(preview.data["source_publication"], str(publication.id))
+        self.assertEqual(Decimal(str(preview.data["summary"]["planned_total"])), Decimal("2800"))
+        self.assertEqual(Decimal(str(preview.data["summary"]["planned_budget_variance_amount"])), Decimal("-2200"))
+        self.assertEqual(preview.data["summary"]["planned_budget_status"], "normal")
+        self.assertTrue(
+            any(item["code"] == "actual_estimate_unavailable" for item in preview.data["comparison_issues"])
+        )
+        self.assertEqual(preview.data["approval_issues"], [])
+        self.assertTrue(preview.data["can_approve"])
+
+        first_hash = preview.data["content_hash"]
+        first_fingerprint = preview.data["validation_fingerprint"]
+        self.staff.employee_code = "BUDGET-CHANGED"
+        self.staff.save(update_fields=["employee_code", "updated_at"])
+        stable = build_labor_cost_budget_preview(LaborCostBudgetPeriod.objects.get(id=period_id))
+        self.assertEqual(stable["content_hash"], first_hash)
+        self.assertEqual(stable["validation_fingerprint"], first_fingerprint)
+
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            failed_approval = client.post(
+                f"/api/v1/labor-cost-budget-periods/{period_id}/approve/",
+                {"acknowledge_warnings": False, "validation_fingerprint": first_fingerprint},
+                format="json",
+            )
+        self.assertEqual(failed_approval.status_code, 500)
+        rolled_back = LaborCostBudgetPeriod.objects.get(id=period_id)
+        self.assertEqual(rolled_back.status, LaborCostBudgetPeriod.Status.REVIEW)
+        self.assertEqual(rolled_back.plan_record_snapshots.count(), 0)
+
+        approved = client.post(
+            f"/api/v1/labor-cost-budget-periods/{period_id}/approve/",
+            {
+                "acknowledge_warnings": False,
+                "validation_fingerprint": first_fingerprint,
+                "manager_note": "予算と予定原価を確認済み",
+            },
+            format="json",
+        )
+        self.assertEqual(approved.status_code, 200, approved.data)
+        self.assertEqual(approved.data["status"], LaborCostBudgetPeriod.Status.APPROVED)
+        budget_period = LaborCostBudgetPeriod.objects.get(id=period_id)
+        self.assertEqual(budget_period.plan_record_snapshots.count(), 1)
+        self.assertEqual(budget_period.staff_summaries.count(), 1)
+        self.assertEqual(budget_period.daily_summaries.count(), 1)
+        self.assertEqual(budget_period.allowance_snapshots.count(), 3)
+        self.assertTrue(LaborCostBudgetPlanRecordSnapshot.objects.filter(budget_period=budget_period).exists())
+        self.assertTrue(LaborCostBudgetStaffSummary.objects.filter(budget_period=budget_period).exists())
+        self.assertTrue(LaborCostBudgetDailySummary.objects.filter(budget_period=budget_period).exists())
+        self.assertTrue(LaborCostBudgetAllowanceSnapshot.objects.filter(budget_period=budget_period).exists())
+        self.assertTrue(AuditEvent.objects.filter(event_type="labor_cost_budget_approved").exists())
+
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            failed_reopen = client.post(f"/api/v1/labor-cost-budget-periods/{period_id}/reopen/", {}, format="json")
+        self.assertEqual(failed_reopen.status_code, 500)
+        budget_period.refresh_from_db()
+        self.assertEqual(budget_period.status, LaborCostBudgetPeriod.Status.APPROVED)
+
+        actual_period = LaborCostEstimatePeriod.objects.create(
+            location=self.location,
+            year=2026,
+            month=8,
+            name="8月実績概算",
+            status=LaborCostEstimatePeriod.Status.FINALIZED,
+            content_hash="actual-finalized-hash",
+            finalized_at=timezone.now(),
+            finalized_by=self.system_admin,
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        LaborCostEstimateRecordSnapshot.objects.create(
+            estimate_period=actual_period,
+            location=self.location,
+            staff=self.staff,
+            location_code_snapshot=self.location.code,
+            location_name_snapshot=self.location.name,
+            staff_display_name_snapshot=self.staff.display_name,
+            employee_code_snapshot=self.staff.employee_code,
+            work_date="2026-08-01",
+            employment_type_snapshot=StaffCompensationProfile.EmploymentType.HOURLY,
+            base_hourly_rate_snapshot="1000.00",
+            worked_minutes=60,
+            worked_hours_decimal="1.00",
+            base_pay="1000.00",
+            allowance_total="500.00",
+            estimated_total="1500.00",
+        )
+        LaborCostEstimateStaffSummary.objects.create(
+            estimate_period=actual_period,
+            staff=self.staff,
+            staff_display_name_snapshot=self.staff.display_name,
+            employee_code_snapshot=self.staff.employee_code,
+            employment_type_snapshot=StaffCompensationProfile.EmploymentType.HOURLY,
+            base_hourly_rate_snapshot="1000.00",
+            worked_days=1,
+            worked_minutes=60,
+            worked_hours_decimal="1.00",
+            base_pay_total="1000.00",
+            allowance_total="500.00",
+            estimated_total="1500.00",
+        )
+        plan.assignments.get().segments.update(end_offset_minutes=660)
+        variance = client.get(f"/api/v1/labor-cost-budget-periods/{period_id}/variance/")
+        self.assertEqual(variance.status_code, 200, variance.data)
+        self.assertEqual(Decimal(str(variance.data["summary"]["planned_total"])), Decimal("2800"))
+        self.assertEqual(Decimal(str(variance.data["summary"]["actual_estimated_total"])), Decimal("1500"))
+        self.assertEqual(variance.data["actual_source_status"], "finalized")
+        self.assertEqual(variance.data["actual_content_hash"], "actual-finalized-hash")
+        self.assertEqual(
+            client.patch(
+                f"/api/v1/labor-cost-budget-periods/{period_id}/",
+                {"budget_amount": "6000.00"},
+                format="json",
+            ).status_code,
+            400,
+        )
+        self.assertEqual(client.post(f"/api/v1/labor-cost-budget-periods/{period_id}/archive/", {}).status_code, 400)
+
+        csv_response = client.get(f"/api/v1/labor-cost-budget-periods/{period_id}/export-csv/")
+        self.assertEqual(csv_response.status_code, 200)
+        self.assertEqual(csv_response["Content-Type"], "text/csv; charset=utf-8")
+        self.assertTrue(csv_response.content.startswith(b"\xef\xbb\xbf"))
+        self.assertIn("labor_cost_budget_main_2026_08.csv", csv_response["Content-Disposition"])
+        self.assertIn("予定予算差異".encode(), csv_response.content)
+        self.assertTrue(AuditEvent.objects.filter(event_type="labor_cost_budget_exported").exists())
+
+        reopened = client.post(f"/api/v1/labor-cost-budget-periods/{period_id}/reopen/", {}, format="json")
+        self.assertEqual(reopened.status_code, 200, reopened.data)
+        archived = client.post(f"/api/v1/labor-cost-budget-periods/{period_id}/archive/", {}, format="json")
+        self.assertEqual(archived.status_code, 200, archived.data)
+        self.assertEqual(
+            client.post(f"/api/v1/labor-cost-budget-periods/{period_id}/preview/", {}, format="json").status_code,
+            400,
+        )
+
+    def test_labor_cost_budget_draft_fixed_manual_permissions_validation_and_rollback(self):
+        plan = self.create_plan(month=9)
+        assignment = self.create_assignment_record(
+            plan,
+            work_date="2026-09-01",
+            start_offset_minutes=1380,
+            end_offset_minutes=1500,
+        )
+        MonthlyShiftSegment.objects.create(
+            monthly_shift_assignment=assignment,
+            work_type=self.break_work,
+            work_area=None,
+            work_type_name_snapshot=self.break_work.name,
+            work_type_short_name_snapshot=self.break_work.short_name,
+            work_type_color_key_snapshot=self.break_work.color_key,
+            work_type_is_break_snapshot=True,
+            work_area_name_snapshot="",
+            start_offset_minutes=1500,
+            end_offset_minutes=1530,
+        )
+        StaffCompensationProfile.objects.create(
+            location=self.location,
+            staff=self.staff,
+            employment_type=StaffCompensationProfile.EmploymentType.MONTHLY_FIXED,
+            fixed_monthly_amount="200000.00",
+            valid_from="2026-09-01",
+            valid_to="2026-09-30",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        StaffAllowanceAssignment.objects.create(
+            location=self.location,
+            staff=self.staff,
+            code="manual",
+            name="手入力",
+            allowance_type=StaffAllowanceAssignment.AllowanceType.MANUAL,
+            amount="1000.00",
+            valid_from="2026-09-01",
+            valid_to="2026-09-30",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        period = LaborCostBudgetPeriod.objects.create(
+            location=self.location,
+            year=2026,
+            month=9,
+            name="固定給予算",
+            budget_amount="300000.00",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        preview = build_labor_cost_budget_preview(period)
+        self.assertEqual(preview["plan_source"], "draft")
+        self.assertEqual(preview["plan_records"][0]["planned_worked_minutes"], 120)
+        self.assertEqual(preview["plan_records"][0]["planned_base_pay"], 0)
+        self.assertEqual(preview["staff_summaries"][0]["planned_fixed_monthly_pay"], Decimal("200000"))
+        self.assertTrue(any(item["code"] == "draft_shift_source" for item in preview["approval_issues"]))
+        self.assertTrue(any(item["code"] == "monthly_fixed_not_prorated" for item in preview["approval_issues"]))
+        self.assertTrue(any(item["code"] == "manual_allowance_not_calculated" for item in preview["approval_issues"]))
+
+        client = self.force_client(self.system_admin)
+        self.assertEqual(
+            client.post(
+                f"/api/v1/labor-cost-budget-periods/{period.id}/approve/",
+                {"acknowledge_warnings": True, "validation_fingerprint": preview["validation_fingerprint"]},
+                format="json",
+            ).status_code,
+            400,
+        )
+        confirmed = client.post(
+            f"/api/v1/monthly-shift-plans/{plan.id}/confirm/",
+            {"acknowledge_warnings": True},
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.data)
+        confirmed_preview = client.post(f"/api/v1/labor-cost-budget-periods/{period.id}/preview/", {}, format="json")
+        self.assertEqual(confirmed_preview.status_code, 200, confirmed_preview.data)
+        self.assertEqual(confirmed_preview.data["plan_source"], "confirmed")
+        self.assertTrue(confirmed_preview.data["can_approve"])
+        no_ack = client.post(
+            f"/api/v1/labor-cost-budget-periods/{period.id}/approve/",
+            {
+                "acknowledge_warnings": False,
+                "validation_fingerprint": confirmed_preview.data["validation_fingerprint"],
+            },
+            format="json",
+        )
+        self.assertEqual(no_ack.status_code, 400)
+
+        for user in [self.supervisor, self.staff, self.viewer]:
+            denied = self.force_client(user).post(
+                f"/api/v1/labor-cost-budget-periods/{period.id}/approve/",
+                {"bad": "payload"},
+                format="json",
+            )
+            self.assertEqual(denied.status_code, 403)
+            self.assertEqual(self.force_client(user).get("/api/v1/labor-cost-budget-periods/").status_code, 403)
+        self.assertEqual(
+            self.force_client(self.shift_manager).get("/api/v1/labor-cost-budget-periods/").status_code, 200
+        )
+
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            rollback = client.post(
+                "/api/v1/labor-cost-budget-periods/",
+                {
+                    "location": str(self.location.id),
+                    "year": 2026,
+                    "month": 10,
+                    "budget_amount": "1000.00",
+                },
+                format="json",
+            )
+        self.assertEqual(rollback.status_code, 500)
+        self.assertFalse(LaborCostBudgetPeriod.objects.filter(year=2026, month=10).exists())
+
+        negative = LaborCostBudgetPeriod(
+            location=self.location,
+            year=2026,
+            month=11,
+            name="invalid",
+            budget_amount=Decimal("-1"),
+            warning_threshold_percent=Decimal("100"),
+            critical_threshold_percent=Decimal("90"),
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        with self.assertRaises(ValidationError):
+            negative.full_clean()
+
+    def test_labor_cost_budget_unavailable_hash_comparison_and_query_growth(self):
+        unavailable = LaborCostBudgetPeriod.objects.create(
+            location=self.location,
+            year=2026,
+            month=12,
+            name="sourceなし",
+            budget_amount="0.00",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        unavailable_preview = build_labor_cost_budget_preview(unavailable)
+        self.assertEqual(unavailable_preview["plan_source"], "unavailable")
+        self.assertEqual(unavailable_preview["summary"]["planned_budget_status"], "normal")
+        self.assertIsNone(unavailable_preview["summary"]["planned_budget_variance_percent"])
+        self.assertTrue(
+            any(item["code"] == "shift_source_unavailable" for item in unavailable_preview["approval_issues"])
+        )
+
+        plan = self.create_plan(month=11)
+        self.create_assignment_record(plan, work_date="2026-11-01")
+        self.publish_plan(plan)
+        StaffCompensationProfile.objects.create(
+            location=self.location,
+            staff=self.staff,
+            employment_type=StaffCompensationProfile.EmploymentType.HOURLY,
+            base_hourly_rate="1000.00",
+            valid_from="2026-11-01",
+            valid_to="2026-11-30",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        small = LaborCostBudgetPeriod.objects.create(
+            location=self.location,
+            year=2026,
+            month=11,
+            name="small",
+            budget_amount="10000.00",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        first = build_labor_cost_budget_preview(small)
+        LaborCostEstimatePeriod.objects.create(
+            location=self.location,
+            year=2026,
+            month=11,
+            name="actual live",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        second = build_labor_cost_budget_preview(small)
+        self.assertEqual(first["validation_fingerprint"], second["validation_fingerprint"])
+        self.assertEqual(first["content_hash"], second["content_hash"])
+        self.assertNotEqual(first["comparison_issues"], second["comparison_issues"])
+
+        client = self.force_client(self.system_admin)
+        with CaptureQueriesContext(connection) as list_queries:
+            response = client.get("/api/v1/labor-cost-budget-periods/")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertLessEqual(self.select_query_count(list_queries), 4)
+
+        large_plan = self.create_plan(year=2027, month=3)
+        large_staff = [self.create_user(f"budget_staff_{index}", ROLE_STAFF) for index in range(8)]
+        for staff in large_staff:
+            StaffLocation.objects.create(staff=staff, location=self.location, valid_from="2027-03-01")
+            StaffCompensationProfile.objects.create(
+                location=self.location,
+                staff=staff,
+                employment_type=StaffCompensationProfile.EmploymentType.HOURLY,
+                base_hourly_rate="1000.00",
+                valid_from="2027-03-01",
+                valid_to="2027-03-31",
+                created_by=self.system_admin,
+                updated_by=self.system_admin,
+            )
+            for day in range(1, 6):
+                self.create_assignment_record(
+                    large_plan,
+                    staff=staff,
+                    work_date=f"2027-03-{day:02d}",
+                )
+        self.publish_plan(large_plan)
+        large = LaborCostBudgetPeriod.objects.create(
+            location=self.location,
+            year=2027,
+            month=3,
+            name="large",
+            budget_amount="100000.00",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        with CaptureQueriesContext(connection) as small_queries:
+            build_labor_cost_budget_preview(small)
+        with CaptureQueriesContext(connection) as large_queries:
+            large_preview = build_labor_cost_budget_preview(large)
+        self.assertEqual(len(large_preview["plan_records"]), 40)
+        self.assertLessEqual(self.select_query_count(large_queries) - self.select_query_count(small_queries), 3)
+
+    def test_labor_cost_budget_model_source_and_snapshot_uniqueness(self):
+        period = LaborCostBudgetPeriod.objects.create(
+            location=self.location,
+            year=2027,
+            month=1,
+            name="model constraints",
+            budget_amount="1000.00",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        duplicate_period = LaborCostBudgetPeriod(
+            location=self.location,
+            year=2027,
+            month=1,
+            name="duplicate",
+            budget_amount="1000.00",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        with self.assertRaises(ValidationError):
+            duplicate_period.full_clean()
+
+        mismatched_plan = self.create_plan(year=2027, month=2)
+        period.source_monthly_shift_plan = mismatched_plan
+        with self.assertRaises(ValidationError):
+            period.full_clean()
+        period.source_monthly_shift_plan = None
+
+        LaborCostBudgetPlanRecordSnapshot.objects.create(
+            budget_period=period,
+            location=self.location,
+            staff=self.staff,
+            work_date="2027-01-01",
+            location_code_snapshot=self.location.code,
+            location_name_snapshot=self.location.name,
+            staff_display_name_snapshot=self.staff.display_name,
+            plan_source_snapshot="confirmed",
+            employment_type_snapshot="hourly",
+        )
+        duplicate_record = LaborCostBudgetPlanRecordSnapshot(
+            budget_period=period,
+            location=self.location,
+            staff=self.staff,
+            work_date="2027-01-01",
+            location_code_snapshot=self.location.code,
+            location_name_snapshot=self.location.name,
+            staff_display_name_snapshot=self.staff.display_name,
+            plan_source_snapshot="confirmed",
+            employment_type_snapshot="hourly",
+        )
+        with self.assertRaises(ValidationError):
+            duplicate_record.full_clean()
+
+        LaborCostBudgetStaffSummary.objects.create(
+            budget_period=period,
+            staff=self.staff,
+            staff_display_name_snapshot=self.staff.display_name,
+            employment_type_snapshot="hourly",
+        )
+        with self.assertRaises(ValidationError):
+            LaborCostBudgetStaffSummary(
+                budget_period=period,
+                staff=self.staff,
+                staff_display_name_snapshot=self.staff.display_name,
+                employment_type_snapshot="hourly",
+            ).full_clean()
+
+        LaborCostBudgetDailySummary.objects.create(budget_period=period, work_date="2027-01-01")
+        with self.assertRaises(ValidationError):
+            LaborCostBudgetDailySummary(budget_period=period, work_date="2027-01-01").full_clean()
+
+        LaborCostBudgetAllowanceSnapshot.objects.create(
+            budget_period=period,
+            staff=self.staff,
+            staff_display_name_snapshot=self.staff.display_name,
+            code_snapshot="manual",
+            name_snapshot="manual",
+            allowance_type_snapshot="manual",
+            amount_snapshot="0.00",
+        )
+        with self.assertRaises(ValidationError):
+            LaborCostBudgetAllowanceSnapshot(
+                budget_period=period,
+                staff=self.staff,
+                staff_display_name_snapshot=self.staff.display_name,
+                code_snapshot="manual",
+                name_snapshot="manual",
+                allowance_type_snapshot="manual",
+                amount_snapshot="0.00",
+            ).full_clean()
 
     def test_shift_change_request_my_api_manager_apply_and_matrix_badges(self):
         plan = self.create_plan()

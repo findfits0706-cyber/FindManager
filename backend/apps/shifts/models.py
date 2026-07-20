@@ -1,4 +1,5 @@
 import uuid
+from decimal import Decimal
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -1551,6 +1552,338 @@ class LaborCostEstimateAllowanceSnapshot(models.Model):
 
     def __str__(self):
         return f"{self.estimate_period_id} / {self.staff_id} / {self.code_snapshot}"
+
+
+class LaborCostBudgetPeriod(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "draft"
+        REVIEW = "review", "review"
+        APPROVED = "approved", "approved"
+        REOPENED = "reopened", "reopened"
+        ARCHIVED = "archived", "archived"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="labor_cost_budget_periods")
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField()
+    name = models.CharField(max_length=150)
+    description = models.TextField(blank=True)
+    budget_amount = models.DecimalField(max_digits=14, decimal_places=2)
+    warning_threshold_percent = models.DecimalField(max_digits=6, decimal_places=2, default=90)
+    critical_threshold_percent = models.DecimalField(max_digits=6, decimal_places=2, default=100)
+    source_monthly_shift_plan = models.ForeignKey(
+        MonthlyShiftPlan,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_budget_periods",
+        null=True,
+        blank=True,
+    )
+    source_publication = models.ForeignKey(
+        MonthlyShiftPublication,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_budget_periods",
+        null=True,
+        blank=True,
+    )
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    content_hash = models.CharField(max_length=64, blank=True)
+    validation_fingerprint = models.CharField(max_length=64, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_budget_periods_approved",
+        null=True,
+        blank=True,
+    )
+    reopened_at = models.DateTimeField(null=True, blank=True)
+    reopened_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_budget_periods_reopened",
+        null=True,
+        blank=True,
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_budget_periods_created",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_budget_periods_updated",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["-year", "-month", "location__display_order", "created_at"]
+        indexes = [
+            models.Index(fields=["location", "year", "month"], name="labor_budget_lookup_idx"),
+            models.Index(fields=["status", "is_active"], name="labor_budget_status_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["location", "year", "month"],
+                condition=Q(is_active=True),
+                name="uniq_active_labor_budget",
+            ),
+            models.CheckConstraint(condition=Q(year__gte=2000) & Q(year__lte=2100), name="labor_budget_year_range"),
+            models.CheckConstraint(condition=Q(month__gte=1) & Q(month__lte=12), name="labor_budget_month_range"),
+            models.CheckConstraint(condition=Q(budget_amount__gte=0), name="labor_budget_amount_gte0"),
+            models.CheckConstraint(condition=Q(warning_threshold_percent__gte=0), name="labor_budget_warn_gte0"),
+            models.CheckConstraint(
+                condition=Q(critical_threshold_percent__gte=models.F("warning_threshold_percent")),
+                name="labor_budget_critical_gte_warn",
+            ),
+            models.CheckConstraint(
+                condition=Q(critical_threshold_percent__lte=999.99),
+                name="labor_budget_critical_lte999",
+            ),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.location_id and not self.location.is_active:
+            errors["location"] = "Inactive locations cannot be assigned."
+        if self.year < 2000 or self.year > 2100:
+            errors["year"] = "year must be between 2000 and 2100."
+        if self.month < 1 or self.month > 12:
+            errors["month"] = "month must be between 1 and 12."
+        if self.budget_amount is not None and self.budget_amount < 0:
+            errors["budget_amount"] = "budget_amount must be greater than or equal to 0."
+        if self.warning_threshold_percent is not None and self.warning_threshold_percent < 0:
+            errors["warning_threshold_percent"] = "warning_threshold_percent must be greater than or equal to 0."
+        if (
+            self.warning_threshold_percent is not None
+            and self.critical_threshold_percent is not None
+            and self.critical_threshold_percent < self.warning_threshold_percent
+        ):
+            errors["critical_threshold_percent"] = "critical_threshold_percent must not be below warning threshold."
+        if self.critical_threshold_percent is not None and self.critical_threshold_percent > Decimal("999.99"):
+            errors["critical_threshold_percent"] = "critical_threshold_percent must be at most 999.99."
+        if self.source_monthly_shift_plan_id:
+            plan = self.source_monthly_shift_plan
+            if plan.location_id != self.location_id or plan.year != self.year or plan.month != self.month:
+                errors["source_monthly_shift_plan"] = "source plan must match location/year/month."
+        if self.source_publication_id:
+            publication = self.source_publication
+            if (
+                publication.location_id != self.location_id
+                or publication.year != self.year
+                or publication.month != self.month
+            ):
+                errors["source_publication"] = "source publication must match location/year/month."
+            if (
+                self.source_monthly_shift_plan_id
+                and publication.monthly_shift_plan_id != self.source_monthly_shift_plan_id
+            ):
+                errors["source_publication"] = "source publication must belong to the source plan."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.location.short_name} / {self.year}-{self.month:02d} / {self.status}"
+
+
+class LaborCostBudgetPlanRecordSnapshot(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    budget_period = models.ForeignKey(
+        LaborCostBudgetPeriod,
+        on_delete=models.CASCADE,
+        related_name="plan_record_snapshots",
+    )
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="labor_cost_budget_plan_snapshots")
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_budget_plan_snapshots",
+    )
+    work_date = models.DateField()
+    monthly_shift_plan = models.ForeignKey(
+        MonthlyShiftPlan,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_budget_plan_snapshots",
+        null=True,
+        blank=True,
+    )
+    monthly_shift_assignment = models.ForeignKey(
+        MonthlyShiftAssignment,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_budget_plan_snapshots",
+        null=True,
+        blank=True,
+    )
+    publication = models.ForeignKey(
+        MonthlyShiftPublication,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_budget_plan_snapshots",
+        null=True,
+        blank=True,
+    )
+    publication_assignment = models.ForeignKey(
+        MonthlyShiftPublicationAssignment,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_budget_plan_snapshots",
+        null=True,
+        blank=True,
+    )
+    location_code_snapshot = models.CharField(max_length=50)
+    location_name_snapshot = models.CharField(max_length=150)
+    staff_display_name_snapshot = models.CharField(max_length=150)
+    employee_code_snapshot = models.CharField(max_length=50, blank=True)
+    plan_source_snapshot = models.CharField(max_length=20)
+    employment_type_snapshot = models.CharField(max_length=32)
+    base_hourly_rate_snapshot = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    fixed_monthly_amount_snapshot = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    planned_start_offset_minutes = models.IntegerField(null=True, blank=True)
+    planned_end_offset_minutes = models.IntegerField(null=True, blank=True)
+    planned_worked_minutes = models.PositiveIntegerField(default=0)
+    planned_hours_decimal = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    planned_base_pay = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    planned_daily_allowance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    planned_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    warning_count = models.PositiveIntegerField(default=0)
+    warnings = models.JSONField(default=list, blank=True)
+    error_count = models.PositiveIntegerField(default=0)
+    errors = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["work_date", "employee_code_snapshot", "created_at"]
+        indexes = [
+            models.Index(fields=["budget_period", "work_date"], name="labor_budget_plan_date_idx"),
+            models.Index(fields=["staff", "work_date"], name="labor_budget_plan_staff_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["budget_period", "staff", "work_date", "location"],
+                name="uniq_labor_budget_plan_day",
+            ),
+        ]
+
+
+class LaborCostBudgetStaffSummary(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    budget_period = models.ForeignKey(
+        LaborCostBudgetPeriod,
+        on_delete=models.CASCADE,
+        related_name="staff_summaries",
+    )
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_budget_staff_summaries",
+    )
+    staff_display_name_snapshot = models.CharField(max_length=150)
+    employee_code_snapshot = models.CharField(max_length=50, blank=True)
+    employment_type_snapshot = models.CharField(max_length=32)
+    base_hourly_rate_snapshot = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    fixed_monthly_amount_snapshot = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    planned_worked_days = models.PositiveIntegerField(default=0)
+    planned_worked_minutes = models.PositiveIntegerField(default=0)
+    planned_hours_decimal = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    planned_hourly_base_pay = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    planned_fixed_monthly_pay = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    planned_allowance_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    planned_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    actual_worked_minutes = models.PositiveIntegerField(default=0)
+    actual_base_pay_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    actual_allowance_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    actual_estimated_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    actual_plan_variance_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    actual_plan_variance_percent = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    warning_count = models.PositiveIntegerField(default=0)
+    error_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["employee_code_snapshot", "staff_display_name_snapshot", "created_at"]
+        indexes = [models.Index(fields=["budget_period", "staff"], name="labor_budget_staff_sum_idx")]
+        constraints = [
+            models.UniqueConstraint(fields=["budget_period", "staff"], name="uniq_labor_budget_staff_sum"),
+        ]
+
+
+class LaborCostBudgetDailySummary(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    budget_period = models.ForeignKey(
+        LaborCostBudgetPeriod,
+        on_delete=models.CASCADE,
+        related_name="daily_summaries",
+    )
+    work_date = models.DateField()
+    planned_staff_count = models.PositiveIntegerField(default=0)
+    planned_worked_minutes = models.PositiveIntegerField(default=0)
+    planned_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    actual_staff_count = models.PositiveIntegerField(default=0)
+    actual_worked_minutes = models.PositiveIntegerField(default=0)
+    actual_estimated_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    actual_plan_variance_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    actual_plan_variance_percent = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    warning_count = models.PositiveIntegerField(default=0)
+    error_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["work_date", "created_at"]
+        indexes = [models.Index(fields=["budget_period", "work_date"], name="labor_budget_daily_idx")]
+        constraints = [
+            models.UniqueConstraint(fields=["budget_period", "work_date"], name="uniq_labor_budget_daily_sum"),
+        ]
+
+
+class LaborCostBudgetAllowanceSnapshot(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    budget_period = models.ForeignKey(
+        LaborCostBudgetPeriod,
+        on_delete=models.CASCADE,
+        related_name="allowance_snapshots",
+    )
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_budget_allowance_snapshots",
+    )
+    staff_display_name_snapshot = models.CharField(max_length=150)
+    employee_code_snapshot = models.CharField(max_length=50, blank=True)
+    allowance_assignment = models.ForeignKey(
+        StaffAllowanceAssignment,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_budget_snapshots",
+        null=True,
+        blank=True,
+    )
+    code_snapshot = models.CharField(max_length=50)
+    name_snapshot = models.CharField(max_length=150)
+    allowance_type_snapshot = models.CharField(max_length=32)
+    amount_snapshot = models.DecimalField(max_digits=10, decimal_places=2)
+    quantity = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    planned_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    warning_count = models.PositiveIntegerField(default=0)
+    warnings = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["employee_code_snapshot", "code_snapshot", "created_at"]
+        indexes = [
+            models.Index(fields=["budget_period", "staff"], name="labor_budget_allow_staff_idx"),
+            models.Index(fields=["allowance_assignment"], name="labor_budget_allow_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["budget_period", "staff", "allowance_assignment"],
+                condition=Q(allowance_assignment__isnull=False),
+                name="uniq_labor_budget_allow_assign",
+            ),
+            models.UniqueConstraint(
+                fields=["budget_period", "staff", "code_snapshot", "allowance_type_snapshot"],
+                condition=Q(allowance_assignment__isnull=True),
+                name="uniq_labor_budget_allow_code",
+            ),
+        ]
 
 
 class ShiftChangeRequest(models.Model):

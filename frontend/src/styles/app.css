@@ -683,6 +683,107 @@ button:disabled {
   margin-bottom: 8px;
 }
 
+.budget-form-grid {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.budget-action-bar {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto minmax(180px, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+  padding: 14px 0;
+  border-top: 1px solid #dbe4ec;
+  border-bottom: 1px solid #dbe4ec;
+}
+
+.budget-action-bar > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.budget-action-bar > div:first-child span,
+.budget-metric span {
+  color: #5f7488;
+  font-size: 0.82rem;
+}
+
+.hash-list {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 12px;
+  margin: 0;
+}
+
+.hash-list dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.78rem;
+}
+
+.budget-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  border-top: 1px solid #dbe4ec;
+  border-left: 1px solid #dbe4ec;
+}
+
+.budget-metric {
+  display: grid;
+  gap: 6px;
+  min-height: 76px;
+  padding: 12px;
+  border-right: 1px solid #dbe4ec;
+  border-bottom: 1px solid #dbe4ec;
+  background: #fff;
+}
+
+.budget-metric strong {
+  font-size: 1.1rem;
+}
+
+.source-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin: 14px 0;
+}
+
+.budget-status {
+  font-weight: 700;
+}
+
+.status-normal {
+  color: #176b55;
+}
+
+.status-warning {
+  color: #8a5a00;
+}
+
+.status-critical {
+  color: #ad2e24;
+}
+
+.issue-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.issue-columns section {
+  min-width: 0;
+}
+
+.issue-columns .issue-list li {
+  display: grid;
+  gap: 2px;
+}
+
 @media (max-width: 768px) {
   .layout {
     grid-template-columns: 1fr;
@@ -709,6 +810,16 @@ button:disabled {
   }
 
   .timeline-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .budget-action-bar,
+  .issue-columns {
+    grid-template-columns: 1fr;
+  }
+
+  .hash-list {
+    grid-column: auto;
     grid-template-columns: 1fr;
   }
 }

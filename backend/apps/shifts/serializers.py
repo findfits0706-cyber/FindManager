@@ -10,6 +10,11 @@ from .models import (
     AttendanceCorrectionRequest,
     AttendanceEvent,
     AttendanceRecord,
+    LaborCostBudgetAllowanceSnapshot,
+    LaborCostBudgetDailySummary,
+    LaborCostBudgetPeriod,
+    LaborCostBudgetPlanRecordSnapshot,
+    LaborCostBudgetStaffSummary,
     LaborCostEstimateAllowanceSnapshot,
     LaborCostEstimatePeriod,
     LaborCostEstimateRecordSnapshot,
@@ -1527,6 +1532,178 @@ class LaborCostEstimateFinalizeSerializer(serializers.Serializer):
 
 
 class LaborCostEstimateManagerNoteSerializer(serializers.Serializer):
+    manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+
+
+class LaborCostBudgetPeriodSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source="location.name", read_only=True)
+    location_code = serializers.CharField(source="location.code", read_only=True)
+    source_monthly_shift_plan_name = serializers.CharField(source="source_monthly_shift_plan.name", read_only=True)
+    source_publication_version = serializers.IntegerField(source="source_publication.version", read_only=True)
+    approved_by_display_name = serializers.CharField(source="approved_by.display_name", read_only=True)
+    reopened_by_display_name = serializers.CharField(source="reopened_by.display_name", read_only=True)
+    created_by_display_name = serializers.CharField(source="created_by.display_name", read_only=True)
+    updated_by_display_name = serializers.CharField(source="updated_by.display_name", read_only=True)
+    plan_record_snapshot_count = serializers.SerializerMethodField()
+    staff_summary_count = serializers.SerializerMethodField()
+    daily_summary_count = serializers.SerializerMethodField()
+    allowance_snapshot_count = serializers.SerializerMethodField()
+    name = serializers.CharField(required=False, allow_blank=True, trim_whitespace=True)
+
+    class Meta:
+        model = LaborCostBudgetPeriod
+        validators = []
+        fields = [
+            "id",
+            "location",
+            "location_name",
+            "location_code",
+            "year",
+            "month",
+            "name",
+            "description",
+            "budget_amount",
+            "warning_threshold_percent",
+            "critical_threshold_percent",
+            "source_monthly_shift_plan",
+            "source_monthly_shift_plan_name",
+            "source_publication",
+            "source_publication_version",
+            "status",
+            "content_hash",
+            "validation_fingerprint",
+            "approved_at",
+            "approved_by",
+            "approved_by_display_name",
+            "reopened_at",
+            "reopened_by",
+            "reopened_by_display_name",
+            "created_by",
+            "created_by_display_name",
+            "updated_by",
+            "updated_by_display_name",
+            "plan_record_snapshot_count",
+            "staff_summary_count",
+            "daily_summary_count",
+            "allowance_snapshot_count",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+        read_only_fields = [
+            "id",
+            "source_monthly_shift_plan",
+            "source_publication",
+            "status",
+            "content_hash",
+            "validation_fingerprint",
+            "approved_at",
+            "approved_by",
+            "reopened_at",
+            "reopened_by",
+            "created_by",
+            "updated_by",
+            "plan_record_snapshot_count",
+            "staff_summary_count",
+            "daily_summary_count",
+            "allowance_snapshot_count",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+
+    def _count(self, obj, annotation, relation):
+        if hasattr(obj, annotation):
+            return getattr(obj, annotation)
+        return getattr(obj, relation).count()
+
+    def get_plan_record_snapshot_count(self, obj):
+        return self._count(obj, "plan_record_snapshot_total", "plan_record_snapshots")
+
+    def get_staff_summary_count(self, obj):
+        return self._count(obj, "budget_staff_summary_total", "staff_summaries")
+
+    def get_daily_summary_count(self, obj):
+        return self._count(obj, "daily_summary_total", "daily_summaries")
+
+    def get_allowance_snapshot_count(self, obj):
+        return self._count(obj, "budget_allowance_snapshot_total", "allowance_snapshots")
+
+    def validate(self, attrs):
+        if self.instance is not None:
+            if self.instance.status == LaborCostBudgetPeriod.Status.ARCHIVED:
+                raise serializers.ValidationError({"status": "アーカイブ済みの予算periodは編集できません。"})
+            if self.instance.status == LaborCostBudgetPeriod.Status.APPROVED:
+                raise serializers.ValidationError(
+                    {"status": "承認済みの予算periodは再オープンしてから編集してください。"}
+                )
+            immutable_errors = {}
+            for field in ["location", "year", "month"]:
+                if field in attrs and attrs[field] != getattr(self.instance, field):
+                    immutable_errors[field] = "作成後は変更できません。"
+            if immutable_errors:
+                raise serializers.ValidationError(immutable_errors)
+        return attrs
+
+    def create(self, validated_data):
+        actor = self.context["request"].user
+        if not validated_data.get("name"):
+            location = validated_data["location"]
+            validated_data["name"] = (
+                f"{location.short_name} {validated_data['year']}-{validated_data['month']:02d} 人件費予算"
+            )
+        period = LaborCostBudgetPeriod(created_by=actor, updated_by=actor, **validated_data)
+        period.full_clean()
+        period.save()
+        return period
+
+    def update(self, instance, validated_data):
+        for field in [
+            "name",
+            "description",
+            "budget_amount",
+            "warning_threshold_percent",
+            "critical_threshold_percent",
+        ]:
+            if field in validated_data:
+                setattr(instance, field, validated_data[field])
+        instance.updated_by = self.context["request"].user
+        instance.full_clean()
+        instance.save()
+        return instance
+
+
+class LaborCostBudgetPlanRecordSnapshotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LaborCostBudgetPlanRecordSnapshot
+        fields = "__all__"
+
+
+class LaborCostBudgetStaffSummarySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LaborCostBudgetStaffSummary
+        fields = "__all__"
+
+
+class LaborCostBudgetDailySummarySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LaborCostBudgetDailySummary
+        fields = "__all__"
+
+
+class LaborCostBudgetAllowanceSnapshotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LaborCostBudgetAllowanceSnapshot
+        fields = "__all__"
+
+
+class LaborCostBudgetApproveSerializer(serializers.Serializer):
+    acknowledge_warnings = serializers.BooleanField(default=False)
+    validation_fingerprint = serializers.CharField(max_length=64)
+    manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+
+
+class LaborCostBudgetManagerNoteSerializer(serializers.Serializer):
     manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
 
 

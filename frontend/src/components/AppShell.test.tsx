@@ -65,6 +65,7 @@ describe("AppShell", () => {
     expect(screen.getByRole("link", { name: "勤務単価設定" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "手当設定" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "概算人件費" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "人件費予算・予実" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "自分の月次勤怠" })).toBeInTheDocument();
   });
 
@@ -80,6 +81,7 @@ describe("AppShell", () => {
     expect(screen.queryByRole("link", { name: "勤務単価設定" })).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "手当設定" })).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "概算人件費" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "人件費予算・予実" })).not.toBeInTheDocument();
   });
 
   it("shows self pages only for staff users", async () => {
@@ -92,5 +94,6 @@ describe("AppShell", () => {
     expect(screen.queryByRole("link", { name: "拠点管理" })).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "スタッフ所属" })).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "月次勤怠締め" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "人件費予算・予実" })).not.toBeInTheDocument();
   });
 });

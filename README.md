@@ -157,3 +157,16 @@ Phase 11 adds labor cost estimate foundations:
 - Management screens at `/labor-cost/rates`, `/labor-cost/allowances`, and `/labor-cost/monthly`
 - Wage and estimate information is restricted to `system_admin` and `shift_manager`
 - Formal payroll finalization, payslips, tax/social insurance, statutory premium calculation, PDF/Excel, and external payroll/accounting integrations remain outside this phase
+
+Phase 12 adds monthly labor cost budget and variance management:
+
+- Monthly labor cost budgets with draft, review, approved, reopened, and archived states
+- Planned labor cost preview from an active publication, confirmed plan, or draft plan, in that priority order
+- Approval snapshots for daily plan records, staff summaries, daily summaries, and planned allowances
+- Current comparison with Phase 11 actual labor cost estimates without changing approved planned-cost snapshots
+- Budget variance, planned-versus-actual variance, consumption ratios, and explicit normal/warning/critical statuses
+- Separate approval and comparison issues so changing actual estimates does not invalidate budget approval
+- UTF-8 BOM CSV export from approved snapshots or unapproved live preview
+- Management screen at `/labor-cost/budget` and budget context on `/labor-cost/monthly`
+- Budget, planned cost, actual estimate, rates, and allowances remain restricted to `system_admin` and `shift_manager`
+- Sales, labor-cost ratios, automatic shift optimization, and formal payroll remain outside this phase

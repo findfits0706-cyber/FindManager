@@ -195,6 +195,15 @@ EVENT_MAP = {
         "archive": "labor_cost_estimate_archived",
         "export": "labor_cost_estimate_exported",
     },
+    "labor_cost_budget_period": {
+        "create": "labor_cost_budget_period_created",
+        "update": "labor_cost_budget_period_updated",
+        "preview": "labor_cost_budget_previewed",
+        "approve": "labor_cost_budget_approved",
+        "reopen": "labor_cost_budget_reopened",
+        "archive": "labor_cost_budget_archived",
+        "export": "labor_cost_budget_exported",
+    },
 }
 
 

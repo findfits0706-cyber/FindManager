@@ -53,10 +53,12 @@ class User(AbstractUser):
 
     @property
     def role_keys(self):
-        return list(self.groups.order_by("name").values_list("name", flat=True))
+        if not hasattr(self, "_role_keys_cache"):
+            self._role_keys_cache = tuple(self.groups.order_by("name").values_list("name", flat=True))
+        return list(self._role_keys_cache)
 
     def has_role(self, role: str) -> bool:
-        return self.groups.filter(name=role).exists()
+        return role in self.role_keys
 
     def is_login_allowed(self) -> bool:
         return self.is_active and self.employment_status in {

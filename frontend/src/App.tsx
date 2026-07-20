@@ -1,5 +1,7 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { GlobalErrorNotice } from "./components/GlobalErrorNotice";
 import { AttendanceCorrectionRequestsPage } from "./pages/AttendanceCorrectionRequestsPage";
 import { AttendanceMonthlyPage } from "./pages/AttendanceMonthlyPage";
 import { AttendancePage } from "./pages/AttendancePage";
@@ -23,6 +25,7 @@ import { OperationsMasterPage } from "./pages/OperationsMasterPage";
 import { StaffAssignmentsPage } from "./pages/StaffAssignmentsPage";
 import { StaffEditPage } from "./pages/StaffEditPage";
 import { StaffListPage } from "./pages/StaffListPage";
+import { SystemStatusPage } from "./pages/SystemStatusPage";
 import { MonthlyShiftsPage } from "./pages/MonthlyShiftsPage";
 import { ShiftTimelinePage } from "./pages/ShiftTimelinePage";
 import { ShiftPatternsPage } from "./pages/ShiftPatternsPage";
@@ -32,8 +35,10 @@ import { WeeklyTemplatesPage } from "./pages/WeeklyTemplatesPage";
 
 export function App() {
   return (
-    <AuthProvider>
-      <Routes>
+    <ErrorBoundary>
+      <AuthProvider>
+        <GlobalErrorNotice />
+        <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route
           path="/change-password"
@@ -77,6 +82,7 @@ export function App() {
           <Route path="labor-cost/monthly" element={<LaborCostMonthlyPage />} />
           <Route path="labor-cost/budget" element={<LaborCostBudgetPage />} />
           <Route path="finance/performance" element={<FinancePerformancePage />} />
+          <Route path="system/status" element={<SystemStatusPage />} />
           <Route path="shifts/monthly" element={<MonthlyShiftsPage />} />
           <Route path="shifts/timeline" element={<ShiftTimelinePage />} />
           <Route path="shifts/change-requests" element={<ShiftChangeRequestsPage />} />
@@ -86,7 +92,8 @@ export function App() {
           <Route path="403" element={<ForbiddenPage />} />
         </Route>
         <Route path="*" element={<NotFoundPage />} />
-      </Routes>
-    </AuthProvider>
+        </Routes>
+      </AuthProvider>
+    </ErrorBoundary>
   );
 }

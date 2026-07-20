@@ -99,4 +99,10 @@ describe("AppShell", () => {
     expect(screen.queryByRole("link", { name: "人件費予算・予実" })).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "売上・人件費率" })).not.toBeInTheDocument();
   });
+
+  it("shows system status only for system administrators", async () => {
+    mockAuthUser(["system_admin"]);
+    renderShell();
+    expect(await screen.findByRole("link", { name: "システム状態" })).toBeInTheDocument();
+  });
 });

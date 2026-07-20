@@ -34,6 +34,17 @@ FindManager is an operations management system for Find Sports Club. The reposit
   - `npm run test -- --run`
   - `npm run build`
 
+## Release Candidate Operations
+
+- Application version: `1.0.0-rc1`
+- Production configuration is environment-driven; see `.env.example` and [initial setup](docs/operations/initial-setup.md).
+- Validate a configured environment with `python manage.py check --deploy` and `python manage.py check_deployment_readiness`.
+- Liveness and traffic readiness are exposed at `/api/v1/health/` and `/api/v1/readiness/` without internal details.
+- System administrators can view the safe operational summary at `/system/status`.
+- Run the nine critical Playwright workflows with `npm run e2e` after starting a dedicated seeded backend and frontend.
+- A minimal PostgreSQL/backend/frontend stack is available through `docker compose build` and `docker compose up`.
+- Before release, complete the [release checklist](docs/operations/release-checklist.md), [backup and restore rehearsal](docs/operations/backup-and-restore.md), and review the [1.0.0-rc1 release notes](docs/releases/1.0.0-rc1.md).
+
 ## Seed Users
 
 - `system_admin`
@@ -181,3 +192,15 @@ Phase 13 adds monthly revenue performance management:
 - Financial management screen at `/finance/performance` and revenue context on `/labor-cost/budget`
 - All revenue, budget, labor-cost, and ratio information remains restricted to `system_admin` and `shift_manager`
 - Formal accounting, tax, payroll, member-system integration, forecasting, PDF, and Excel remain outside this phase
+
+Phase 14 establishes the release-candidate operating foundation:
+
+- Environment-based production security settings with fail-fast validation
+- Deployment readiness command plus separate public health and readiness probes
+- Safe structured request logging, validated request IDs, and normalized API errors
+- Frontend error boundary, session/error notices, 403/404 routes, and system status screen
+- Role-matrix, information-leakage, query-count, and nine-workflow Playwright coverage
+- PostgreSQL-backed CI jobs for backend, frontend, E2E, dependency audits, and container builds
+- Non-root backend/frontend images and a minimal Compose validation stack
+- Setup, daily/monthly operation, backup/restore, incident, release, and rollback documentation
+- Production deployment, real secrets/data, external monitoring, formal payroll, and formal accounting remain outside this phase

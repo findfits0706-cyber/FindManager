@@ -64,6 +64,7 @@ export function AppShell() {
           { to: "/finance/performance", label: "売上・人件費率" },
         ]
       : []),
+    ...(isSystemAdmin ? [{ to: "/system/status", label: "システム状態" }] : []),
     ...(canViewSelfPages
       ? [
           { to: "/my/shift-requests", label: "希望提出" },
@@ -78,9 +79,12 @@ export function AppShell() {
   ];
 
   const logout = async () => {
-    await api("/api/v1/auth/logout/", { method: "POST", body: JSON.stringify({}) });
-    setUser(null);
-    navigate("/login");
+    try {
+      await api("/api/v1/auth/logout/", { method: "POST", body: JSON.stringify({}) });
+    } finally {
+      setUser(null);
+      navigate("/login");
+    }
   };
 
   return (

@@ -11,3 +11,6 @@ urlpatterns = [
     path("api/v1/", include("apps.operations.urls")),
     path("api/v1/", include("apps.shifts.urls")),
 ]
+
+handler404 = "apps.common.views.json_not_found"
+handler500 = "apps.common.views.json_server_error"

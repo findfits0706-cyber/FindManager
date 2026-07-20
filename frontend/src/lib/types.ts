@@ -1490,6 +1490,23 @@ export type RevenuePerformance = {
   is_snapshot?: boolean;
 };
 
+export type SystemStatus = {
+  backend_version: string;
+  environment: string;
+  api_health: "ok" | "unavailable";
+  api_readiness: "ready" | "not_ready";
+  migration_status: "up_to_date" | "pending";
+  database_status: "connected" | "unavailable";
+  last_audit_event_at: string | null;
+  active_location_count: number;
+  active_staff_count: number;
+  pending_request_count: number;
+  unclosed_attendance_period_count: number;
+  unfinalized_labor_estimate_period_count: number;
+  unapproved_labor_budget_period_count: number;
+  unfinalized_revenue_actual_period_count: number;
+};
+
 export type Paginated<T> = {
   count: number;
   next: string | null;

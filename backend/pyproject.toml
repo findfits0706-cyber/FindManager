@@ -1,32 +1,35 @@
 [project]
 name = "findmanager-backend"
-version = "0.1.0"
+version = "1.0.0rc1"
 description = "Find Sports Club management backend"
 requires-python = ">=3.13"
 dependencies = [
-  "Django>=5.2,<5.3",
+  "Django>=5.2.16,<5.3",
   "djangorestframework>=3.16,<3.17",
   "drf-spectacular>=0.28,<0.29",
   "psycopg[binary]>=3.2,<3.3",
   "django-filter>=25.1,<26",
+  "gunicorn>=23,<24",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=8.4,<9",
+  "pytest>=9.0.3,<10",
   "pytest-django>=4.11,<5",
   "ruff>=0.12,<0.13",
+  "pip-audit>=2.9,<3",
 ]
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["config", "apps", "apps.accounts", "apps.common", "apps.operations", "apps.shifts"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["apps*", "config*"]
 
 [tool.pytest.ini_options]
-DJANGO_SETTINGS_MODULE = "config.settings"
+DJANGO_SETTINGS_MODULE = "config.test_settings"
 pythonpath = ["."]
 testpaths = ["apps"]
 

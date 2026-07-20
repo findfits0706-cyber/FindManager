@@ -1127,6 +1127,432 @@ class AttendanceClosingStaffSummary(models.Model):
         return f"{self.closing_period_id} / {self.staff_id}"
 
 
+class StaffCompensationProfile(models.Model):
+    class EmploymentType(models.TextChoices):
+        HOURLY = "hourly", "hourly"
+        MONTHLY_FIXED = "monthly_fixed", "monthly_fixed"
+        OTHER = "other", "other"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="staff_compensation_profiles")
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="compensation_profiles",
+    )
+    employment_type = models.CharField(
+        max_length=32,
+        choices=EmploymentType.choices,
+        default=EmploymentType.HOURLY,
+    )
+    base_hourly_rate = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    fixed_monthly_amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    valid_from = models.DateField()
+    valid_to = models.DateField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="staff_compensation_profiles_created",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="staff_compensation_profiles_updated",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["location__display_order", "staff__employee_code", "-valid_from", "created_at"]
+        indexes = [
+            models.Index(fields=["location", "staff", "is_active"], name="comp_profile_lookup_idx"),
+            models.Index(fields=["valid_from", "valid_to"], name="comp_profile_period_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(valid_to__isnull=True) | Q(valid_from__lte=models.F("valid_to")),
+                name="comp_profile_valid_range",
+            ),
+            models.CheckConstraint(
+                condition=Q(base_hourly_rate__isnull=True) | Q(base_hourly_rate__gte=0),
+                name="comp_profile_hourly_gte0",
+            ),
+            models.CheckConstraint(
+                condition=Q(fixed_monthly_amount__isnull=True) | Q(fixed_monthly_amount__gte=0),
+                name="comp_profile_fixed_gte0",
+            ),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.location_id and not self.location.is_active:
+            errors["location"] = "Inactive locations cannot be assigned."
+        if self.staff_id and not self.staff.is_login_allowed():
+            errors["staff"] = "Inactive staff cannot be assigned."
+        if self.valid_to and self.valid_from > self.valid_to:
+            errors["valid_to"] = "valid_to must be on or after valid_from."
+        if self.employment_type == self.EmploymentType.HOURLY and self.base_hourly_rate is None:
+            errors["base_hourly_rate"] = "base_hourly_rate is required for hourly employment_type."
+        if self.employment_type == self.EmploymentType.MONTHLY_FIXED and self.fixed_monthly_amount is None:
+            errors["fixed_monthly_amount"] = "fixed_monthly_amount is required for monthly_fixed employment_type."
+        if self.base_hourly_rate is not None and self.base_hourly_rate < 0:
+            errors["base_hourly_rate"] = "base_hourly_rate must be greater than or equal to 0."
+        if self.fixed_monthly_amount is not None and self.fixed_monthly_amount < 0:
+            errors["fixed_monthly_amount"] = "fixed_monthly_amount must be greater than or equal to 0."
+        if self.location_id and self.staff_id and self.valid_from and self.is_active:
+            overlap_end = self.valid_to or self.valid_from
+            overlapping_profiles = StaffCompensationProfile.objects.filter(
+                location_id=self.location_id,
+                staff_id=self.staff_id,
+                is_active=True,
+                valid_from__lte=overlap_end,
+            ).filter(Q(valid_to__isnull=True) | Q(valid_to__gte=self.valid_from))
+            if self.valid_to is None:
+                overlapping_profiles = StaffCompensationProfile.objects.filter(
+                    location_id=self.location_id,
+                    staff_id=self.staff_id,
+                    is_active=True,
+                ).filter(Q(valid_to__isnull=True) | Q(valid_to__gte=self.valid_from))
+            if self.pk:
+                overlapping_profiles = overlapping_profiles.exclude(pk=self.pk)
+            if overlapping_profiles.exists():
+                errors["non_field_errors"] = "Active compensation profile periods cannot overlap."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.location.short_name} / {self.staff} / {self.valid_from}"
+
+
+class StaffAllowanceAssignment(models.Model):
+    class AllowanceType(models.TextChoices):
+        PER_WORKED_DAY = "per_worked_day", "per_worked_day"
+        PER_WORKED_HOUR = "per_worked_hour", "per_worked_hour"
+        FIXED_MONTHLY = "fixed_monthly", "fixed_monthly"
+        MANUAL = "manual", "manual"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="staff_allowance_assignments")
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="allowance_assignments",
+    )
+    code = models.CharField(max_length=50)
+    name = models.CharField(max_length=150)
+    allowance_type = models.CharField(
+        max_length=32,
+        choices=AllowanceType.choices,
+        default=AllowanceType.PER_WORKED_DAY,
+    )
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    valid_from = models.DateField()
+    valid_to = models.DateField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="staff_allowance_assignments_created",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="staff_allowance_assignments_updated",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["location__display_order", "staff__employee_code", "code", "-valid_from", "created_at"]
+        indexes = [
+            models.Index(fields=["location", "staff", "code", "is_active"], name="allowance_lookup_idx"),
+            models.Index(fields=["valid_from", "valid_to"], name="allowance_period_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(valid_to__isnull=True) | Q(valid_from__lte=models.F("valid_to")),
+                name="allowance_valid_range",
+            ),
+            models.CheckConstraint(condition=Q(amount__gte=0), name="allowance_amount_gte0"),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.location_id and not self.location.is_active:
+            errors["location"] = "Inactive locations cannot be assigned."
+        if self.staff_id and not self.staff.is_login_allowed():
+            errors["staff"] = "Inactive staff cannot be assigned."
+        if self.valid_to and self.valid_from > self.valid_to:
+            errors["valid_to"] = "valid_to must be on or after valid_from."
+        if self.amount is not None and self.amount < 0:
+            errors["amount"] = "amount must be greater than or equal to 0."
+        if self.location_id and self.staff_id and self.code and self.valid_from and self.is_active:
+            overlap_end = self.valid_to or self.valid_from
+            overlapping_assignments = StaffAllowanceAssignment.objects.filter(
+                location_id=self.location_id,
+                staff_id=self.staff_id,
+                code=self.code,
+                is_active=True,
+                valid_from__lte=overlap_end,
+            ).filter(Q(valid_to__isnull=True) | Q(valid_to__gte=self.valid_from))
+            if self.valid_to is None:
+                overlapping_assignments = StaffAllowanceAssignment.objects.filter(
+                    location_id=self.location_id,
+                    staff_id=self.staff_id,
+                    code=self.code,
+                    is_active=True,
+                ).filter(Q(valid_to__isnull=True) | Q(valid_to__gte=self.valid_from))
+            if self.pk:
+                overlapping_assignments = overlapping_assignments.exclude(pk=self.pk)
+            if overlapping_assignments.exists():
+                errors["non_field_errors"] = "Active allowance assignment periods with the same code cannot overlap."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.location.short_name} / {self.staff} / {self.code}"
+
+
+class LaborCostEstimatePeriod(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "draft"
+        REVIEW = "review", "review"
+        FINALIZED = "finalized", "finalized"
+        REOPENED = "reopened", "reopened"
+        ARCHIVED = "archived", "archived"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="labor_cost_estimate_periods")
+    year = models.PositiveSmallIntegerField()
+    month = models.PositiveSmallIntegerField()
+    attendance_closing_period = models.ForeignKey(
+        AttendanceClosingPeriod,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_estimate_periods",
+        null=True,
+        blank=True,
+    )
+    name = models.CharField(max_length=150)
+    description = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    content_hash = models.CharField(max_length=64, blank=True)
+    validation_fingerprint = models.CharField(max_length=64, blank=True)
+    finalized_at = models.DateTimeField(null=True, blank=True)
+    finalized_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_estimate_periods_finalized",
+        null=True,
+        blank=True,
+    )
+    reopened_at = models.DateTimeField(null=True, blank=True)
+    reopened_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_estimate_periods_reopened",
+        null=True,
+        blank=True,
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_estimate_periods_created",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_estimate_periods_updated",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["-year", "-month", "location__display_order", "created_at"]
+        indexes = [
+            models.Index(fields=["location", "year", "month"], name="labor_period_lookup_idx"),
+            models.Index(fields=["status", "is_active"], name="labor_period_status_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["location", "year", "month"],
+                condition=Q(is_active=True),
+                name="uniq_active_labor_period",
+            ),
+            models.CheckConstraint(condition=Q(year__gte=2000) & Q(year__lte=2100), name="labor_period_year_range"),
+            models.CheckConstraint(condition=Q(month__gte=1) & Q(month__lte=12), name="labor_period_month_range"),
+        ]
+
+    def clean(self):
+        errors = {}
+        if self.location_id and not self.location.is_active:
+            errors["location"] = "Inactive locations cannot be assigned."
+        if self.year < 2000 or self.year > 2100:
+            errors["year"] = "year must be between 2000 and 2100."
+        if self.month < 1 or self.month > 12:
+            errors["month"] = "month must be between 1 and 12."
+        if self.attendance_closing_period_id:
+            closing = self.attendance_closing_period
+            if closing.location_id != self.location_id or closing.year != self.year or closing.month != self.month:
+                errors["attendance_closing_period"] = "attendance_closing_period must match location/year/month."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return f"{self.location.short_name} / {self.year}-{self.month:02d} / {self.status}"
+
+
+class LaborCostEstimateRecordSnapshot(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    estimate_period = models.ForeignKey(
+        LaborCostEstimatePeriod,
+        on_delete=models.CASCADE,
+        related_name="record_snapshots",
+    )
+    attendance_closing_snapshot = models.ForeignKey(
+        AttendanceClosingRecordSnapshot,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_snapshots",
+        null=True,
+        blank=True,
+    )
+    attendance_record = models.ForeignKey(
+        AttendanceRecord,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_snapshots",
+        null=True,
+        blank=True,
+    )
+    location = models.ForeignKey(Location, on_delete=models.PROTECT, related_name="labor_cost_record_snapshots")
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_record_snapshots",
+    )
+    location_code_snapshot = models.CharField(max_length=50)
+    location_name_snapshot = models.CharField(max_length=150)
+    staff_display_name_snapshot = models.CharField(max_length=150)
+    employee_code_snapshot = models.CharField(max_length=50, blank=True)
+    work_date = models.DateField()
+    employment_type_snapshot = models.CharField(max_length=32)
+    base_hourly_rate_snapshot = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    fixed_monthly_amount_snapshot = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    worked_minutes = models.PositiveIntegerField(default=0)
+    worked_hours_decimal = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    base_pay = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    allowance_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    estimated_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    warning_count = models.PositiveIntegerField(default=0)
+    warnings = models.JSONField(default=list, blank=True)
+    error_count = models.PositiveIntegerField(default=0)
+    errors = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["work_date", "employee_code_snapshot", "created_at"]
+        indexes = [
+            models.Index(fields=["estimate_period", "work_date"], name="labor_snap_date_idx"),
+            models.Index(fields=["staff", "work_date"], name="labor_snap_staff_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["estimate_period", "staff", "work_date", "location"],
+                name="uniq_labor_snapshot_day",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.estimate_period_id} / {self.work_date} / {self.staff_id}"
+
+
+class LaborCostEstimateStaffSummary(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    estimate_period = models.ForeignKey(
+        LaborCostEstimatePeriod,
+        on_delete=models.CASCADE,
+        related_name="staff_summaries",
+    )
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_staff_summaries",
+    )
+    staff_display_name_snapshot = models.CharField(max_length=150)
+    employee_code_snapshot = models.CharField(max_length=50, blank=True)
+    employment_type_snapshot = models.CharField(max_length=32)
+    base_hourly_rate_snapshot = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    fixed_monthly_amount_snapshot = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    worked_days = models.PositiveIntegerField(default=0)
+    worked_minutes = models.PositiveIntegerField(default=0)
+    worked_hours_decimal = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    base_pay_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    allowance_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    estimated_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    warning_count = models.PositiveIntegerField(default=0)
+    error_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["employee_code_snapshot", "staff_display_name_snapshot", "created_at"]
+        indexes = [
+            models.Index(fields=["estimate_period", "staff"], name="labor_sum_staff_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["estimate_period", "staff"],
+                name="uniq_labor_staff_sum",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.estimate_period_id} / {self.staff_id}"
+
+
+class LaborCostEstimateAllowanceSnapshot(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    estimate_period = models.ForeignKey(
+        LaborCostEstimatePeriod,
+        on_delete=models.CASCADE,
+        related_name="allowance_snapshots",
+    )
+    staff = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_allowance_snapshots",
+    )
+    staff_display_name_snapshot = models.CharField(max_length=150)
+    employee_code_snapshot = models.CharField(max_length=50, blank=True)
+    allowance_assignment = models.ForeignKey(
+        StaffAllowanceAssignment,
+        on_delete=models.PROTECT,
+        related_name="labor_cost_snapshots",
+        null=True,
+        blank=True,
+    )
+    code_snapshot = models.CharField(max_length=50)
+    name_snapshot = models.CharField(max_length=150)
+    allowance_type_snapshot = models.CharField(max_length=32)
+    amount_snapshot = models.DecimalField(max_digits=10, decimal_places=2)
+    quantity = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    estimated_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    warning_count = models.PositiveIntegerField(default=0)
+    warnings = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["employee_code_snapshot", "code_snapshot", "created_at"]
+        indexes = [
+            models.Index(fields=["estimate_period", "staff"], name="labor_allow_staff_idx"),
+            models.Index(fields=["allowance_assignment"], name="labor_allow_assign_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.estimate_period_id} / {self.staff_id} / {self.code_snapshot}"
+
+
 class ShiftChangeRequest(models.Model):
     class RequestType(models.TextChoices):
         DROP_SHIFT = "drop_shift", "drop_shift"

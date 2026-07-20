@@ -115,6 +115,43 @@ class AuditEvent(models.Model):
         ATTENDANCE_CORRECTION_APPROVED = "attendance_correction_approved", "Attendance correction approved"
         ATTENDANCE_CORRECTION_REJECTED = "attendance_correction_rejected", "Attendance correction rejected"
         ATTENDANCE_CORRECTION_APPLIED = "attendance_correction_applied", "Attendance correction applied"
+        STAFF_COMPENSATION_PROFILE_CREATED = (
+            "staff_compensation_profile_created",
+            "Staff compensation profile created",
+        )
+        STAFF_COMPENSATION_PROFILE_UPDATED = (
+            "staff_compensation_profile_updated",
+            "Staff compensation profile updated",
+        )
+        STAFF_COMPENSATION_PROFILE_DEACTIVATED = (
+            "staff_compensation_profile_deactivated",
+            "Staff compensation profile deactivated",
+        )
+        STAFF_ALLOWANCE_ASSIGNMENT_CREATED = (
+            "staff_allowance_assignment_created",
+            "Staff allowance assignment created",
+        )
+        STAFF_ALLOWANCE_ASSIGNMENT_UPDATED = (
+            "staff_allowance_assignment_updated",
+            "Staff allowance assignment updated",
+        )
+        STAFF_ALLOWANCE_ASSIGNMENT_DEACTIVATED = (
+            "staff_allowance_assignment_deactivated",
+            "Staff allowance assignment deactivated",
+        )
+        LABOR_COST_ESTIMATE_PERIOD_CREATED = (
+            "labor_cost_estimate_period_created",
+            "Labor cost estimate period created",
+        )
+        LABOR_COST_ESTIMATE_PERIOD_UPDATED = (
+            "labor_cost_estimate_period_updated",
+            "Labor cost estimate period updated",
+        )
+        LABOR_COST_ESTIMATE_PREVIEWED = "labor_cost_estimate_previewed", "Labor cost estimate previewed"
+        LABOR_COST_ESTIMATE_FINALIZED = "labor_cost_estimate_finalized", "Labor cost estimate finalized"
+        LABOR_COST_ESTIMATE_REOPENED = "labor_cost_estimate_reopened", "Labor cost estimate reopened"
+        LABOR_COST_ESTIMATE_ARCHIVED = "labor_cost_estimate_archived", "Labor cost estimate archived"
+        LABOR_COST_ESTIMATE_EXPORTED = "labor_cost_estimate_exported", "Labor cost estimate exported"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     event_type = models.CharField(max_length=64, choices=EventType.choices)

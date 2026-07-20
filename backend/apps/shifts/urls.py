@@ -5,6 +5,7 @@ from .views import (
     AttendanceClosingPeriodViewSet,
     AttendanceCorrectionRequestViewSet,
     AttendanceRecordViewSet,
+    LaborCostEstimatePeriodViewSet,
     MonthlyShiftAssignmentViewSet,
     MonthlyShiftPlanViewSet,
     MonthlyShiftPublicationViewSet,
@@ -18,6 +19,8 @@ from .views import (
     ShiftPatternViewSet,
     ShiftRequestPeriodViewSet,
     ShiftRequestSubmissionViewSet,
+    StaffAllowanceAssignmentViewSet,
+    StaffCompensationProfileViewSet,
     WeeklyShiftTemplateViewSet,
 )
 
@@ -32,6 +35,9 @@ router.register("shift-request-submissions", ShiftRequestSubmissionViewSet, base
 router.register("shift-change-requests", ShiftChangeRequestViewSet, basename="shift-change-request")
 router.register("attendance-records", AttendanceRecordViewSet, basename="attendance-record")
 router.register("attendance-closing-periods", AttendanceClosingPeriodViewSet, basename="attendance-closing-period")
+router.register("staff-compensation-profiles", StaffCompensationProfileViewSet, basename="staff-compensation-profile")
+router.register("staff-allowance-assignments", StaffAllowanceAssignmentViewSet, basename="staff-allowance-assignment")
+router.register("labor-cost-estimate-periods", LaborCostEstimatePeriodViewSet, basename="labor-cost-estimate-period")
 router.register(
     "attendance-correction-requests",
     AttendanceCorrectionRequestViewSet,

@@ -145,3 +145,15 @@ Phase 10 adds monthly attendance closing:
 - Staff self-service monthly attendance screen at `/my/attendance-monthly`
 - UTF-8 BOM CSV export from closed snapshots or unclosed live preview
 - Payroll calculation, wage rates, overtime/legal judgement, PDF, Excel, and external integrations remain outside this phase
+
+Phase 11 adds labor cost estimate foundations:
+
+- Staff compensation profiles with effective periods for hourly, monthly-fixed, and other employment types
+- Staff allowance assignments for worked-day, worked-hour, fixed-monthly, and manual allowances
+- Monthly labor cost estimate periods linked to attendance closing periods
+- Preview from closed attendance snapshots, or live preview with an `attendance_not_closed` warning
+- Finalize flow with warning acknowledgement, validation fingerprint match, immutable estimate snapshots, staff summaries, and allowance snapshots
+- UTF-8 BOM CSV export from finalized snapshots or unfinalized preview data
+- Management screens at `/labor-cost/rates`, `/labor-cost/allowances`, and `/labor-cost/monthly`
+- Wage and estimate information is restricted to `system_admin` and `shift_manager`
+- Formal payroll finalization, payslips, tax/social insurance, statutory premium calculation, PDF/Excel, and external payroll/accounting integrations remain outside this phase

@@ -10,6 +10,10 @@ from .models import (
     AttendanceCorrectionRequest,
     AttendanceEvent,
     AttendanceRecord,
+    LaborCostEstimateAllowanceSnapshot,
+    LaborCostEstimatePeriod,
+    LaborCostEstimateRecordSnapshot,
+    LaborCostEstimateStaffSummary,
     MonthlyShiftAssignment,
     MonthlyShiftPlan,
     MonthlyShiftPublication,
@@ -22,6 +26,8 @@ from .models import (
     ShiftRequestItem,
     ShiftRequestPeriod,
     ShiftRequestSubmission,
+    StaffAllowanceAssignment,
+    StaffCompensationProfile,
     WeeklyShiftTemplate,
     WeeklyShiftTemplateEntry,
 )
@@ -1000,6 +1006,9 @@ class AttendanceClosingPeriodSerializer(serializers.ModelSerializer):
     updated_by_display_name = serializers.CharField(source="updated_by.display_name", read_only=True)
     snapshot_count = serializers.SerializerMethodField()
     staff_summary_count = serializers.SerializerMethodField()
+    labor_cost_estimate_period = serializers.SerializerMethodField()
+    labor_cost_estimate_status = serializers.SerializerMethodField()
+    labor_cost_estimate_name = serializers.SerializerMethodField()
     name = serializers.CharField(required=False, allow_blank=True, trim_whitespace=True)
 
     class Meta:
@@ -1028,6 +1037,9 @@ class AttendanceClosingPeriodSerializer(serializers.ModelSerializer):
             "updated_by_display_name",
             "snapshot_count",
             "staff_summary_count",
+            "labor_cost_estimate_period",
+            "labor_cost_estimate_status",
+            "labor_cost_estimate_name",
             "created_at",
             "updated_at",
             "is_active",
@@ -1045,6 +1057,9 @@ class AttendanceClosingPeriodSerializer(serializers.ModelSerializer):
             "updated_by",
             "snapshot_count",
             "staff_summary_count",
+            "labor_cost_estimate_period",
+            "labor_cost_estimate_status",
+            "labor_cost_estimate_name",
             "created_at",
             "updated_at",
             "is_active",
@@ -1059,6 +1074,23 @@ class AttendanceClosingPeriodSerializer(serializers.ModelSerializer):
         if hasattr(obj, "staff_summary_total"):
             return obj.staff_summary_total
         return obj.staff_summaries.count()
+
+    def _labor_cost_period(self, obj):
+        if hasattr(obj, "prefetched_labor_cost_periods"):
+            return next(iter(obj.prefetched_labor_cost_periods), None)
+        return obj.labor_cost_estimate_periods.filter(is_active=True).order_by("created_at").first()
+
+    def get_labor_cost_estimate_period(self, obj):
+        period = self._labor_cost_period(obj)
+        return str(period.id) if period else None
+
+    def get_labor_cost_estimate_status(self, obj):
+        period = self._labor_cost_period(obj)
+        return period.status if period else ""
+
+    def get_labor_cost_estimate_name(self, obj):
+        period = self._labor_cost_period(obj)
+        return period.name if period else ""
 
     def validate(self, attrs):
         if self.instance is not None:
@@ -1176,6 +1208,325 @@ class AttendanceClosingCloseSerializer(serializers.Serializer):
 
 
 class AttendanceClosingManagerNoteSerializer(serializers.Serializer):
+    manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+
+
+class StaffCompensationProfileSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source="location.name", read_only=True)
+    location_code = serializers.CharField(source="location.code", read_only=True)
+    staff_display_name = serializers.CharField(source="staff.display_name", read_only=True)
+    employee_code = serializers.CharField(source="staff.employee_code", read_only=True)
+    created_by_display_name = serializers.CharField(source="created_by.display_name", read_only=True)
+    updated_by_display_name = serializers.CharField(source="updated_by.display_name", read_only=True)
+
+    class Meta:
+        model = StaffCompensationProfile
+        fields = [
+            "id",
+            "location",
+            "location_name",
+            "location_code",
+            "staff",
+            "staff_display_name",
+            "employee_code",
+            "employment_type",
+            "base_hourly_rate",
+            "fixed_monthly_amount",
+            "valid_from",
+            "valid_to",
+            "notes",
+            "created_by",
+            "created_by_display_name",
+            "updated_by",
+            "updated_by_display_name",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+        read_only_fields = [
+            "id",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def create(self, validated_data):
+        actor = self.context["request"].user
+        profile = StaffCompensationProfile(created_by=actor, updated_by=actor, **validated_data)
+        profile.full_clean()
+        profile.save()
+        return profile
+
+    def update(self, instance, validated_data):
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.updated_by = self.context["request"].user
+        instance.full_clean()
+        instance.save()
+        return instance
+
+
+class StaffAllowanceAssignmentSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source="location.name", read_only=True)
+    location_code = serializers.CharField(source="location.code", read_only=True)
+    staff_display_name = serializers.CharField(source="staff.display_name", read_only=True)
+    employee_code = serializers.CharField(source="staff.employee_code", read_only=True)
+    created_by_display_name = serializers.CharField(source="created_by.display_name", read_only=True)
+    updated_by_display_name = serializers.CharField(source="updated_by.display_name", read_only=True)
+
+    class Meta:
+        model = StaffAllowanceAssignment
+        fields = [
+            "id",
+            "location",
+            "location_name",
+            "location_code",
+            "staff",
+            "staff_display_name",
+            "employee_code",
+            "code",
+            "name",
+            "allowance_type",
+            "amount",
+            "valid_from",
+            "valid_to",
+            "notes",
+            "created_by",
+            "created_by_display_name",
+            "updated_by",
+            "updated_by_display_name",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+        read_only_fields = [
+            "id",
+            "created_by",
+            "updated_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def create(self, validated_data):
+        actor = self.context["request"].user
+        assignment = StaffAllowanceAssignment(created_by=actor, updated_by=actor, **validated_data)
+        assignment.full_clean()
+        assignment.save()
+        return assignment
+
+    def update(self, instance, validated_data):
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.updated_by = self.context["request"].user
+        instance.full_clean()
+        instance.save()
+        return instance
+
+
+class LaborCostEstimatePeriodSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source="location.name", read_only=True)
+    location_code = serializers.CharField(source="location.code", read_only=True)
+    attendance_closing_period_name = serializers.CharField(source="attendance_closing_period.name", read_only=True)
+    attendance_closing_period_status = serializers.CharField(source="attendance_closing_period.status", read_only=True)
+    finalized_by_display_name = serializers.CharField(source="finalized_by.display_name", read_only=True)
+    reopened_by_display_name = serializers.CharField(source="reopened_by.display_name", read_only=True)
+    created_by_display_name = serializers.CharField(source="created_by.display_name", read_only=True)
+    updated_by_display_name = serializers.CharField(source="updated_by.display_name", read_only=True)
+    record_snapshot_count = serializers.SerializerMethodField()
+    staff_summary_count = serializers.SerializerMethodField()
+    allowance_snapshot_count = serializers.SerializerMethodField()
+    name = serializers.CharField(required=False, allow_blank=True, trim_whitespace=True)
+
+    class Meta:
+        model = LaborCostEstimatePeriod
+        fields = [
+            "id",
+            "location",
+            "location_name",
+            "location_code",
+            "year",
+            "month",
+            "attendance_closing_period",
+            "attendance_closing_period_name",
+            "attendance_closing_period_status",
+            "name",
+            "description",
+            "status",
+            "content_hash",
+            "validation_fingerprint",
+            "finalized_at",
+            "finalized_by",
+            "finalized_by_display_name",
+            "reopened_at",
+            "reopened_by",
+            "reopened_by_display_name",
+            "created_by",
+            "created_by_display_name",
+            "updated_by",
+            "updated_by_display_name",
+            "record_snapshot_count",
+            "staff_summary_count",
+            "allowance_snapshot_count",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+        read_only_fields = [
+            "id",
+            "status",
+            "content_hash",
+            "validation_fingerprint",
+            "finalized_at",
+            "finalized_by",
+            "reopened_at",
+            "reopened_by",
+            "created_by",
+            "updated_by",
+            "record_snapshot_count",
+            "staff_summary_count",
+            "allowance_snapshot_count",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+
+    def get_record_snapshot_count(self, obj):
+        if hasattr(obj, "record_snapshot_total"):
+            return obj.record_snapshot_total
+        return obj.record_snapshots.count()
+
+    def get_staff_summary_count(self, obj):
+        if hasattr(obj, "staff_summary_total"):
+            return obj.staff_summary_total
+        return obj.staff_summaries.count()
+
+    def get_allowance_snapshot_count(self, obj):
+        if hasattr(obj, "allowance_snapshot_total"):
+            return obj.allowance_snapshot_total
+        return obj.allowance_snapshots.count()
+
+    def validate(self, attrs):
+        if self.instance is not None:
+            if self.instance.status == LaborCostEstimatePeriod.Status.ARCHIVED:
+                raise serializers.ValidationError({"status": "アーカイブ済みの概算人件費periodは編集できません。"})
+            immutable_errors = {}
+            for field in ["location", "year", "month"]:
+                if field in attrs and attrs[field] != getattr(self.instance, field):
+                    immutable_errors[field] = "作成後は変更できません。"
+            if immutable_errors:
+                raise serializers.ValidationError(immutable_errors)
+        return attrs
+
+    def create(self, validated_data):
+        actor = self.context["request"].user
+        location = validated_data["location"]
+        year = validated_data["year"]
+        month = validated_data["month"]
+        if not validated_data.get("name"):
+            validated_data["name"] = f"{location.short_name} {year}-{month:02d} 概算人件費"
+        period = LaborCostEstimatePeriod(created_by=actor, updated_by=actor, **validated_data)
+        period.full_clean()
+        period.save()
+        return period
+
+    def update(self, instance, validated_data):
+        for field in ["attendance_closing_period", "name", "description"]:
+            if field in validated_data:
+                setattr(instance, field, validated_data[field])
+        instance.updated_by = self.context["request"].user
+        instance.full_clean()
+        instance.save()
+        return instance
+
+
+class LaborCostEstimateRecordSnapshotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LaborCostEstimateRecordSnapshot
+        fields = [
+            "id",
+            "estimate_period",
+            "attendance_closing_snapshot",
+            "attendance_record",
+            "location",
+            "location_code_snapshot",
+            "location_name_snapshot",
+            "staff",
+            "staff_display_name_snapshot",
+            "employee_code_snapshot",
+            "work_date",
+            "employment_type_snapshot",
+            "base_hourly_rate_snapshot",
+            "fixed_monthly_amount_snapshot",
+            "worked_minutes",
+            "worked_hours_decimal",
+            "base_pay",
+            "allowance_total",
+            "estimated_total",
+            "warning_count",
+            "warnings",
+            "error_count",
+            "errors",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class LaborCostEstimateStaffSummarySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LaborCostEstimateStaffSummary
+        fields = [
+            "id",
+            "estimate_period",
+            "staff",
+            "staff_display_name_snapshot",
+            "employee_code_snapshot",
+            "employment_type_snapshot",
+            "base_hourly_rate_snapshot",
+            "fixed_monthly_amount_snapshot",
+            "worked_days",
+            "worked_minutes",
+            "worked_hours_decimal",
+            "base_pay_total",
+            "allowance_total",
+            "estimated_total",
+            "warning_count",
+            "error_count",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class LaborCostEstimateAllowanceSnapshotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LaborCostEstimateAllowanceSnapshot
+        fields = [
+            "id",
+            "estimate_period",
+            "staff",
+            "staff_display_name_snapshot",
+            "employee_code_snapshot",
+            "allowance_assignment",
+            "code_snapshot",
+            "name_snapshot",
+            "allowance_type_snapshot",
+            "amount_snapshot",
+            "quantity",
+            "estimated_amount",
+            "warning_count",
+            "warnings",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class LaborCostEstimateFinalizeSerializer(serializers.Serializer):
+    acknowledge_warnings = serializers.BooleanField(default=False)
+    validation_fingerprint = serializers.CharField(max_length=64)
+    manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+
+
+class LaborCostEstimateManagerNoteSerializer(serializers.Serializer):
     manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
 
 

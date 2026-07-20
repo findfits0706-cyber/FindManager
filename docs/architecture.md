@@ -44,6 +44,7 @@
   - Shift change requests for published shifts
   - Attendance records, immutable attendance events, and attendance correction requests
   - Attendance closing periods, record snapshots, and staff monthly summaries
+  - Staff compensation profiles, allowance assignments, and labor cost estimate snapshots
 
 ## Phase 2 Domain Rules
 
@@ -64,6 +65,7 @@
 - Monthly shift planning page
 - Daily/weekly shift timeline page
 - Monthly attendance closing page and self-service monthly attendance page
+- Labor cost estimate pages for rates, allowances, and monthly estimate review
 
 ## Phase 3 Domain Rules
 
@@ -145,6 +147,20 @@
 - Reopening changes the period to `reopened` and unlocks the month. Existing snapshots remain as history and are recreated on the next close.
 - CSV export uses UTF-8 with BOM so Japanese headers and staff names open correctly in common spreadsheet tools.
 - Payroll calculation, wage rates, overtime/legal judgement, paid leave, PDF, Excel, notifications, and external integrations remain outside this phase.
+
+## Labor Cost Estimates
+
+- Labor cost estimate APIs are management-only and require `system_admin` or `shift_manager`.
+- `StaffCompensationProfile` stores staff wage-rate settings by location, staff, employment type, and effective date range. Active overlapping periods for the same location and staff are rejected.
+- `StaffAllowanceAssignment` stores allowance settings by location, staff, code, allowance type, amount, and effective date range. Active overlapping periods for the same location, staff, and code are rejected.
+- `LaborCostEstimatePeriod` is unique for active location/year/month combinations and can link to the matching `AttendanceClosingPeriod`.
+- Preview prefers closed attendance snapshots. If the month is not closed, preview can use live attendance closing data but includes an `attendance_not_closed` warning and cannot be finalized.
+- Finalize requires a closed attendance period, the latest `validation_fingerprint`, no errors, and explicit warning acknowledgement when warnings exist.
+- Finalize recreates `LaborCostEstimateRecordSnapshot`, `LaborCostEstimateStaffSummary`, and `LaborCostEstimateAllowanceSnapshot` rows in one transaction.
+- `content_hash` is generated from stable sorted attendance snapshot, profile, allowance, and calculation content. `validation_fingerprint` is generated from warning/error content.
+- CSV export uses UTF-8 with BOM and always labels values as estimates. Finalized periods export saved snapshots; unfinalized periods export preview data.
+- Attendance monthly closing responses expose only labor estimate ID/status/name for navigation. Wage amounts and estimate totals are not shown on attendance or staff self-service screens.
+- Payroll finalization, payslips, taxes, social insurance, statutory premiums, paid leave balances, PDF/Excel, notifications, and external payroll/accounting integrations remain outside this phase.
 
 ## Quality Gates
 

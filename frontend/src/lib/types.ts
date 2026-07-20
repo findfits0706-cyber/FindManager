@@ -576,6 +576,9 @@ export type AttendanceClosingPeriod = {
   reopened_by_display_name: string;
   snapshot_count: number;
   staff_summary_count: number;
+  labor_cost_estimate_period: string | null;
+  labor_cost_estimate_status: string;
+  labor_cost_estimate_name: string;
   created_at: string;
   updated_at: string;
   is_active: boolean;
@@ -713,6 +716,185 @@ export type MyAttendanceMonthlyItem = {
 export type MyAttendanceMonthlyResponse = {
   results: MyAttendanceMonthlyItem[];
   count: number;
+};
+
+export type LaborCostEmploymentType = "hourly" | "monthly_fixed" | "other";
+export type LaborCostAllowanceType = "per_worked_day" | "per_worked_hour" | "fixed_monthly" | "manual";
+export type LaborCostEstimateStatus = "draft" | "review" | "finalized" | "reopened" | "archived";
+
+export type StaffCompensationProfile = {
+  id: string;
+  location: string;
+  location_name: string;
+  location_code: string;
+  staff: string;
+  staff_display_name: string;
+  employee_code: string;
+  employment_type: LaborCostEmploymentType;
+  base_hourly_rate: string | null;
+  fixed_monthly_amount: string | null;
+  valid_from: string;
+  valid_to: string | null;
+  notes: string;
+  created_at: string;
+  updated_at: string;
+  is_active: boolean;
+};
+
+export type StaffAllowanceAssignment = {
+  id: string;
+  location: string;
+  location_name: string;
+  location_code: string;
+  staff: string;
+  staff_display_name: string;
+  employee_code: string;
+  code: string;
+  name: string;
+  allowance_type: LaborCostAllowanceType;
+  amount: string;
+  valid_from: string;
+  valid_to: string | null;
+  notes: string;
+  created_at: string;
+  updated_at: string;
+  is_active: boolean;
+};
+
+export type LaborCostIssue = {
+  severity: "warning" | "error";
+  code: string;
+  message: string;
+};
+
+export type LaborCostEstimatePeriod = {
+  id: string;
+  location: string;
+  location_name: string;
+  location_code: string;
+  year: number;
+  month: number;
+  attendance_closing_period: string | null;
+  attendance_closing_period_name: string;
+  attendance_closing_period_status: string;
+  name: string;
+  description: string;
+  status: LaborCostEstimateStatus;
+  content_hash: string;
+  validation_fingerprint: string;
+  finalized_at: string | null;
+  finalized_by: string | null;
+  finalized_by_display_name: string;
+  reopened_at: string | null;
+  reopened_by: string | null;
+  reopened_by_display_name: string;
+  record_snapshot_count: number;
+  staff_summary_count: number;
+  allowance_snapshot_count: number;
+  created_at: string;
+  updated_at: string;
+  is_active: boolean;
+};
+
+export type LaborCostEstimateRecordSnapshot = {
+  id?: string;
+  estimate_period?: string;
+  attendance_closing_snapshot: string | null;
+  attendance_record: string | null;
+  location: string;
+  location_code?: string;
+  location_name?: string;
+  location_code_snapshot?: string;
+  location_name_snapshot?: string;
+  staff: string;
+  staff_display_name?: string;
+  staff_display_name_snapshot?: string;
+  employee_code?: string;
+  employee_code_snapshot?: string;
+  work_date: string;
+  employment_type_snapshot: string;
+  base_hourly_rate_snapshot: string | null;
+  fixed_monthly_amount_snapshot: string | null;
+  worked_minutes: number;
+  worked_hours_decimal: string;
+  base_pay: string;
+  allowance_total: string;
+  estimated_total: string;
+  warning_count: number;
+  warnings: LaborCostIssue[];
+  error_count: number;
+  errors: LaborCostIssue[];
+};
+
+export type LaborCostEstimateStaffSummary = {
+  id?: string;
+  estimate_period?: string;
+  staff: string;
+  staff_display_name_snapshot: string;
+  employee_code_snapshot: string;
+  employment_type_snapshot: string;
+  base_hourly_rate_snapshot: string | null;
+  fixed_monthly_amount_snapshot: string | null;
+  worked_days: number;
+  worked_minutes: number;
+  worked_hours_decimal: string;
+  base_pay_total: string;
+  allowance_total: string;
+  estimated_total: string;
+  warning_count: number;
+  error_count: number;
+};
+
+export type LaborCostEstimateAllowanceSnapshot = {
+  id?: string;
+  estimate_period?: string;
+  staff: string;
+  staff_display_name_snapshot: string;
+  employee_code_snapshot: string;
+  allowance_assignment: string | null;
+  code_snapshot: string;
+  name_snapshot: string;
+  allowance_type_snapshot: string;
+  amount_snapshot: string;
+  quantity: string;
+  estimated_amount: string;
+  warning_count: number;
+  warnings: LaborCostIssue[];
+};
+
+export type LaborCostEstimatePreview = {
+  period: string;
+  location: string;
+  location_name: string;
+  location_code: string;
+  year: number;
+  month: number;
+  status: LaborCostEstimateStatus;
+  attendance_closing_period: string | null;
+  attendance_closing_status: string;
+  source_status: "closed" | "live";
+  content_hash: string;
+  validation_fingerprint: string;
+  summary: {
+    date_from: string;
+    date_to: string;
+    record_snapshot_count: number;
+    staff_summary_count: number;
+    allowance_snapshot_count: number;
+    staff_count: number;
+    warning_count: number;
+    error_count: number;
+    worked_minutes: number;
+    worked_hours_decimal: string;
+    base_pay_total: string;
+    allowance_total: string;
+    estimated_total: string;
+  };
+  issues: LaborCostIssue[];
+  record_snapshots: LaborCostEstimateRecordSnapshot[];
+  staff_summaries: LaborCostEstimateStaffSummary[];
+  allowance_snapshots: LaborCostEstimateAllowanceSnapshot[];
+  can_finalize: boolean;
 };
 
 export type AttendanceRecord = AttendanceSummary & {

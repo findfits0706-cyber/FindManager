@@ -146,6 +146,16 @@ button:disabled {
   cursor: wait;
 }
 
+.btn-link {
+  display: inline;
+  margin: 0;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #136f63;
+  text-decoration: underline;
+}
+
 .error {
   color: #aa2e25;
 }
@@ -314,6 +324,43 @@ button:disabled {
   overflow: auto;
   border: 1px solid #dbe4ec;
   border-radius: 8px;
+}
+
+.labor-page {
+  display: grid;
+  gap: 16px;
+}
+
+.labor-page .table {
+  min-width: 920px;
+}
+
+.preview-block {
+  display: grid;
+  gap: 16px;
+  overflow-x: auto;
+}
+
+.summary-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.summary-strip span,
+.issue-list li {
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: #eef6f4;
+}
+
+.issue-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0;
+  margin: 0;
+  list-style: none;
 }
 
 .monthly-grid {

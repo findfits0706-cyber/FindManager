@@ -22,6 +22,7 @@ export function AppShell() {
   const canViewOperations = isSystemAdmin || isShiftManager || isSupervisor;
   const canViewAssignments = isSystemAdmin || isShiftManager || isSupervisor;
   const canViewShiftSettings = isSystemAdmin || isShiftManager || isSupervisor;
+  const canManageLaborCosts = isSystemAdmin || isShiftManager;
   const canViewSelfPages = canViewOperations || isStaff || isViewer;
 
   const navItems: NavItem[] = [
@@ -52,6 +53,13 @@ export function AppShell() {
           { to: "/shifts/request-periods", label: "希望提出管理" },
           { to: "/shifts/patterns", label: "勤務パターン" },
           { to: "/shifts/templates", label: "週間テンプレート" },
+        ]
+      : []),
+    ...(canManageLaborCosts
+      ? [
+          { to: "/labor-cost/rates", label: "勤務単価設定" },
+          { to: "/labor-cost/allowances", label: "手当設定" },
+          { to: "/labor-cost/monthly", label: "概算人件費" },
         ]
       : []),
     ...(canViewSelfPages

@@ -20,6 +20,10 @@ from .models import (
     AttendanceCorrectionRequest,
     AttendanceEvent,
     AttendanceRecord,
+    LaborCostEstimateAllowanceSnapshot,
+    LaborCostEstimatePeriod,
+    LaborCostEstimateRecordSnapshot,
+    LaborCostEstimateStaffSummary,
     MonthlyShiftAssignment,
     MonthlyShiftPlan,
     MonthlyShiftPublication,
@@ -31,6 +35,8 @@ from .models import (
     ShiftRequestItem,
     ShiftRequestPeriod,
     ShiftRequestSubmission,
+    StaffAllowanceAssignment,
+    StaffCompensationProfile,
     WeeklyShiftTemplate,
 )
 from .serializers import (
@@ -46,6 +52,12 @@ from .serializers import (
     AttendanceManagerNoteSerializer,
     AttendanceManualAdjustSerializer,
     AttendanceRecordSerializer,
+    LaborCostEstimateAllowanceSnapshotSerializer,
+    LaborCostEstimateFinalizeSerializer,
+    LaborCostEstimateManagerNoteSerializer,
+    LaborCostEstimatePeriodSerializer,
+    LaborCostEstimateRecordSnapshotSerializer,
+    LaborCostEstimateStaffSummarySerializer,
     MonthlyShiftAssignmentListSerializer,
     MonthlyShiftAssignmentSerializer,
     MonthlyShiftPlanListSerializer,
@@ -67,6 +79,8 @@ from .serializers import (
     ShiftRequestReturnSerializer,
     ShiftRequestSubmissionSaveSerializer,
     ShiftRequestSubmissionSerializer,
+    StaffAllowanceAssignmentSerializer,
+    StaffCompensationProfileSerializer,
     TemplateGenerationSerializer,
     WeeklyShiftTemplateDuplicateSerializer,
     WeeklyShiftTemplateListSerializer,
@@ -80,13 +94,16 @@ from .services import (
     approve_attendance_correction_request,
     approve_shift_change_request,
     archive_attendance_period,
+    archive_labor_cost_estimate,
     attendance_closing_period_metadata,
     attendance_correction_metadata,
     attendance_record_metadata,
     attendance_record_summary,
     build_attendance_closing_preview,
     build_capability_lookup,
+    build_labor_cost_preview,
     build_publication_preview,
+    can_manage_labor_costs,
     can_manage_shifts,
     can_view_shifts,
     cancel_attendance_correction_request,
@@ -102,6 +119,8 @@ from .services import (
     duplicate_weekly_template,
     ensure_monthly_plan_editable,
     export_attendance_closing_csv,
+    export_labor_cost_estimate_csv,
+    finalize_labor_cost_estimate,
     get_attendance_closed_period_lookup,
     get_attendance_lookup,
     get_or_create_shift_request_submission,
@@ -110,6 +129,7 @@ from .services import (
     get_shift_request_info_lookup,
     get_shift_request_lookup,
     get_shift_request_target_staff_counts,
+    labor_cost_estimate_period_metadata,
     lock_shift_request_submission,
     manual_adjust_attendance_record,
     month_dates,
@@ -122,6 +142,7 @@ from .services import (
     reject_attendance_correction_request,
     reject_shift_change_request,
     reopen_attendance_period,
+    reopen_labor_cost_estimate,
     reopen_monthly_shift_plan,
     return_shift_request_submission,
     save_attendance_correction_request,
@@ -262,15 +283,25 @@ def attendance_correction_queryset():
 
 
 def attendance_closing_period_queryset():
-    return AttendanceClosingPeriod.objects.select_related(
-        "location",
-        "closed_by",
-        "reopened_by",
-        "created_by",
-        "updated_by",
-    ).annotate(
-        snapshot_total=Count("record_snapshots", distinct=True),
-        staff_summary_total=Count("staff_summaries", distinct=True),
+    return (
+        AttendanceClosingPeriod.objects.select_related(
+            "location",
+            "closed_by",
+            "reopened_by",
+            "created_by",
+            "updated_by",
+        )
+        .prefetch_related(
+            Prefetch(
+                "labor_cost_estimate_periods",
+                queryset=LaborCostEstimatePeriod.objects.filter(is_active=True).order_by("created_at"),
+                to_attr="prefetched_labor_cost_periods",
+            )
+        )
+        .annotate(
+            snapshot_total=Count("record_snapshots", distinct=True),
+            staff_summary_total=Count("staff_summaries", distinct=True),
+        )
     )
 
 
@@ -285,6 +316,86 @@ def attendance_closing_snapshot_queryset():
 
 def attendance_closing_staff_summary_queryset():
     return AttendanceClosingStaffSummary.objects.select_related("closing_period", "staff")
+
+
+def staff_compensation_profile_queryset():
+    return StaffCompensationProfile.objects.select_related(
+        "location",
+        "staff",
+        "created_by",
+        "updated_by",
+    )
+
+
+def staff_allowance_assignment_queryset():
+    return StaffAllowanceAssignment.objects.select_related(
+        "location",
+        "staff",
+        "created_by",
+        "updated_by",
+    )
+
+
+def labor_cost_estimate_period_queryset():
+    return LaborCostEstimatePeriod.objects.select_related(
+        "location",
+        "attendance_closing_period",
+        "finalized_by",
+        "reopened_by",
+        "created_by",
+        "updated_by",
+    ).annotate(
+        record_snapshot_total=Count("record_snapshots", distinct=True),
+        staff_summary_total=Count("staff_summaries", distinct=True),
+        allowance_snapshot_total=Count("allowance_snapshots", distinct=True),
+    )
+
+
+def labor_cost_record_snapshot_queryset():
+    return LaborCostEstimateRecordSnapshot.objects.select_related(
+        "estimate_period",
+        "attendance_closing_snapshot",
+        "attendance_record",
+        "location",
+        "staff",
+    )
+
+
+def labor_cost_staff_summary_queryset():
+    return LaborCostEstimateStaffSummary.objects.select_related("estimate_period", "staff")
+
+
+def labor_cost_allowance_snapshot_queryset():
+    return LaborCostEstimateAllowanceSnapshot.objects.select_related(
+        "estimate_period",
+        "staff",
+        "allowance_assignment",
+    )
+
+
+def staff_compensation_profile_metadata(profile: StaffCompensationProfile) -> dict:
+    return {
+        "staff_compensation_profile_id": str(profile.id),
+        "location_id": str(profile.location_id),
+        "staff_id": str(profile.staff_id),
+        "employment_type": profile.employment_type,
+        "valid_from": profile.valid_from.isoformat(),
+        "valid_to": profile.valid_to.isoformat() if profile.valid_to else None,
+        "is_active": profile.is_active,
+    }
+
+
+def staff_allowance_assignment_metadata(assignment: StaffAllowanceAssignment) -> dict:
+    return {
+        "staff_allowance_assignment_id": str(assignment.id),
+        "location_id": str(assignment.location_id),
+        "staff_id": str(assignment.staff_id),
+        "code": assignment.code,
+        "allowance_type": assignment.allowance_type,
+        "valid_from": assignment.valid_from.isoformat(),
+        "valid_to": assignment.valid_to.isoformat() if assignment.valid_to else None,
+        "is_active": assignment.is_active,
+    }
 
 
 def drf_validation_from_django(exc):
@@ -1863,6 +1974,340 @@ class AttendanceClosingPeriodViewSet(viewsets.ModelViewSet):
                 metadata=attendance_closing_period_metadata(period)
                 | {
                     "snapshot_count": summary.get("snapshot_count", 0),
+                    "warning_count": summary.get("warning_count", 0),
+                    "error_count": summary.get("error_count", 0),
+                },
+            )
+        response = HttpResponse(data, content_type="text/csv; charset=utf-8")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+
+class LaborCostManagementPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_authenticated and can_manage_labor_costs(request.user))
+
+    def has_object_permission(self, request, view, obj):
+        return self.has_permission(request, view)
+
+
+class StaffCompensationProfileViewSet(viewsets.ModelViewSet):
+    permission_classes = [LaborCostManagementPermission]
+    serializer_class = StaffCompensationProfileSerializer
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_queryset(self):
+        params = self.request.query_params
+        queryset = staff_compensation_profile_queryset()
+        if params.get("location"):
+            queryset = queryset.filter(location_id=params["location"])
+        if params.get("staff"):
+            queryset = queryset.filter(staff_id=params["staff"])
+        if params.get("employment_type"):
+            queryset = queryset.filter(employment_type=params["employment_type"])
+        if params.get("valid_on"):
+            valid_on = date.fromisoformat(params["valid_on"])
+            queryset = queryset.filter(valid_from__lte=valid_on).filter(
+                Q(valid_to__isnull=True) | Q(valid_to__gte=valid_on)
+            )
+        if params.get("is_active") == "true":
+            queryset = queryset.filter(is_active=True)
+        if params.get("is_active") == "false":
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("location__display_order", "staff__employee_code", "-valid_from", "created_at")
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                profile = serializer.save()
+                record_shift_event(
+                    entity="staff_compensation_profile",
+                    action="create",
+                    actor=request.user,
+                    request=request,
+                    metadata=staff_compensation_profile_metadata(profile),
+                )
+        except (DjangoValidationError, IntegrityError) as exc:
+            raise drf_validation_from_django(exc) from exc
+        return Response(self.get_serializer(staff_compensation_profile_queryset().get(pk=profile.pk)).data, status=201)
+
+    def partial_update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        was_active = instance.is_active
+        serializer = self.get_serializer(instance, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                profile = serializer.save()
+                action_name = "deactivate" if was_active and not profile.is_active else "update"
+                record_shift_event(
+                    entity="staff_compensation_profile",
+                    action=action_name,
+                    actor=request.user,
+                    request=request,
+                    metadata=staff_compensation_profile_metadata(profile),
+                )
+        except (DjangoValidationError, IntegrityError) as exc:
+            raise drf_validation_from_django(exc) from exc
+        return Response(self.get_serializer(staff_compensation_profile_queryset().get(pk=profile.pk)).data)
+
+
+class StaffAllowanceAssignmentViewSet(viewsets.ModelViewSet):
+    permission_classes = [LaborCostManagementPermission]
+    serializer_class = StaffAllowanceAssignmentSerializer
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_queryset(self):
+        params = self.request.query_params
+        queryset = staff_allowance_assignment_queryset()
+        if params.get("location"):
+            queryset = queryset.filter(location_id=params["location"])
+        if params.get("staff"):
+            queryset = queryset.filter(staff_id=params["staff"])
+        if params.get("code"):
+            queryset = queryset.filter(code=params["code"])
+        if params.get("allowance_type"):
+            queryset = queryset.filter(allowance_type=params["allowance_type"])
+        if params.get("valid_on"):
+            valid_on = date.fromisoformat(params["valid_on"])
+            queryset = queryset.filter(valid_from__lte=valid_on).filter(
+                Q(valid_to__isnull=True) | Q(valid_to__gte=valid_on)
+            )
+        if params.get("is_active") == "true":
+            queryset = queryset.filter(is_active=True)
+        if params.get("is_active") == "false":
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("location__display_order", "staff__employee_code", "code", "-valid_from", "created_at")
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                assignment = serializer.save()
+                record_shift_event(
+                    entity="staff_allowance_assignment",
+                    action="create",
+                    actor=request.user,
+                    request=request,
+                    metadata=staff_allowance_assignment_metadata(assignment),
+                )
+        except (DjangoValidationError, IntegrityError) as exc:
+            raise drf_validation_from_django(exc) from exc
+        return Response(
+            self.get_serializer(staff_allowance_assignment_queryset().get(pk=assignment.pk)).data,
+            status=201,
+        )
+
+    def partial_update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        was_active = instance.is_active
+        serializer = self.get_serializer(instance, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                assignment = serializer.save()
+                action_name = "deactivate" if was_active and not assignment.is_active else "update"
+                record_shift_event(
+                    entity="staff_allowance_assignment",
+                    action=action_name,
+                    actor=request.user,
+                    request=request,
+                    metadata=staff_allowance_assignment_metadata(assignment),
+                )
+        except (DjangoValidationError, IntegrityError) as exc:
+            raise drf_validation_from_django(exc) from exc
+        return Response(self.get_serializer(staff_allowance_assignment_queryset().get(pk=assignment.pk)).data)
+
+
+class LaborCostEstimatePeriodViewSet(viewsets.ModelViewSet):
+    permission_classes = [LaborCostManagementPermission]
+    serializer_class = LaborCostEstimatePeriodSerializer
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_queryset(self):
+        params = self.request.query_params
+        queryset = labor_cost_estimate_period_queryset()
+        if params.get("location"):
+            queryset = queryset.filter(location_id=params["location"])
+        if params.get("year"):
+            queryset = queryset.filter(year=params["year"])
+        if params.get("month"):
+            queryset = queryset.filter(month=params["month"])
+        if params.get("status"):
+            queryset = queryset.filter(status=params["status"])
+        if params.get("is_active") == "true":
+            queryset = queryset.filter(is_active=True)
+        if params.get("is_active") == "false":
+            queryset = queryset.filter(is_active=False)
+        return queryset.order_by("-year", "-month", "location__display_order", "created_at")
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                period = serializer.save()
+                record_shift_event(
+                    entity="labor_cost_estimate_period",
+                    action="create",
+                    actor=request.user,
+                    request=request,
+                    metadata=labor_cost_estimate_period_metadata(period),
+                )
+        except (DjangoValidationError, IntegrityError) as exc:
+            raise drf_validation_from_django(exc) from exc
+        return Response(self.get_serializer(labor_cost_estimate_period_queryset().get(pk=period.pk)).data, status=201)
+
+    def partial_update(self, request, *args, **kwargs):
+        serializer = self.get_serializer(self.get_object(), data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                period = serializer.save()
+                record_shift_event(
+                    entity="labor_cost_estimate_period",
+                    action="update",
+                    actor=request.user,
+                    request=request,
+                    metadata=labor_cost_estimate_period_metadata(period),
+                )
+        except (DjangoValidationError, IntegrityError) as exc:
+            raise drf_validation_from_django(exc) from exc
+        return Response(self.get_serializer(labor_cost_estimate_period_queryset().get(pk=period.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def preview(self, request, pk=None):
+        with transaction.atomic():
+            period = (
+                LaborCostEstimatePeriod.objects.select_for_update(of=("self",))
+                .select_related("location", "attendance_closing_period")
+                .get(pk=self.get_object().pk)
+            )
+            if period.status == LaborCostEstimatePeriod.Status.ARCHIVED or not period.is_active:
+                raise ValidationError({"status": "アーカイブ済みの概算人件費periodは操作できません。"})
+            if period.status in {LaborCostEstimatePeriod.Status.DRAFT, LaborCostEstimatePeriod.Status.REOPENED}:
+                period.status = LaborCostEstimatePeriod.Status.REVIEW
+                period.updated_by = request.user
+                period.full_clean()
+                period.save(update_fields=["status", "updated_by", "updated_at"])
+            preview = build_labor_cost_preview(period)
+            record_shift_event(
+                entity="labor_cost_estimate_period",
+                action="preview",
+                actor=request.user,
+                request=request,
+                metadata=labor_cost_estimate_period_metadata(period, preview),
+            )
+        return Response(preview)
+
+    @action(detail=True, methods=["post"])
+    def finalize(self, request, pk=None):
+        serializer = LaborCostEstimateFinalizeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            period, preview = finalize_labor_cost_estimate(
+                period=self.get_object(),
+                actor=request.user,
+                acknowledge_warnings=serializer.validated_data["acknowledge_warnings"],
+                validation_fingerprint=serializer.validated_data["validation_fingerprint"],
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="labor_cost_estimate_period",
+                action="finalize",
+                actor=request.user,
+                request=request,
+                metadata=labor_cost_estimate_period_metadata(period, preview),
+            )
+        return Response(self.get_serializer(labor_cost_estimate_period_queryset().get(pk=period.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def reopen(self, request, pk=None):
+        serializer = LaborCostEstimateManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            period = reopen_labor_cost_estimate(
+                period=self.get_object(),
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="labor_cost_estimate_period",
+                action="reopen",
+                actor=request.user,
+                request=request,
+                metadata=labor_cost_estimate_period_metadata(period),
+            )
+        return Response(self.get_serializer(labor_cost_estimate_period_queryset().get(pk=period.pk)).data)
+
+    @action(detail=True, methods=["post"])
+    def archive(self, request, pk=None):
+        serializer = LaborCostEstimateManagerNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            period = archive_labor_cost_estimate(
+                period=self.get_object(),
+                actor=request.user,
+                manager_note=serializer.validated_data.get("manager_note", ""),
+            )
+            record_shift_event(
+                entity="labor_cost_estimate_period",
+                action="archive",
+                actor=request.user,
+                request=request,
+                metadata=labor_cost_estimate_period_metadata(period),
+            )
+        return Response(self.get_serializer(labor_cost_estimate_period_queryset().get(pk=period.pk)).data)
+
+    @action(detail=True, methods=["get"], url_path="record-snapshots")
+    def record_snapshots(self, request, pk=None):
+        period = self.get_object()
+        queryset = (
+            labor_cost_record_snapshot_queryset()
+            .filter(estimate_period=period)
+            .order_by("work_date", "employee_code_snapshot")
+        )
+        serializer = LaborCostEstimateRecordSnapshotSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["get"], url_path="staff-summaries")
+    def staff_summaries(self, request, pk=None):
+        period = self.get_object()
+        queryset = (
+            labor_cost_staff_summary_queryset()
+            .filter(estimate_period=period)
+            .order_by("employee_code_snapshot", "staff_display_name_snapshot")
+        )
+        serializer = LaborCostEstimateStaffSummarySerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["get"], url_path="allowance-snapshots")
+    def allowance_snapshots(self, request, pk=None):
+        period = self.get_object()
+        queryset = (
+            labor_cost_allowance_snapshot_queryset()
+            .filter(estimate_period=period)
+            .order_by("employee_code_snapshot", "code_snapshot")
+        )
+        serializer = LaborCostEstimateAllowanceSnapshotSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["get"], url_path="export-csv")
+    def export_csv(self, request, pk=None):
+        period = self.get_object()
+        with transaction.atomic():
+            data, filename, summary = export_labor_cost_estimate_csv(period)
+            record_shift_event(
+                entity="labor_cost_estimate_period",
+                action="export",
+                actor=request.user,
+                request=request,
+                metadata=labor_cost_estimate_period_metadata(period)
+                | {
+                    "record_snapshot_count": summary.get("record_snapshot_count", 0),
                     "warning_count": summary.get("warning_count", 0),
                     "error_count": summary.get("error_count", 0),
                 },

@@ -1,5 +1,6 @@
 import uuid
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
@@ -25,6 +26,10 @@ from ..models import (
     AttendanceCorrectionRequest,
     AttendanceEvent,
     AttendanceRecord,
+    LaborCostEstimateAllowanceSnapshot,
+    LaborCostEstimatePeriod,
+    LaborCostEstimateRecordSnapshot,
+    LaborCostEstimateStaffSummary,
     MonthlyShiftAssignment,
     MonthlyShiftPlan,
     MonthlyShiftPublication,
@@ -34,11 +39,14 @@ from ..models import (
     ShiftPatternSegment,
     ShiftRequestPeriod,
     ShiftRequestSubmission,
+    StaffAllowanceAssignment,
+    StaffCompensationProfile,
     WeeklyShiftTemplate,
     WeeklyShiftTemplateEntry,
 )
 from ..services import (
     build_attendance_closing_preview,
+    build_labor_cost_preview,
     build_monthly_plan_content_hash,
     build_publication_preview,
     seed_shifts,
@@ -1533,6 +1541,398 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
             )
         self.assertEqual(large_response.status_code, 200, large_response.data)
         self.assertGreaterEqual(large_response.data["summary"]["snapshot_count"], 40)
+        self.assertLessEqual(self.select_query_count(large_queries) - self.select_query_count(small_queries), 4)
+
+    def create_closed_attendance_period_with_record(self, *, month=7, staff=None, worked_minutes=420):
+        staff = staff or self.staff
+        plan = self.create_plan(month=month)
+        work_date = f"2026-{month:02d}-01"
+        assignment = self.create_assignment_record(
+            plan,
+            staff=staff,
+            work_date=work_date,
+            start_offset_minutes=540,
+            end_offset_minutes=1020,
+        )
+        publication = self.publish_plan(plan)
+        publication_assignment = publication.assignments.get(source_assignment=assignment)
+        AttendanceRecord.objects.create(
+            location=self.location,
+            staff=staff,
+            work_date=work_date,
+            monthly_shift_plan=plan,
+            monthly_shift_assignment=assignment,
+            publication=publication,
+            publication_assignment=publication_assignment,
+            status=AttendanceRecord.Status.CONFIRMED,
+            source=AttendanceRecord.Source.SCHEDULED,
+            scheduled_start_offset_minutes=540,
+            scheduled_end_offset_minutes=1020,
+            actual_clock_in_at=timezone.make_aware(datetime(2026, month, 1, 9, 0)),
+            actual_clock_out_at=timezone.make_aware(datetime(2026, month, 1, 17, 0)),
+            actual_start_offset_minutes=540,
+            actual_end_offset_minutes=1020,
+            break_minutes=60,
+            worked_minutes=worked_minutes,
+            confirmed_at=timezone.now(),
+            confirmed_by=self.system_admin,
+        )
+        client = self.force_client(self.system_admin)
+        created = client.post(
+            "/api/v1/attendance-closing-periods/",
+            {
+                "location": str(self.location.id),
+                "year": 2026,
+                "month": month,
+                "name": f"2026年{month}月 月次勤怠締め",
+            },
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        preview = client.post(f"/api/v1/attendance-closing-periods/{created.data['id']}/preview/", {}, format="json")
+        self.assertEqual(preview.status_code, 200, preview.data)
+        closed = client.post(
+            f"/api/v1/attendance-closing-periods/{created.data['id']}/close/",
+            {
+                "acknowledge_warnings": True,
+                "validation_fingerprint": preview.data["validation_fingerprint"],
+            },
+            format="json",
+        )
+        self.assertEqual(closed.status_code, 200, closed.data)
+        return AttendanceClosingPeriod.objects.get(id=created.data["id"])
+
+    def test_labor_cost_master_preview_finalize_csv_permissions_and_audit(self):
+        closing_period = self.create_closed_attendance_period_with_record()
+        client = self.force_client(self.system_admin)
+        period = client.post(
+            "/api/v1/labor-cost-estimate-periods/",
+            {
+                "location": str(self.location.id),
+                "year": 2026,
+                "month": 7,
+                "attendance_closing_period": str(closing_period.id),
+                "name": "2026年7月 概算人件費",
+            },
+            format="json",
+        )
+        self.assertEqual(period.status_code, 201, period.data)
+        period_id = period.data["id"]
+
+        missing_rate = client.post(f"/api/v1/labor-cost-estimate-periods/{period_id}/preview/", {}, format="json")
+        self.assertEqual(missing_rate.status_code, 200, missing_rate.data)
+        self.assertGreater(missing_rate.data["summary"]["error_count"], 0)
+        self.assertTrue(
+            any(
+                error["code"] == "staff_compensation_profile_missing"
+                for item in missing_rate.data["record_snapshots"]
+                for error in item["errors"]
+            )
+        )
+
+        profile = client.post(
+            "/api/v1/staff-compensation-profiles/",
+            {
+                "location": str(self.location.id),
+                "staff": str(self.staff.id),
+                "employment_type": StaffCompensationProfile.EmploymentType.HOURLY,
+                "base_hourly_rate": "1200.00",
+                "valid_from": "2026-07-01",
+                "valid_to": "2026-07-31",
+                "notes": "概算用",
+            },
+            format="json",
+        )
+        self.assertEqual(profile.status_code, 201, profile.data)
+        duplicate_profile = client.post(
+            "/api/v1/staff-compensation-profiles/",
+            {
+                "location": str(self.location.id),
+                "staff": str(self.staff.id),
+                "employment_type": StaffCompensationProfile.EmploymentType.HOURLY,
+                "base_hourly_rate": "1250.00",
+                "valid_from": "2026-07-15",
+            },
+            format="json",
+        )
+        self.assertEqual(duplicate_profile.status_code, 400)
+        self.assertEqual(
+            self.force_client(self.supervisor).get("/api/v1/staff-compensation-profiles/").status_code,
+            403,
+        )
+        self.assertEqual(self.force_client(self.staff).get("/api/v1/staff-allowance-assignments/").status_code, 403)
+        self.assertEqual(self.force_client(self.viewer).get("/api/v1/labor-cost-estimate-periods/").status_code, 403)
+
+        allowances = [
+            ("day", "日額手当", StaffAllowanceAssignment.AllowanceType.PER_WORKED_DAY, "500.00"),
+            ("hour", "時間手当", StaffAllowanceAssignment.AllowanceType.PER_WORKED_HOUR, "100.00"),
+            ("fixed", "固定手当", StaffAllowanceAssignment.AllowanceType.FIXED_MONTHLY, "1000.00"),
+            ("manual", "手入力手当", StaffAllowanceAssignment.AllowanceType.MANUAL, "999.00"),
+        ]
+        for code, name, allowance_type, amount in allowances:
+            response = client.post(
+                "/api/v1/staff-allowance-assignments/",
+                {
+                    "location": str(self.location.id),
+                    "staff": str(self.staff.id),
+                    "code": code,
+                    "name": name,
+                    "allowance_type": allowance_type,
+                    "amount": amount,
+                    "valid_from": "2026-07-01",
+                    "valid_to": "2026-07-31",
+                },
+                format="json",
+            )
+            self.assertEqual(response.status_code, 201, response.data)
+        duplicate_allowance = client.post(
+            "/api/v1/staff-allowance-assignments/",
+            {
+                "location": str(self.location.id),
+                "staff": str(self.staff.id),
+                "code": "day",
+                "name": "重複日額",
+                "allowance_type": StaffAllowanceAssignment.AllowanceType.PER_WORKED_DAY,
+                "amount": "100.00",
+                "valid_from": "2026-07-15",
+            },
+            format="json",
+        )
+        self.assertEqual(duplicate_allowance.status_code, 400)
+        deactivated = client.patch(
+            f"/api/v1/staff-compensation-profiles/{profile.data['id']}/",
+            {"notes": "更新済み"},
+            format="json",
+        )
+        self.assertEqual(deactivated.status_code, 200, deactivated.data)
+        self.assertTrue(AuditEvent.objects.filter(event_type="staff_compensation_profile_updated").exists())
+        inactive = client.patch(
+            f"/api/v1/staff-compensation-profiles/{profile.data['id']}/",
+            {"is_active": False},
+            format="json",
+        )
+        self.assertEqual(inactive.status_code, 200, inactive.data)
+        self.assertTrue(AuditEvent.objects.filter(event_type="staff_compensation_profile_deactivated").exists())
+        reactivated = client.patch(
+            f"/api/v1/staff-compensation-profiles/{profile.data['id']}/",
+            {"is_active": True},
+            format="json",
+        )
+        self.assertEqual(reactivated.status_code, 200, reactivated.data)
+
+        preview = client.post(f"/api/v1/labor-cost-estimate-periods/{period_id}/preview/", {}, format="json")
+        self.assertEqual(preview.status_code, 200, preview.data)
+        self.assertEqual(preview.data["source_status"], "closed")
+        self.assertEqual(preview.data["summary"]["error_count"], 0, preview.data)
+        self.assertEqual(Decimal(str(preview.data["summary"]["base_pay_total"])), Decimal("8400"))
+        self.assertEqual(Decimal(str(preview.data["summary"]["allowance_total"])), Decimal("2200"))
+        self.assertEqual(Decimal(str(preview.data["summary"]["estimated_total"])), Decimal("10600"))
+        self.assertTrue(
+            any(
+                warning["code"] == "manual_allowance_not_calculated"
+                for item in preview.data["allowance_snapshots"]
+                for warning in item["warnings"]
+            )
+        )
+
+        stale = client.post(
+            f"/api/v1/labor-cost-estimate-periods/{period_id}/finalize/",
+            {"acknowledge_warnings": True, "validation_fingerprint": "bad"},
+            format="json",
+        )
+        self.assertEqual(stale.status_code, 400)
+        no_ack = client.post(
+            f"/api/v1/labor-cost-estimate-periods/{period_id}/finalize/",
+            {"acknowledge_warnings": False, "validation_fingerprint": preview.data["validation_fingerprint"]},
+            format="json",
+        )
+        self.assertEqual(no_ack.status_code, 400)
+        finalized = client.post(
+            f"/api/v1/labor-cost-estimate-periods/{period_id}/finalize/",
+            {
+                "acknowledge_warnings": True,
+                "validation_fingerprint": preview.data["validation_fingerprint"],
+                "manager_note": "概算人件費を確認済み",
+            },
+            format="json",
+        )
+        self.assertEqual(finalized.status_code, 200, finalized.data)
+        self.assertEqual(finalized.data["status"], LaborCostEstimatePeriod.Status.FINALIZED)
+        estimate_period = LaborCostEstimatePeriod.objects.get(id=period_id)
+        self.assertEqual(estimate_period.record_snapshots.count(), preview.data["summary"]["record_snapshot_count"])
+        self.assertEqual(estimate_period.staff_summaries.count(), preview.data["summary"]["staff_summary_count"])
+        self.assertEqual(
+            estimate_period.allowance_snapshots.count(),
+            preview.data["summary"]["allowance_snapshot_count"],
+        )
+        self.assertTrue(LaborCostEstimateRecordSnapshot.objects.filter(estimate_period=estimate_period).exists())
+        self.assertTrue(LaborCostEstimateStaffSummary.objects.filter(estimate_period=estimate_period).exists())
+        self.assertTrue(LaborCostEstimateAllowanceSnapshot.objects.filter(estimate_period=estimate_period).exists())
+        self.assertTrue(AuditEvent.objects.filter(event_type="labor_cost_estimate_finalized").exists())
+
+        csv_response = client.get(f"/api/v1/labor-cost-estimate-periods/{period_id}/export-csv/")
+        self.assertEqual(csv_response.status_code, 200)
+        self.assertEqual(csv_response["Content-Type"], "text/csv; charset=utf-8")
+        self.assertTrue(csv_response.content.startswith(b"\xef\xbb\xbf"))
+        self.assertIn("labor_cost_estimate_main_2026_07.csv", csv_response["Content-Disposition"])
+        self.assertIn("概算合計".encode("utf-8"), csv_response.content)
+        self.assertTrue(AuditEvent.objects.filter(event_type="labor_cost_estimate_exported").exists())
+
+        closing_list = client.get(f"/api/v1/attendance-closing-periods/?location={self.location.id}&year=2026&month=7")
+        self.assertEqual(closing_list.status_code, 200, closing_list.data)
+        closing_result = closing_list.data["results"][0]
+        self.assertEqual(closing_result["labor_cost_estimate_status"], LaborCostEstimatePeriod.Status.FINALIZED)
+        self.assertNotIn("estimated_total", closing_result)
+
+        archive_finalized = client.post(f"/api/v1/labor-cost-estimate-periods/{period_id}/archive/", {}, format="json")
+        self.assertEqual(archive_finalized.status_code, 400)
+        reopened = client.post(f"/api/v1/labor-cost-estimate-periods/{period_id}/reopen/", {}, format="json")
+        self.assertEqual(reopened.status_code, 200, reopened.data)
+        self.assertEqual(reopened.data["status"], LaborCostEstimatePeriod.Status.REOPENED)
+        archived = client.post(f"/api/v1/labor-cost-estimate-periods/{period_id}/archive/", {}, format="json")
+        self.assertEqual(archived.status_code, 200, archived.data)
+        self.assertFalse(LaborCostEstimatePeriod.objects.get(id=period_id).is_active)
+
+    def test_labor_cost_unclosed_live_warning_rollback_hash_and_query_counts(self):
+        client = self.force_client(self.system_admin)
+        with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
+            response = client.post(
+                "/api/v1/staff-compensation-profiles/",
+                {
+                    "location": str(self.location.id),
+                    "staff": str(self.staff.id),
+                    "employment_type": StaffCompensationProfile.EmploymentType.HOURLY,
+                    "base_hourly_rate": "1000.00",
+                    "valid_from": "2026-09-01",
+                },
+                format="json",
+            )
+        self.assertEqual(response.status_code, 500)
+        self.assertFalse(StaffCompensationProfile.objects.filter(base_hourly_rate="1000.00").exists())
+
+        live_period = LaborCostEstimatePeriod.objects.create(
+            location=self.location,
+            year=2026,
+            month=9,
+            name="live",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        live_preview = build_labor_cost_preview(live_period)
+        self.assertEqual(live_preview["source_status"], "live")
+        self.assertTrue(any(issue["code"] == "attendance_not_closed" for issue in live_preview["issues"]))
+        self.assertFalse(live_preview["can_finalize"])
+
+        small_closing = self.create_closed_attendance_period_with_record(month=10)
+        StaffCompensationProfile.objects.create(
+            location=self.location,
+            staff=self.staff,
+            employment_type=StaffCompensationProfile.EmploymentType.HOURLY,
+            base_hourly_rate="1000.00",
+            valid_from="2026-10-01",
+            valid_to="2026-10-31",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        small_period = LaborCostEstimatePeriod.objects.create(
+            location=self.location,
+            year=2026,
+            month=10,
+            attendance_closing_period=small_closing,
+            name="small labor",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        large_plan = self.create_plan(month=11)
+        large_staff = [self.create_user(f"labor_staff_{index}", ROLE_STAFF) for index in range(8)]
+        for staff in large_staff:
+            StaffLocation.objects.create(staff=staff, location=self.location, valid_from="2026-11-01")
+            StaffCompensationProfile.objects.create(
+                location=self.location,
+                staff=staff,
+                employment_type=StaffCompensationProfile.EmploymentType.HOURLY,
+                base_hourly_rate="1000.00",
+                valid_from="2026-11-01",
+                valid_to="2026-11-30",
+                created_by=self.system_admin,
+                updated_by=self.system_admin,
+            )
+            for day in range(1, 6):
+                self.create_assignment_record(
+                    large_plan,
+                    staff=staff,
+                    work_date=f"2026-11-{day:02d}",
+                    start_offset_minutes=540,
+                    end_offset_minutes=600,
+                )
+        large_publication = self.publish_plan(large_plan)
+        for publication_assignment in large_publication.assignments.all():
+            AttendanceRecord.objects.create(
+                location=self.location,
+                staff=publication_assignment.staff,
+                work_date=publication_assignment.work_date,
+                publication=large_publication,
+                publication_assignment=publication_assignment,
+                status=AttendanceRecord.Status.CONFIRMED,
+                source=AttendanceRecord.Source.SCHEDULED,
+                scheduled_start_offset_minutes=540,
+                scheduled_end_offset_minutes=600,
+                actual_start_offset_minutes=540,
+                actual_end_offset_minutes=600,
+                worked_minutes=60,
+                confirmed_at=timezone.now(),
+                confirmed_by=self.system_admin,
+            )
+        large_closing = AttendanceClosingPeriod.objects.create(
+            location=self.location,
+            year=2026,
+            month=11,
+            name="large close",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+        closing_preview = build_attendance_closing_preview(large_closing)
+        client.post(
+            f"/api/v1/attendance-closing-periods/{large_closing.id}/close/",
+            {
+                "acknowledge_warnings": True,
+                "validation_fingerprint": closing_preview["validation_fingerprint"],
+            },
+            format="json",
+        )
+        large_period = LaborCostEstimatePeriod.objects.create(
+            location=self.location,
+            year=2026,
+            month=11,
+            attendance_closing_period=large_closing,
+            name="large labor",
+            created_by=self.system_admin,
+            updated_by=self.system_admin,
+        )
+
+        first = build_labor_cost_preview(small_period)
+        second = build_labor_cost_preview(small_period)
+        self.assertEqual(first["content_hash"], second["content_hash"])
+        self.assertEqual(first["validation_fingerprint"], second["validation_fingerprint"])
+        self.staff.employee_code = "LABOR-CHANGED"
+        self.staff.save(update_fields=["employee_code", "updated_at"])
+        self.assertEqual(first["content_hash"], build_labor_cost_preview(small_period)["content_hash"])
+
+        with CaptureQueriesContext(connection) as small_queries:
+            small_response = client.post(
+                f"/api/v1/labor-cost-estimate-periods/{small_period.id}/preview/",
+                {},
+                format="json",
+            )
+        self.assertEqual(small_response.status_code, 200, small_response.data)
+        with CaptureQueriesContext(connection) as large_queries:
+            large_response = client.post(
+                f"/api/v1/labor-cost-estimate-periods/{large_period.id}/preview/",
+                {},
+                format="json",
+            )
+        self.assertEqual(large_response.status_code, 200, large_response.data)
+        self.assertGreaterEqual(large_response.data["summary"]["record_snapshot_count"], 40)
         self.assertLessEqual(self.select_query_count(large_queries) - self.select_query_count(small_queries), 4)
 
     def test_shift_change_request_my_api_manager_apply_and_matrix_badges(self):

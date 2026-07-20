@@ -8,6 +8,8 @@ import { ProtectedRoute } from "./routes/ProtectedRoute";
 import { ChangePasswordPage } from "./pages/ChangePasswordPage";
 import { ForbiddenPage } from "./pages/ForbiddenPage";
 import { LoginPage } from "./pages/LoginPage";
+import { LaborCostMonthlyPage } from "./pages/LaborCostMonthlyPage";
+import { LaborCostSettingsPage } from "./pages/LaborCostSettingsPage";
 import { MyCapabilitiesPage } from "./pages/MyCapabilitiesPage";
 import { MyAttendancePage } from "./pages/MyAttendancePage";
 import { MyAttendanceMonthlyPage } from "./pages/MyAttendanceMonthlyPage";
@@ -68,6 +70,9 @@ export function App() {
           <Route path="attendance" element={<AttendancePage />} />
           <Route path="attendance/monthly" element={<AttendanceMonthlyPage />} />
           <Route path="attendance/corrections" element={<AttendanceCorrectionRequestsPage />} />
+          <Route path="labor-cost/rates" element={<LaborCostSettingsPage resource="rates" />} />
+          <Route path="labor-cost/allowances" element={<LaborCostSettingsPage resource="allowances" />} />
+          <Route path="labor-cost/monthly" element={<LaborCostMonthlyPage />} />
           <Route path="shifts/monthly" element={<MonthlyShiftsPage />} />
           <Route path="shifts/timeline" element={<ShiftTimelinePage />} />
           <Route path="shifts/change-requests" element={<ShiftChangeRequestsPage />} />

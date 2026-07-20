@@ -6,6 +6,7 @@ import json
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -26,6 +27,10 @@ from .models import (
     AttendanceCorrectionRequest,
     AttendanceEvent,
     AttendanceRecord,
+    LaborCostEstimateAllowanceSnapshot,
+    LaborCostEstimatePeriod,
+    LaborCostEstimateRecordSnapshot,
+    LaborCostEstimateStaffSummary,
     MonthlyShiftAssignment,
     MonthlyShiftPlan,
     MonthlyShiftPublication,
@@ -38,6 +43,8 @@ from .models import (
     ShiftRequestItem,
     ShiftRequestPeriod,
     ShiftRequestSubmission,
+    StaffAllowanceAssignment,
+    StaffCompensationProfile,
     WeeklyShiftTemplate,
     WeeklyShiftTemplateEntry,
 )
@@ -69,6 +76,10 @@ def user_has_any_role(user: User, roles: set[str]) -> bool:
 
 
 def can_manage_shifts(user: User) -> bool:
+    return user_has_any_role(user, MANAGE_ROLES)
+
+
+def can_manage_labor_costs(user: User) -> bool:
     return user_has_any_role(user, MANAGE_ROLES)
 
 
@@ -164,6 +175,25 @@ EVENT_MAP = {
         "reopen": "attendance_closing_period_reopened",
         "archive": "attendance_closing_period_archived",
         "export": "attendance_closing_period_exported",
+    },
+    "staff_compensation_profile": {
+        "create": "staff_compensation_profile_created",
+        "update": "staff_compensation_profile_updated",
+        "deactivate": "staff_compensation_profile_deactivated",
+    },
+    "staff_allowance_assignment": {
+        "create": "staff_allowance_assignment_created",
+        "update": "staff_allowance_assignment_updated",
+        "deactivate": "staff_allowance_assignment_deactivated",
+    },
+    "labor_cost_estimate_period": {
+        "create": "labor_cost_estimate_period_created",
+        "update": "labor_cost_estimate_period_updated",
+        "preview": "labor_cost_estimate_previewed",
+        "finalize": "labor_cost_estimate_finalized",
+        "reopen": "labor_cost_estimate_reopened",
+        "archive": "labor_cost_estimate_archived",
+        "export": "labor_cost_estimate_exported",
     },
 }
 
@@ -2451,6 +2481,1189 @@ def export_attendance_closing_csv(period: AttendanceClosingPeriod) -> tuple[byte
     filename = f"attendance_{period.location.code}_{period.year}_{period.month:02d}.csv"
     data = ("\ufeff" + output.getvalue()).encode("utf-8")
     return data, filename, summary if preview is None else preview["summary"]
+
+
+YEN_QUANT = Decimal("1")
+HOUR_QUANT = Decimal("0.01")
+ZERO_MONEY = Decimal("0")
+
+
+def _decimal(value) -> Decimal:
+    if value is None:
+        return ZERO_MONEY
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
+def _round_yen(value: Decimal) -> Decimal:
+    return value.quantize(YEN_QUANT, rounding=ROUND_HALF_UP)
+
+
+def _hours_from_minutes(minutes: int) -> Decimal:
+    return (Decimal(minutes) / Decimal(60)).quantize(HOUR_QUANT, rounding=ROUND_HALF_UP)
+
+
+def _decimal_payload(value: Decimal | int | str | None) -> str:
+    if value is None:
+        return ""
+    return format(_decimal(value), "f")
+
+
+def _periods_overlap(
+    first_from: date,
+    first_to: date | None,
+    second_from: date,
+    second_to: date | None,
+) -> bool:
+    first_end = first_to or date.max
+    second_end = second_to or date.max
+    return first_from <= second_end and second_from <= first_end
+
+
+def _active_on_day(item, target_date: date) -> bool:
+    return item.valid_from <= target_date and (item.valid_to is None or item.valid_to >= target_date)
+
+
+def _active_during_period(item, start_date: date, end_date: date) -> bool:
+    return item.valid_from <= end_date and (item.valid_to is None or item.valid_to >= start_date)
+
+
+def get_staff_compensation_profile_for_date(
+    *,
+    location: Location,
+    staff: User,
+    target_date: date,
+) -> StaffCompensationProfile | None:
+    profiles = list(
+        StaffCompensationProfile.objects.select_related("location", "staff")
+        .filter(
+            location=location,
+            staff=staff,
+            valid_from__lte=target_date,
+            is_active=True,
+        )
+        .filter(Q(valid_to__isnull=True) | Q(valid_to__gte=target_date))
+        .order_by("valid_from", "id")
+    )
+    if len(profiles) == 1:
+        return profiles[0]
+    return None
+
+
+def get_staff_allowances_for_period(
+    *,
+    location: Location,
+    staff: User,
+    start_date: date,
+    end_date: date,
+) -> list[StaffAllowanceAssignment]:
+    return list(
+        StaffAllowanceAssignment.objects.select_related("location", "staff")
+        .filter(
+            location=location,
+            staff=staff,
+            valid_from__lte=end_date,
+            is_active=True,
+        )
+        .filter(Q(valid_to__isnull=True) | Q(valid_to__gte=start_date))
+        .order_by("code", "valid_from", "id")
+    )
+
+
+def labor_cost_estimate_period_metadata(period: LaborCostEstimatePeriod, preview: dict | None = None) -> dict:
+    summary = (preview or {}).get("summary", {})
+    return {
+        "labor_cost_estimate_period_id": str(period.id),
+        "location_id": str(period.location_id),
+        "year": period.year,
+        "month": period.month,
+        "status": period.status,
+        "content_hash": period.content_hash or (preview or {}).get("content_hash", ""),
+        "validation_fingerprint": period.validation_fingerprint
+        or (preview or {}).get(
+            "validation_fingerprint",
+            "",
+        ),
+        "staff_summary_count": summary.get(
+            "staff_summary_count",
+            period.staff_summaries.count() if period.pk else 0,
+        ),
+        "record_snapshot_count": summary.get(
+            "record_snapshot_count",
+            period.record_snapshots.count() if period.pk else 0,
+        ),
+        "allowance_snapshot_count": summary.get(
+            "allowance_snapshot_count",
+            period.allowance_snapshots.count() if period.pk else 0,
+        ),
+        "warning_count": summary.get("warning_count", 0),
+        "error_count": summary.get("error_count", 0),
+    }
+
+
+def _labor_profiles_for_period(
+    *,
+    location: Location,
+    staff_ids: set[str],
+    start_date: date,
+    end_date: date,
+    lock_masters: bool = False,
+) -> list[StaffCompensationProfile]:
+    if not staff_ids:
+        return []
+    queryset = (
+        StaffCompensationProfile.objects.select_related("location", "staff")
+        .filter(
+            location=location,
+            staff_id__in=staff_ids,
+            valid_from__lte=end_date,
+            is_active=True,
+        )
+        .filter(Q(valid_to__isnull=True) | Q(valid_to__gte=start_date))
+        .order_by("staff_id", "valid_from", "id")
+    )
+    if lock_masters:
+        queryset = queryset.select_for_update(of=("self",))
+    return list(queryset)
+
+
+def _labor_allowances_for_period(
+    *,
+    location: Location,
+    staff_ids: set[str],
+    start_date: date,
+    end_date: date,
+    lock_masters: bool = False,
+) -> list[StaffAllowanceAssignment]:
+    if not staff_ids:
+        return []
+    queryset = (
+        StaffAllowanceAssignment.objects.select_related("location", "staff")
+        .filter(
+            location=location,
+            staff_id__in=staff_ids,
+            valid_from__lte=end_date,
+            is_active=True,
+        )
+        .filter(Q(valid_to__isnull=True) | Q(valid_to__gte=start_date))
+        .order_by("staff_id", "code", "valid_from", "id")
+    )
+    if lock_masters:
+        queryset = queryset.select_for_update(of=("self",))
+    return list(queryset)
+
+
+def _labor_attendance_closing_period(period: LaborCostEstimatePeriod) -> AttendanceClosingPeriod | None:
+    if period.attendance_closing_period_id:
+        return period.attendance_closing_period
+    return (
+        AttendanceClosingPeriod.objects.select_related("location")
+        .filter(
+            location=period.location,
+            year=period.year,
+            month=period.month,
+            status=AttendanceClosingPeriod.Status.CLOSED,
+            is_active=True,
+        )
+        .order_by("created_at")
+        .first()
+    )
+
+
+def _labor_source_items_from_closed(period: LaborCostEstimatePeriod, closing: AttendanceClosingPeriod) -> list[dict]:
+    snapshots = (
+        closing.record_snapshots.select_related("location", "staff", "attendance_record")
+        .all()
+        .order_by("work_date", "staff_id", "location_id")
+    )
+    return [
+        {
+            "attendance_closing_snapshot": str(snapshot.id),
+            "attendance_record": str(snapshot.attendance_record_id) if snapshot.attendance_record_id else None,
+            "location": str(snapshot.location_id),
+            "location_code": snapshot.location_code_snapshot,
+            "location_name": snapshot.location_name_snapshot,
+            "staff": str(snapshot.staff_id),
+            "staff_display_name": snapshot.staff_display_name_snapshot,
+            "employee_code": snapshot.employee_code_snapshot,
+            "work_date": snapshot.work_date.isoformat(),
+            "worked_minutes": snapshot.worked_minutes,
+            "source_warning_count": snapshot.warning_count,
+            "source_warnings": snapshot.warnings if isinstance(snapshot.warnings, list) else [],
+        }
+        for snapshot in snapshots
+        if snapshot.location_id == period.location_id
+    ]
+
+
+def _labor_source_items_from_live(
+    period: LaborCostEstimatePeriod,
+    closing: AttendanceClosingPeriod | None,
+) -> list[dict]:
+    source_period = closing or AttendanceClosingPeriod(
+        location=period.location,
+        year=period.year,
+        month=period.month,
+        name=f"{period.location.short_name} {period.year}-{period.month:02d} 概算人件費用勤怠preview",
+        created_by=period.created_by,
+        updated_by=period.updated_by,
+    )
+    if closing is None:
+        source_period.pk = None
+    preview = build_attendance_closing_preview(source_period)
+    return [
+        {
+            "attendance_closing_snapshot": None,
+            "attendance_record": item["attendance_record"],
+            "location": item["location"],
+            "location_code": item.get("location_code", period.location.code),
+            "location_name": item.get("location_name", period.location.name),
+            "staff": item["staff"],
+            "staff_display_name": item["staff_display_name"],
+            "employee_code": item["employee_code"],
+            "work_date": item["work_date"],
+            "worked_minutes": item["worked_minutes"],
+            "source_warning_count": item.get("warning_count", 0),
+            "source_warnings": item.get("warnings", []),
+        }
+        for item in preview["items"]
+        if item["location"] == str(period.location_id)
+    ]
+
+
+def _labor_source_context(period: LaborCostEstimatePeriod) -> dict:
+    closing = _labor_attendance_closing_period(period)
+    top_issues = []
+    use_closed_snapshots = bool(closing and closing.status == AttendanceClosingPeriod.Status.CLOSED)
+    if closing and (
+        closing.location_id != period.location_id or closing.year != period.year or closing.month != period.month
+    ):
+        top_issues.append(
+            _error(
+                "estimate_period_mismatch",
+                "概算人件費periodと勤怠締めperiodの拠点・年月が一致しません。",
+            )
+        )
+        use_closed_snapshots = False
+    if closing and closing.status != AttendanceClosingPeriod.Status.CLOSED:
+        top_issues.append(
+            _error(
+                "attendance_closing_period_not_closed",
+                "勤怠締めperiodがclosedではないため概算確定できません。",
+            )
+        )
+        top_issues.append(_warning("attendance_not_closed", "勤怠締めが未完了のためlive dataで概算previewしています。"))
+        if closing.status == AttendanceClosingPeriod.Status.REOPENED:
+            top_issues.append(
+                _warning(
+                    "reopened_attendance_closing_period",
+                    "勤怠締めperiodが確定解除済みです。",
+                )
+            )
+    if closing is None:
+        top_issues.append(_warning("attendance_not_closed", "勤怠締めが未完了のためlive dataで概算previewしています。"))
+    if use_closed_snapshots:
+        source_items = _labor_source_items_from_closed(period, closing)
+        source_status = "closed"
+    else:
+        source_items = _labor_source_items_from_live(period, closing)
+        source_status = "live"
+    return {
+        "attendance_closing_period": str(closing.id) if closing else None,
+        "attendance_closing_status": closing.status if closing else "none",
+        "attendance_closing_content_hash": closing.content_hash if closing else "",
+        "source_status": source_status,
+        "top_issues": top_issues,
+        "items": source_items,
+    }
+
+
+def _profile_payload(profile: StaffCompensationProfile | None) -> dict:
+    if profile is None:
+        return {
+            "staff_compensation_profile": None,
+            "employment_type_snapshot": "",
+            "base_hourly_rate_snapshot": None,
+            "fixed_monthly_amount_snapshot": None,
+        }
+    return {
+        "staff_compensation_profile": str(profile.id),
+        "employment_type_snapshot": profile.employment_type,
+        "base_hourly_rate_snapshot": profile.base_hourly_rate,
+        "fixed_monthly_amount_snapshot": profile.fixed_monthly_amount,
+    }
+
+
+def _allowance_snapshot_seed(
+    *,
+    period: LaborCostEstimatePeriod,
+    assignment: StaffAllowanceAssignment,
+    staff_display_name: str,
+    employee_code: str,
+) -> dict:
+    return {
+        "estimate_period": str(period.id),
+        "staff": str(assignment.staff_id),
+        "staff_display_name_snapshot": staff_display_name,
+        "employee_code_snapshot": employee_code,
+        "allowance_assignment": str(assignment.id),
+        "code_snapshot": assignment.code,
+        "name_snapshot": assignment.name,
+        "allowance_type_snapshot": assignment.allowance_type,
+        "amount_snapshot": assignment.amount,
+        "quantity": ZERO_MONEY,
+        "estimated_amount": ZERO_MONEY,
+        "warning_count": 0,
+        "warnings": [],
+    }
+
+
+def _allowance_overlap_codes(assignments: list[StaffAllowanceAssignment]) -> set[str]:
+    overlaps = set()
+    by_code = defaultdict(list)
+    for assignment in assignments:
+        by_code[assignment.code].append(assignment)
+    for code, items in by_code.items():
+        ordered = sorted(items, key=lambda value: (value.valid_from, value.valid_to or date.max, str(value.id)))
+        for index, current in enumerate(ordered):
+            for other in ordered[index + 1 :]:
+                if _periods_overlap(current.valid_from, current.valid_to, other.valid_from, other.valid_to):
+                    overlaps.add(code)
+                    break
+    return overlaps
+
+
+def _add_issue_to_record_item(item: dict, issue: dict):
+    if issue not in item["issues"]:
+        item["issues"].append(issue)
+        if issue["severity"] == "warning":
+            item["warnings"].append(issue)
+            item["warning_count"] += 1
+        else:
+            item["errors"].append(issue)
+            item["error_count"] += 1
+
+
+def _labor_record_item(
+    *,
+    source_item: dict,
+    profiles: list[StaffCompensationProfile],
+    allowances: list[StaffAllowanceAssignment],
+    duplicate_allowance_codes: set[str],
+    allowance_accumulators: dict[str, dict],
+    period: LaborCostEstimatePeriod,
+) -> dict:
+    work_date = date.fromisoformat(source_item["work_date"])
+    worked_minutes = source_item["worked_minutes"] or 0
+    worked_hours = _hours_from_minutes(worked_minutes)
+    issues = []
+    if source_item.get("source_warning_count", 0) > 0:
+        issues.append(
+            _warning(
+                "attendance_warning_in_source",
+                "勤怠締め元データにwarningがあります。",
+            )
+        )
+    if worked_minutes <= 0:
+        issues.append(_warning("no_worked_minutes", "勤務分が0分です。"))
+    matching_profiles = [profile for profile in profiles if _active_on_day(profile, work_date)]
+    if len(matching_profiles) == 0:
+        if worked_minutes > 0:
+            issues.append(_error("staff_compensation_profile_missing", "対象日の勤務単価が未設定です。"))
+        profile = None
+    elif len(matching_profiles) > 1:
+        issues.append(_error("staff_compensation_profile_duplicated", "対象日に有効な勤務単価が複数あります。"))
+        profile = matching_profiles[0]
+    else:
+        profile = matching_profiles[0]
+    profile_data = _profile_payload(profile)
+    base_pay = ZERO_MONEY
+    allowance_total = ZERO_MONEY
+    try:
+        if profile is not None:
+            if profile.employment_type == StaffCompensationProfile.EmploymentType.HOURLY:
+                base_pay = _round_yen((Decimal(worked_minutes) / Decimal(60)) * _decimal(profile.base_hourly_rate))
+            elif profile.employment_type == StaffCompensationProfile.EmploymentType.MONTHLY_FIXED:
+                issues.append(
+                    _warning(
+                        "monthly_fixed_not_prorated",
+                        "月額固定額は工程11では日割り計算しません。",
+                    )
+                )
+            else:
+                issues.append(_warning("employment_type_other", "その他雇用区分は自動概算できません。"))
+        active_allowances = [assignment for assignment in allowances if _active_on_day(assignment, work_date)]
+        active_by_code = defaultdict(list)
+        for assignment in active_allowances:
+            active_by_code[assignment.code].append(assignment)
+        for code, items in active_by_code.items():
+            if code in duplicate_allowance_codes or len(items) > 1:
+                issues.append(_error("allowance_assignment_overlap", f"手当コード {code} の有効期間が重複しています。"))
+                continue
+            assignment = items[0]
+            if assignment.allowance_type == StaffAllowanceAssignment.AllowanceType.PER_WORKED_DAY:
+                if worked_minutes > 0:
+                    amount = _round_yen(_decimal(assignment.amount))
+                    allowance_total += amount
+                    accumulator = allowance_accumulators.setdefault(
+                        str(assignment.id),
+                        _allowance_snapshot_seed(
+                            period=period,
+                            assignment=assignment,
+                            staff_display_name=source_item["staff_display_name"],
+                            employee_code=source_item["employee_code"],
+                        ),
+                    )
+                    accumulator["quantity"] += Decimal("1")
+                    accumulator["estimated_amount"] += amount
+            elif assignment.allowance_type == StaffAllowanceAssignment.AllowanceType.PER_WORKED_HOUR:
+                if worked_minutes > 0:
+                    raw_hours = Decimal(worked_minutes) / Decimal(60)
+                    amount = _round_yen(raw_hours * _decimal(assignment.amount))
+                    allowance_total += amount
+                    accumulator = allowance_accumulators.setdefault(
+                        str(assignment.id),
+                        _allowance_snapshot_seed(
+                            period=period,
+                            assignment=assignment,
+                            staff_display_name=source_item["staff_display_name"],
+                            employee_code=source_item["employee_code"],
+                        ),
+                    )
+                    accumulator["quantity"] += worked_hours
+                    accumulator["estimated_amount"] += amount
+    except (InvalidOperation, ArithmeticError) as exc:
+        issues.append(_error("decimal_calculation_error", f"Decimal計算でエラーが発生しました: {exc}"))
+    issues = _dedupe_issues(issues)
+    warnings = [issue for issue in issues if issue["severity"] == "warning"]
+    errors = [issue for issue in issues if issue["severity"] == "error"]
+    return {
+        "estimate_period": str(period.id),
+        "attendance_closing_snapshot": source_item["attendance_closing_snapshot"],
+        "attendance_record": source_item["attendance_record"],
+        "location": source_item["location"],
+        "location_code": source_item["location_code"],
+        "location_name": source_item["location_name"],
+        "staff": source_item["staff"],
+        "staff_display_name": source_item["staff_display_name"],
+        "employee_code": source_item["employee_code"],
+        "work_date": source_item["work_date"],
+        **profile_data,
+        "worked_minutes": worked_minutes,
+        "worked_hours_decimal": worked_hours,
+        "base_pay": base_pay,
+        "allowance_total": allowance_total,
+        "estimated_total": base_pay + allowance_total,
+        "warning_count": len(warnings),
+        "warnings": warnings,
+        "error_count": len(errors),
+        "errors": errors,
+        "issues": issues,
+    }
+
+
+def _apply_monthly_allowances(
+    *,
+    period: LaborCostEstimatePeriod,
+    record_items: list[dict],
+    allowances_by_staff: dict[str, list[StaffAllowanceAssignment]],
+    duplicate_allowance_codes_by_staff: dict[str, set[str]],
+    allowance_accumulators: dict[str, dict],
+) -> dict[str, Decimal]:
+    fixed_totals_by_staff = defaultdict(Decimal)
+    first_item_by_staff = {item["staff"]: item for item in record_items}
+    for staff_id, assignments in allowances_by_staff.items():
+        first_item = first_item_by_staff.get(staff_id)
+        if first_item is None:
+            continue
+        for assignment in assignments:
+            if assignment.code in duplicate_allowance_codes_by_staff.get(staff_id, set()):
+                continue
+            if assignment.allowance_type == StaffAllowanceAssignment.AllowanceType.FIXED_MONTHLY:
+                amount = _round_yen(_decimal(assignment.amount))
+                fixed_totals_by_staff[staff_id] += amount
+                accumulator = allowance_accumulators.setdefault(
+                    str(assignment.id),
+                    _allowance_snapshot_seed(
+                        period=period,
+                        assignment=assignment,
+                        staff_display_name=first_item["staff_display_name"],
+                        employee_code=first_item["employee_code"],
+                    ),
+                )
+                accumulator["quantity"] = Decimal("1")
+                accumulator["estimated_amount"] = amount
+            elif assignment.allowance_type == StaffAllowanceAssignment.AllowanceType.MANUAL:
+                accumulator = allowance_accumulators.setdefault(
+                    str(assignment.id),
+                    _allowance_snapshot_seed(
+                        period=period,
+                        assignment=assignment,
+                        staff_display_name=first_item["staff_display_name"],
+                        employee_code=first_item["employee_code"],
+                    ),
+                )
+                warning = _warning("manual_allowance_not_calculated", "手入力手当は工程11では自動計算しません。")
+                if warning not in accumulator["warnings"]:
+                    accumulator["warnings"].append(warning)
+                    accumulator["warning_count"] += 1
+    return fixed_totals_by_staff
+
+
+def build_labor_cost_staff_summaries(
+    period: LaborCostEstimatePeriod,
+    record_items: list[dict],
+    *,
+    fixed_allowance_totals_by_staff: dict[str, Decimal] | None = None,
+) -> list[dict]:
+    fixed_allowance_totals_by_staff = fixed_allowance_totals_by_staff or {}
+    summaries = {}
+    monthly_fixed_by_staff = {}
+    for item in record_items:
+        summary = summaries.setdefault(
+            item["staff"],
+            {
+                "estimate_period": str(period.id),
+                "staff": item["staff"],
+                "staff_display_name_snapshot": item["staff_display_name"],
+                "employee_code_snapshot": item["employee_code"],
+                "employment_type_snapshot": item["employment_type_snapshot"] or "",
+                "base_hourly_rate_snapshot": item["base_hourly_rate_snapshot"],
+                "fixed_monthly_amount_snapshot": item["fixed_monthly_amount_snapshot"],
+                "worked_days": 0,
+                "worked_minutes": 0,
+                "worked_hours_decimal": ZERO_MONEY,
+                "base_pay_total": ZERO_MONEY,
+                "allowance_total": ZERO_MONEY,
+                "estimated_total": ZERO_MONEY,
+                "warning_count": 0,
+                "error_count": 0,
+            },
+        )
+        if item["employment_type_snapshot"] and summary["employment_type_snapshot"] != item["employment_type_snapshot"]:
+            summary["employment_type_snapshot"] = "mixed"
+            summary["base_hourly_rate_snapshot"] = None
+            summary["fixed_monthly_amount_snapshot"] = None
+        if item["worked_minutes"] > 0:
+            summary["worked_days"] += 1
+        summary["worked_minutes"] += item["worked_minutes"]
+        summary["worked_hours_decimal"] += item["worked_hours_decimal"]
+        summary["base_pay_total"] += item["base_pay"]
+        summary["allowance_total"] += item["allowance_total"]
+        summary["warning_count"] += item["warning_count"]
+        summary["error_count"] += item["error_count"]
+        if (
+            item["employment_type_snapshot"] == StaffCompensationProfile.EmploymentType.MONTHLY_FIXED
+            and item["fixed_monthly_amount_snapshot"] is not None
+            and item["staff"] not in monthly_fixed_by_staff
+        ):
+            monthly_fixed_by_staff[item["staff"]] = _round_yen(_decimal(item["fixed_monthly_amount_snapshot"]))
+    for staff_id, fixed_monthly_amount in monthly_fixed_by_staff.items():
+        summaries[staff_id]["base_pay_total"] += fixed_monthly_amount
+    for staff_id, allowance_total in fixed_allowance_totals_by_staff.items():
+        if staff_id in summaries:
+            summaries[staff_id]["allowance_total"] += allowance_total
+    for summary in summaries.values():
+        summary["worked_hours_decimal"] = summary["worked_hours_decimal"].quantize(HOUR_QUANT, rounding=ROUND_HALF_UP)
+        summary["estimated_total"] = summary["base_pay_total"] + summary["allowance_total"]
+    return list(sorted(summaries.values(), key=lambda value: (value["staff"], value["employee_code_snapshot"])))
+
+
+def _labor_content_payload(
+    period: LaborCostEstimatePeriod,
+    *,
+    source: dict,
+    items: list[dict],
+    staff_summaries: list[dict],
+    allowance_snapshots: list[dict],
+) -> dict:
+    return {
+        "period": {
+            "id": str(period.id),
+            "location": str(period.location_id),
+            "year": period.year,
+            "month": period.month,
+            "attendance_closing_period": source.get("attendance_closing_period"),
+            "attendance_closing_status": source.get("attendance_closing_status"),
+            "attendance_closing_content_hash": source.get("attendance_closing_content_hash", ""),
+        },
+        "items": [
+            {
+                "attendance_closing_snapshot": item["attendance_closing_snapshot"] or "",
+                "attendance_record": item["attendance_record"] or "",
+                "location": item["location"],
+                "staff": item["staff"],
+                "work_date": item["work_date"],
+                "staff_compensation_profile": item["staff_compensation_profile"] or "",
+                "employment_type_snapshot": item["employment_type_snapshot"],
+                "base_hourly_rate_snapshot": _decimal_payload(item["base_hourly_rate_snapshot"]),
+                "fixed_monthly_amount_snapshot": _decimal_payload(item["fixed_monthly_amount_snapshot"]),
+                "worked_minutes": item["worked_minutes"],
+                "worked_hours_decimal": _decimal_payload(item["worked_hours_decimal"]),
+                "base_pay": _decimal_payload(item["base_pay"]),
+                "allowance_total": _decimal_payload(item["allowance_total"]),
+                "estimated_total": _decimal_payload(item["estimated_total"]),
+                "warnings": sorted(item["warnings"], key=lambda issue: (issue["code"], issue["message"])),
+                "errors": sorted(item["errors"], key=lambda issue: (issue["code"], issue["message"])),
+            }
+            for item in sorted(items, key=lambda value: (value["location"], value["staff"], value["work_date"]))
+        ],
+        "staff_summaries": [
+            {
+                "staff": summary["staff"],
+                "employment_type_snapshot": summary["employment_type_snapshot"],
+                "base_hourly_rate_snapshot": _decimal_payload(summary["base_hourly_rate_snapshot"]),
+                "fixed_monthly_amount_snapshot": _decimal_payload(summary["fixed_monthly_amount_snapshot"]),
+                "worked_days": summary["worked_days"],
+                "worked_minutes": summary["worked_minutes"],
+                "worked_hours_decimal": _decimal_payload(summary["worked_hours_decimal"]),
+                "base_pay_total": _decimal_payload(summary["base_pay_total"]),
+                "allowance_total": _decimal_payload(summary["allowance_total"]),
+                "estimated_total": _decimal_payload(summary["estimated_total"]),
+                "warning_count": summary["warning_count"],
+                "error_count": summary["error_count"],
+            }
+            for summary in sorted(staff_summaries, key=lambda value: value["staff"])
+        ],
+        "allowance_snapshots": [
+            {
+                "staff": item["staff"],
+                "allowance_assignment": item["allowance_assignment"] or "",
+                "code_snapshot": item["code_snapshot"],
+                "name_snapshot": item["name_snapshot"],
+                "allowance_type_snapshot": item["allowance_type_snapshot"],
+                "amount_snapshot": _decimal_payload(item["amount_snapshot"]),
+                "quantity": _decimal_payload(item["quantity"]),
+                "estimated_amount": _decimal_payload(item["estimated_amount"]),
+                "warnings": sorted(item["warnings"], key=lambda issue: (issue["code"], issue["message"])),
+            }
+            for item in sorted(
+                allowance_snapshots,
+                key=lambda value: (value["staff"], value["code_snapshot"], value["allowance_assignment"] or ""),
+            )
+        ],
+    }
+
+
+def build_labor_cost_content_hash(
+    period: LaborCostEstimatePeriod,
+    *,
+    source: dict | None = None,
+    items: list[dict] | None = None,
+    staff_summaries: list[dict] | None = None,
+    allowance_snapshots: list[dict] | None = None,
+) -> str:
+    if source is None or items is None or staff_summaries is None or allowance_snapshots is None:
+        preview = build_labor_cost_preview(period)
+        return preview["content_hash"]
+    return _stable_sha256(
+        _labor_content_payload(
+            period,
+            source=source,
+            items=items,
+            staff_summaries=staff_summaries,
+            allowance_snapshots=allowance_snapshots,
+        )
+    )
+
+
+def build_labor_cost_validation_fingerprint(
+    period: LaborCostEstimatePeriod,
+    *,
+    items: list[dict] | None = None,
+    allowance_snapshots: list[dict] | None = None,
+    top_issues: list[dict] | None = None,
+) -> str:
+    if items is None or allowance_snapshots is None or top_issues is None:
+        preview = build_labor_cost_preview(period)
+        return preview["validation_fingerprint"]
+    payload = {
+        "period": str(period.id),
+        "location": str(period.location_id),
+        "year": period.year,
+        "month": period.month,
+        "top_issues": sorted(top_issues, key=lambda issue: (issue["severity"], issue["code"], issue["message"])),
+        "items": [
+            {
+                "attendance_record": item["attendance_record"] or "",
+                "staff": item["staff"],
+                "work_date": item["work_date"],
+                "issues": sorted(
+                    item["issues"],
+                    key=lambda issue: (issue["severity"], issue["code"], issue["message"]),
+                ),
+            }
+            for item in sorted(items, key=lambda value: (value["staff"], value["work_date"], value["location"]))
+        ],
+        "allowance_snapshots": [
+            {
+                "staff": item["staff"],
+                "code_snapshot": item["code_snapshot"],
+                "allowance_assignment": item["allowance_assignment"] or "",
+                "warnings": sorted(
+                    item["warnings"],
+                    key=lambda issue: (issue["severity"], issue["code"], issue["message"]),
+                ),
+            }
+            for item in sorted(
+                allowance_snapshots,
+                key=lambda value: (value["staff"], value["code_snapshot"], value["allowance_assignment"] or ""),
+            )
+        ],
+    }
+    return _stable_sha256(payload)
+
+
+def build_labor_cost_preview(period: LaborCostEstimatePeriod, *, lock_masters: bool = False) -> dict:
+    if period.pk:
+        period = LaborCostEstimatePeriod.objects.select_related(
+            "location",
+            "attendance_closing_period",
+            "attendance_closing_period__location",
+            "created_by",
+            "updated_by",
+        ).get(pk=period.pk)
+    start_date, end_date = _month_range(period.year, period.month)
+    source = _labor_source_context(period)
+    source_items = sorted(source["items"], key=lambda value: (value["staff"], value["work_date"], value["location"]))
+    staff_ids = {item["staff"] for item in source_items}
+    profiles = _labor_profiles_for_period(
+        location=period.location,
+        staff_ids=staff_ids,
+        start_date=start_date,
+        end_date=end_date,
+        lock_masters=lock_masters,
+    )
+    allowances = _labor_allowances_for_period(
+        location=period.location,
+        staff_ids=staff_ids,
+        start_date=start_date,
+        end_date=end_date,
+        lock_masters=lock_masters,
+    )
+    profiles_by_staff = defaultdict(list)
+    for profile in profiles:
+        profiles_by_staff[str(profile.staff_id)].append(profile)
+    allowances_by_staff = defaultdict(list)
+    for allowance in allowances:
+        allowances_by_staff[str(allowance.staff_id)].append(allowance)
+    duplicate_allowance_codes_by_staff = {
+        staff_id: _allowance_overlap_codes(staff_allowances)
+        for staff_id, staff_allowances in allowances_by_staff.items()
+    }
+    allowance_accumulators = {}
+    record_items = [
+        _labor_record_item(
+            source_item=item,
+            profiles=profiles_by_staff.get(item["staff"], []),
+            allowances=allowances_by_staff.get(item["staff"], []),
+            duplicate_allowance_codes=duplicate_allowance_codes_by_staff.get(item["staff"], set()),
+            allowance_accumulators=allowance_accumulators,
+            period=period,
+        )
+        for item in source_items
+    ]
+    fixed_allowance_totals_by_staff = _apply_monthly_allowances(
+        period=period,
+        record_items=record_items,
+        allowances_by_staff=allowances_by_staff,
+        duplicate_allowance_codes_by_staff=duplicate_allowance_codes_by_staff,
+        allowance_accumulators=allowance_accumulators,
+    )
+    allowance_snapshots = list(allowance_accumulators.values())
+    staff_summaries = build_labor_cost_staff_summaries(
+        period,
+        record_items,
+        fixed_allowance_totals_by_staff=fixed_allowance_totals_by_staff,
+    )
+    top_issues = _dedupe_issues(source["top_issues"])
+    content_hash = build_labor_cost_content_hash(
+        period,
+        source=source,
+        items=record_items,
+        staff_summaries=staff_summaries,
+        allowance_snapshots=allowance_snapshots,
+    )
+    if (
+        period.content_hash
+        and period.content_hash != content_hash
+        and period.status == LaborCostEstimatePeriod.Status.FINALIZED
+    ):
+        top_issues.append(
+            _warning(
+                "stale_estimate_content",
+                "保存済み概算snapshotと最新preview内容が一致しません。",
+            )
+        )
+    top_issues = _dedupe_issues(top_issues)
+    validation_fingerprint = build_labor_cost_validation_fingerprint(
+        period,
+        items=record_items,
+        allowance_snapshots=allowance_snapshots,
+        top_issues=top_issues,
+    )
+    top_warning_count = sum(1 for issue in top_issues if issue["severity"] == "warning")
+    top_error_count = sum(1 for issue in top_issues if issue["severity"] == "error")
+    record_warning_count = sum(item["warning_count"] for item in record_items)
+    record_error_count = sum(item["error_count"] for item in record_items)
+    allowance_warning_count = sum(item["warning_count"] for item in allowance_snapshots)
+    summary = {
+        "date_from": start_date.isoformat(),
+        "date_to": end_date.isoformat(),
+        "record_snapshot_count": len(record_items),
+        "staff_summary_count": len(staff_summaries),
+        "allowance_snapshot_count": len(allowance_snapshots),
+        "staff_count": len(staff_summaries),
+        "warning_count": top_warning_count + record_warning_count + allowance_warning_count,
+        "error_count": top_error_count + record_error_count,
+        "worked_minutes": sum(item["worked_minutes"] for item in record_items),
+        "worked_hours_decimal": sum((item["worked_hours_decimal"] for item in record_items), ZERO_MONEY).quantize(
+            HOUR_QUANT,
+            rounding=ROUND_HALF_UP,
+        ),
+        "base_pay_total": sum((summary["base_pay_total"] for summary in staff_summaries), ZERO_MONEY),
+        "allowance_total": sum((summary["allowance_total"] for summary in staff_summaries), ZERO_MONEY),
+        "estimated_total": sum((summary["estimated_total"] for summary in staff_summaries), ZERO_MONEY),
+    }
+    return {
+        "period": str(period.id),
+        "location": str(period.location_id),
+        "location_name": period.location.name,
+        "location_code": period.location.code,
+        "year": period.year,
+        "month": period.month,
+        "status": period.status,
+        "attendance_closing_period": source["attendance_closing_period"],
+        "attendance_closing_status": source["attendance_closing_status"],
+        "source_status": source["source_status"],
+        "content_hash": content_hash,
+        "validation_fingerprint": validation_fingerprint,
+        "summary": summary,
+        "issues": top_issues,
+        "record_snapshots": record_items,
+        "staff_summaries": staff_summaries,
+        "allowance_snapshots": allowance_snapshots,
+        "can_finalize": source["source_status"] == "closed" and summary["error_count"] == 0,
+    }
+
+
+def _labor_record_snapshot_from_preview_item(
+    period: LaborCostEstimatePeriod,
+    item: dict,
+) -> LaborCostEstimateRecordSnapshot:
+    return LaborCostEstimateRecordSnapshot(
+        estimate_period=period,
+        attendance_closing_snapshot_id=item["attendance_closing_snapshot"],
+        attendance_record_id=item["attendance_record"],
+        location_id=item["location"],
+        staff_id=item["staff"],
+        location_code_snapshot=item["location_code"],
+        location_name_snapshot=item["location_name"],
+        staff_display_name_snapshot=item["staff_display_name"],
+        employee_code_snapshot=item["employee_code"],
+        work_date=date.fromisoformat(item["work_date"]),
+        employment_type_snapshot=item["employment_type_snapshot"],
+        base_hourly_rate_snapshot=item["base_hourly_rate_snapshot"],
+        fixed_monthly_amount_snapshot=item["fixed_monthly_amount_snapshot"],
+        worked_minutes=item["worked_minutes"],
+        worked_hours_decimal=item["worked_hours_decimal"],
+        base_pay=item["base_pay"],
+        allowance_total=item["allowance_total"],
+        estimated_total=item["estimated_total"],
+        warning_count=item["warning_count"],
+        warnings=item["warnings"],
+        error_count=item["error_count"],
+        errors=item["errors"],
+    )
+
+
+def build_labor_cost_record_snapshots(
+    period: LaborCostEstimatePeriod,
+    *,
+    preview: dict | None = None,
+) -> list[LaborCostEstimateRecordSnapshot]:
+    preview = preview or build_labor_cost_preview(period)
+    return [_labor_record_snapshot_from_preview_item(period, item) for item in preview["record_snapshots"]]
+
+
+def _labor_staff_summary_from_preview_item(
+    period: LaborCostEstimatePeriod,
+    item: dict,
+) -> LaborCostEstimateStaffSummary:
+    return LaborCostEstimateStaffSummary(
+        estimate_period=period,
+        staff_id=item["staff"],
+        staff_display_name_snapshot=item["staff_display_name_snapshot"],
+        employee_code_snapshot=item["employee_code_snapshot"],
+        employment_type_snapshot=item["employment_type_snapshot"],
+        base_hourly_rate_snapshot=item["base_hourly_rate_snapshot"],
+        fixed_monthly_amount_snapshot=item["fixed_monthly_amount_snapshot"],
+        worked_days=item["worked_days"],
+        worked_minutes=item["worked_minutes"],
+        worked_hours_decimal=item["worked_hours_decimal"],
+        base_pay_total=item["base_pay_total"],
+        allowance_total=item["allowance_total"],
+        estimated_total=item["estimated_total"],
+        warning_count=item["warning_count"],
+        error_count=item["error_count"],
+    )
+
+
+def build_labor_cost_staff_summary_snapshots(
+    period: LaborCostEstimatePeriod,
+    *,
+    preview: dict | None = None,
+) -> list[LaborCostEstimateStaffSummary]:
+    preview = preview or build_labor_cost_preview(period)
+    return [_labor_staff_summary_from_preview_item(period, item) for item in preview["staff_summaries"]]
+
+
+def _labor_allowance_snapshot_from_preview_item(
+    period: LaborCostEstimatePeriod,
+    item: dict,
+) -> LaborCostEstimateAllowanceSnapshot:
+    return LaborCostEstimateAllowanceSnapshot(
+        estimate_period=period,
+        staff_id=item["staff"],
+        staff_display_name_snapshot=item["staff_display_name_snapshot"],
+        employee_code_snapshot=item["employee_code_snapshot"],
+        allowance_assignment_id=item["allowance_assignment"],
+        code_snapshot=item["code_snapshot"],
+        name_snapshot=item["name_snapshot"],
+        allowance_type_snapshot=item["allowance_type_snapshot"],
+        amount_snapshot=item["amount_snapshot"],
+        quantity=item["quantity"],
+        estimated_amount=item["estimated_amount"],
+        warning_count=item["warning_count"],
+        warnings=item["warnings"],
+    )
+
+
+def build_labor_cost_allowance_snapshots(
+    period: LaborCostEstimatePeriod,
+    *,
+    preview: dict | None = None,
+) -> list[LaborCostEstimateAllowanceSnapshot]:
+    preview = preview or build_labor_cost_preview(period)
+    return [_labor_allowance_snapshot_from_preview_item(period, item) for item in preview["allowance_snapshots"]]
+
+
+def finalize_labor_cost_estimate(
+    *,
+    period: LaborCostEstimatePeriod,
+    actor: User,
+    acknowledge_warnings: bool,
+    validation_fingerprint: str,
+    manager_note: str = "",
+) -> tuple[LaborCostEstimatePeriod, dict]:
+    with transaction.atomic():
+        period = (
+            LaborCostEstimatePeriod.objects.select_for_update(of=("self",))
+            .select_related("location", "attendance_closing_period")
+            .get(pk=period.pk)
+        )
+        if period.status == LaborCostEstimatePeriod.Status.ARCHIVED or not period.is_active:
+            raise DRFValidationError({"status": "アーカイブ済みの概算人件費periodは操作できません。"})
+        if period.status == LaborCostEstimatePeriod.Status.FINALIZED:
+            raise DRFValidationError({"status": "既に概算確定済みです。"})
+        closing = _labor_attendance_closing_period(period)
+        if closing is None:
+            raise DRFValidationError({"attendance_closing_period": "closedの月次勤怠締めperiodが必要です。"})
+        AttendanceClosingPeriod.objects.select_for_update(of=("self",)).get(pk=closing.pk)
+        if closing.status != AttendanceClosingPeriod.Status.CLOSED:
+            raise DRFValidationError({"attendance_closing_period": "月次勤怠締めperiodがclosedではありません。"})
+        period.attendance_closing_period = closing
+        preview = build_labor_cost_preview(period, lock_masters=True)
+        if preview["source_status"] != "closed":
+            raise DRFValidationError(
+                {"attendance_closing_period": "closedの月次勤怠締めsnapshotからのみ確定できます。"}
+            )
+        if not validation_fingerprint or validation_fingerprint != preview["validation_fingerprint"]:
+            raise DRFValidationError({"validation_fingerprint": "最新のpreview結果と一致しません。"})
+        if preview["summary"]["error_count"] > 0:
+            raise DRFValidationError({"errors": "errorがあるため概算人件費を確定できません。"})
+        if preview["summary"]["warning_count"] > 0 and not acknowledge_warnings:
+            raise DRFValidationError({"acknowledge_warnings": "warningがあるため確認チェックが必要です。"})
+        period.record_snapshots.all().delete()
+        period.staff_summaries.all().delete()
+        period.allowance_snapshots.all().delete()
+        LaborCostEstimateRecordSnapshot.objects.bulk_create(build_labor_cost_record_snapshots(period, preview=preview))
+        LaborCostEstimateStaffSummary.objects.bulk_create(
+            build_labor_cost_staff_summary_snapshots(period, preview=preview)
+        )
+        LaborCostEstimateAllowanceSnapshot.objects.bulk_create(
+            build_labor_cost_allowance_snapshots(period, preview=preview)
+        )
+        period.status = LaborCostEstimatePeriod.Status.FINALIZED
+        period.finalized_at = timezone.now()
+        period.finalized_by = actor
+        period.updated_by = actor
+        period.content_hash = preview["content_hash"]
+        period.validation_fingerprint = preview["validation_fingerprint"]
+        if manager_note:
+            period.description = manager_note
+        period.full_clean()
+        period.save()
+        return period, preview
+
+
+def reopen_labor_cost_estimate(
+    *,
+    period: LaborCostEstimatePeriod,
+    actor: User,
+    manager_note: str = "",
+) -> LaborCostEstimatePeriod:
+    with transaction.atomic():
+        period = (
+            LaborCostEstimatePeriod.objects.select_for_update(of=("self",))
+            .select_related("location", "attendance_closing_period")
+            .get(pk=period.pk)
+        )
+        if period.status != LaborCostEstimatePeriod.Status.FINALIZED:
+            raise DRFValidationError({"status": "概算確定済みperiodのみ再オープンできます。"})
+        period.status = LaborCostEstimatePeriod.Status.REOPENED
+        period.reopened_at = timezone.now()
+        period.reopened_by = actor
+        period.updated_by = actor
+        if manager_note:
+            period.description = manager_note
+        period.full_clean()
+        period.save()
+        return period
+
+
+def archive_labor_cost_estimate(
+    *,
+    period: LaborCostEstimatePeriod,
+    actor: User,
+    manager_note: str = "",
+) -> LaborCostEstimatePeriod:
+    with transaction.atomic():
+        period = (
+            LaborCostEstimatePeriod.objects.select_for_update(of=("self",))
+            .select_related("location", "attendance_closing_period")
+            .get(pk=period.pk)
+        )
+        if period.status == LaborCostEstimatePeriod.Status.FINALIZED:
+            raise DRFValidationError({"status": "概算確定済みperiodは再オープンしてからアーカイブしてください。"})
+        if period.status == LaborCostEstimatePeriod.Status.ARCHIVED:
+            raise DRFValidationError({"status": "既にアーカイブ済みです。"})
+        period.status = LaborCostEstimatePeriod.Status.ARCHIVED
+        period.is_active = False
+        period.updated_by = actor
+        if manager_note:
+            period.description = manager_note
+        period.full_clean()
+        period.save()
+        return period
+
+
+def _labor_csv_issue_codes(issues: list[dict]) -> str:
+    return " ".join(sorted(issue.get("code", "") for issue in issues if isinstance(issue, dict)))
+
+
+def _labor_csv_rows_from_preview(preview: dict, status_label: str) -> list[list]:
+    rows = []
+    for item in preview["record_snapshots"]:
+        rows.append(
+            [
+                item["location_name"],
+                f"{preview['year']}-{preview['month']:02d}",
+                item["employee_code"],
+                item["staff_display_name"],
+                item["work_date"],
+                item["employment_type_snapshot"],
+                _decimal_payload(item["base_hourly_rate_snapshot"]),
+                _decimal_payload(item["fixed_monthly_amount_snapshot"]),
+                item["worked_minutes"],
+                _decimal_payload(item["worked_hours_decimal"]),
+                _decimal_payload(item["base_pay"]),
+                _decimal_payload(item["allowance_total"]),
+                _decimal_payload(item["estimated_total"]),
+                item["warning_count"],
+                _labor_csv_issue_codes(item["warnings"]),
+                item["error_count"],
+                _labor_csv_issue_codes(item["errors"]),
+                status_label,
+            ]
+        )
+    return rows
+
+
+def _labor_csv_rows_from_snapshots(period: LaborCostEstimatePeriod) -> list[list]:
+    snapshots = (
+        period.record_snapshots.select_related("location", "staff")
+        .all()
+        .order_by("work_date", "employee_code_snapshot", "staff_display_name_snapshot")
+    )
+    rows = []
+    for item in snapshots:
+        rows.append(
+            [
+                item.location_name_snapshot,
+                f"{period.year}-{period.month:02d}",
+                item.employee_code_snapshot,
+                item.staff_display_name_snapshot,
+                item.work_date.isoformat(),
+                item.employment_type_snapshot,
+                _decimal_payload(item.base_hourly_rate_snapshot),
+                _decimal_payload(item.fixed_monthly_amount_snapshot),
+                item.worked_minutes,
+                _decimal_payload(item.worked_hours_decimal),
+                _decimal_payload(item.base_pay),
+                _decimal_payload(item.allowance_total),
+                _decimal_payload(item.estimated_total),
+                item.warning_count,
+                _labor_csv_issue_codes(item.warnings),
+                item.error_count,
+                _labor_csv_issue_codes(item.errors),
+                "概算確定済み",
+            ]
+        )
+    return rows
+
+
+def export_labor_cost_estimate_csv(period: LaborCostEstimatePeriod) -> tuple[bytes, str, dict]:
+    period = LaborCostEstimatePeriod.objects.select_related("location", "attendance_closing_period").get(pk=period.pk)
+    header = [
+        "拠点",
+        "年月",
+        "スタッフコード",
+        "スタッフ名",
+        "勤務日",
+        "雇用区分",
+        "時給",
+        "月額固定額",
+        "勤務分",
+        "勤務時間",
+        "基本概算額",
+        "手当概算額",
+        "概算合計",
+        "警告数",
+        "警告コード",
+        "エラー数",
+        "エラーコード",
+        "状態",
+    ]
+    if period.status == LaborCostEstimatePeriod.Status.FINALIZED:
+        rows = _labor_csv_rows_from_snapshots(period)
+        summary = {
+            "record_snapshot_count": len(rows),
+            "warning_count": sum(row[13] for row in rows),
+            "error_count": sum(row[15] for row in rows),
+        }
+    else:
+        preview = build_labor_cost_preview(period)
+        rows = _labor_csv_rows_from_preview(preview, "未確定概算")
+        summary = preview["summary"]
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(header)
+    writer.writerows(rows)
+    filename = f"labor_cost_estimate_{period.location.code}_{period.year}_{period.month:02d}.csv"
+    data = ("\ufeff" + output.getvalue()).encode("utf-8")
+    return data, filename, summary
 
 
 def _location_timezone(location: Location) -> ZoneInfo:

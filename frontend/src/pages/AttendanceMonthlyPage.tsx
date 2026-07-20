@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { Navigate } from "react-router-dom";
+import { Navigate, useNavigate } from "react-router-dom";
 import { api } from "../api/client";
 import { useAuth } from "../features/auth/AuthContext";
 import { offsetToLabel } from "../lib/timeOffsets";
@@ -21,6 +21,7 @@ function statusLabel(status: string) {
     closed: "締め済み",
     reopened: "再オープン",
     archived: "アーカイブ",
+    finalized: "概算確定済み",
   };
   return labels[status] ?? status;
 }
@@ -33,6 +34,7 @@ function offsetRange(item: AttendanceClosingPreviewItem) {
 export function AttendanceMonthlyPage() {
   const { user, loading } = useAuth();
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const roles = user?.roles ?? [];
   const canManage = roles.includes("system_admin") || roles.includes("shift_manager");
   const canView = canManage || roles.includes("supervisor");
@@ -226,13 +228,21 @@ export function AttendanceMonthlyPage() {
         <div className="monthly-grid-wrap">
           {periods.length ? (
             <table className="table">
-              <thead><tr><th>年月</th><th>拠点</th><th>状態</th><th>hash</th><th>snapshot</th><th>summary</th></tr></thead>
+              <thead><tr><th>年月</th><th>拠点</th><th>状態</th><th>概算人件費</th><th>hash</th><th>snapshot</th><th>summary</th></tr></thead>
               <tbody>
                 {periods.map((period) => (
                   <tr key={period.id}>
                     <td><button type="button" className="btn-link" onClick={() => choosePeriod(period)}>{period.year}-{String(period.month).padStart(2, "0")}</button></td>
                     <td>{period.location_name}</td>
                     <td>{statusLabel(period.status)}</td>
+                    <td>
+                      {period.labor_cost_estimate_status ? statusLabel(period.labor_cost_estimate_status) : "-"}
+                      {period.status === "closed" ? (
+                        <button type="button" className="btn-link" onClick={() => navigate("/labor-cost/monthly")}>
+                          概算人件費へ進む
+                        </button>
+                      ) : null}
+                    </td>
                     <td>{period.content_hash ? period.content_hash.slice(0, 12) : "-"}</td>
                     <td>{period.snapshot_count}</td>
                     <td>{period.staff_summary_count}</td>

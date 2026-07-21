@@ -813,6 +813,11 @@ describe("shift settings pages", () => {
     expect(screen.getByText("出勤済み / warning 1")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "退勤" }));
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/my-attendance/ar1/clock-out/"), expect.anything());
+    const clockOutCall = fetchMock.mock.calls.find(
+      ([input, init]) => String(input).includes("/api/v1/my-attendance/ar1/clock-out/") && init?.method === "POST",
+    );
+    expect(JSON.parse(String(clockOutCall?.[1]?.body))).toEqual({});
+    expect(String(clockOutCall?.[1]?.body)).not.toContain("occurred_at");
     await userEvent.click(screen.getByRole("button", { name: "2028-02-01" }));
     expect(screen.getByText("公開備考")).toBeInTheDocument();
     expect(screen.getByText("勤怠状態")).toBeInTheDocument();
@@ -890,6 +895,7 @@ describe("shift settings pages", () => {
     expect(await screen.findByText("shorter_worked")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "2028-02-01" }));
     expect(screen.getByText("打刻履歴")).toBeInTheDocument();
+    expect(screen.getByText("2028-02-01T08:45:00+09:00")).toBeInTheDocument();
     await userEvent.type(screen.getByLabelText("理由"), "打刻修正");
     await userEvent.click(screen.getByRole("button", { name: "提出" }));
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/v1/my-attendance-corrections/"), expect.anything());

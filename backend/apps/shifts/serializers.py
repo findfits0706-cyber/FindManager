@@ -2332,15 +2332,28 @@ class AttendanceRecordSerializer(serializers.ModelSerializer):
         return period.name if period else ""
 
 
-class AttendanceClockInSerializer(serializers.Serializer):
+class AttendanceServerTimedSerializer(serializers.Serializer):
+    server_managed_fields = ("occurred_at",)
+
+    def validate(self, attrs):
+        errors = {
+            field: "本人打刻では指定できません。サーバー時刻を使用します。"
+            for field in self.server_managed_fields
+            if field in self.initial_data
+        }
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
+
+class AttendanceClockInSerializer(AttendanceServerTimedSerializer):
     location = serializers.PrimaryKeyRelatedField(queryset=Location.objects.filter(is_active=True))
     work_date = serializers.DateField()
-    occurred_at = serializers.DateTimeField(required=False, allow_null=True)
     note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
 
 
-class AttendanceClockEventSerializer(serializers.Serializer):
-    occurred_at = serializers.DateTimeField(required=False, allow_null=True)
+class AttendanceClockEventSerializer(AttendanceServerTimedSerializer):
+    server_managed_fields = ("occurred_at", "location", "work_date")
     note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
 
 

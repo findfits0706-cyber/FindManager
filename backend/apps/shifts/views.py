@@ -2781,7 +2781,6 @@ class MyAttendanceViewSet(viewsets.ReadOnlyModelViewSet):
                 location=serializer.validated_data["location"],
                 work_date=serializer.validated_data["work_date"],
                 actor=request.user,
-                occurred_at=serializer.validated_data.get("occurred_at"),
                 note=serializer.validated_data.get("note", ""),
             )
             if created:
@@ -2810,7 +2809,6 @@ class MyAttendanceViewSet(viewsets.ReadOnlyModelViewSet):
                 record=record,
                 event_type=event_type,
                 actor=request.user,
-                occurred_at=serializer.validated_data.get("occurred_at"),
                 note=serializer.validated_data.get("note", ""),
             )
             record_shift_event(

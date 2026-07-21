@@ -1,9 +1,25 @@
 import { expect, test, type Page } from "@playwright/test";
 
 const PASSWORD = process.env.E2E_PASSWORD ?? "DevPassword123!";
-const YEAR = 2032;
-const MONTH = 7;
-const WORK_DATE = `${YEAR}-07-01`;
+
+function dateInTokyo() {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${value.year}-${value.month}-${value.day}`;
+}
+
+const WORK_DATE = dateInTokyo();
+const YEAR = Number(WORK_DATE.slice(0, 4));
+const MONTH = Number(WORK_DATE.slice(5, 7));
+const MONTH_PREFIX = WORK_DATE.slice(0, 7);
+const MONTH_START = `${MONTH_PREFIX}-01`;
+const MONTH_END = `${MONTH_PREFIX}-${String(new Date(Date.UTC(YEAR, MONTH, 0)).getUTCDate()).padStart(2, "0")}`;
+const OTHER_WORK_DATE = WORK_DATE === MONTH_START ? `${MONTH_PREFIX}-02` : MONTH_START;
 
 const state: Record<string, string> = {};
 
@@ -73,6 +89,7 @@ test.describe.serial("FindManager release candidate workflows", () => {
     await loginApi(page, "system_admin");
     const locationList = await getJson(page, "/api/v1/locations/?page_size=100");
     state.location = results(locationList).find((item) => item.code === "main")!.id;
+    state.outsideLocation = results(locationList).find((item) => item.code === "findfits")!.id;
     const staffList = await getJson(page, "/api/v1/staff/?page_size=100");
     state.staff = results(staffList).find((item) => item.username === "staff")!.id;
     state.shiftManager = results(staffList).find((item) => item.username === "shift_manager")!.id;
@@ -148,7 +165,7 @@ test.describe.serial("FindManager release candidate workflows", () => {
       items: [
         {
           request_type: "unavailable",
-          work_date: `${YEAR}-07-02`,
+          work_date: OTHER_WORK_DATE,
           start_offset_minutes: 1080,
           end_offset_minutes: 1320,
           priority: "normal",
@@ -173,21 +190,55 @@ test.describe.serial("FindManager release candidate workflows", () => {
 
   test("attendance: clock, correction approval/apply, and confirm", async ({ page }) => {
     await loginApi(page, "staff");
-    const clockedIn = await requestJson(page, "POST", "/api/v1/my-attendance/clock-in/", {
+    const outsideLocation = await requestJson(page, "POST", "/api/v1/my-attendance/clock-in/", {
+      location: state.outsideLocation,
+      work_date: WORK_DATE,
+    }, 400);
+    expect(outsideLocation.code).toBe("validation_error");
+    expect(outsideLocation.errors.location).toBeTruthy();
+
+    await page.goto("/shifts/my-published");
+    await expect(page.getByRole("heading", { name: "自分のシフト" })).toBeVisible();
+    await page.getByLabel("年").fill(String(YEAR));
+    await page.getByLabel("月").fill(String(MONTH));
+    await expect(page.getByRole("button", { name: WORK_DATE })).toBeVisible();
+    const clockInRequestPromise = page.waitForRequest(
+      (request) => request.method() === "POST" && request.url().endsWith("/api/v1/my-attendance/clock-in/"),
+    );
+    const clockInResponsePromise = page.waitForResponse(
+      (response) => response.request().method() === "POST" && response.url().endsWith("/api/v1/my-attendance/clock-in/"),
+    );
+    await page.getByRole("button", { name: "出勤", exact: true }).click();
+    const clockInRequest = await clockInRequestPromise;
+    expect(clockInRequest.postDataJSON()).toEqual({
       location: state.location,
       work_date: WORK_DATE,
-      occurred_at: `${WORK_DATE}T09:00:00+09:00`,
-    }, 201);
+    });
+    expect(clockInRequest.postDataJSON()).not.toHaveProperty("occurred_at");
+    const clockInResponse = await clockInResponsePromise;
+    expect(clockInResponse.status()).toBe(201);
+    const clockedIn = (await clockInResponse.json()) as JsonObject;
+    expect(clockedIn.actual_clock_in_at).toBeTruthy();
     state.attendance = clockedIn.id;
-    await requestJson(page, "POST", `/api/v1/my-attendance/${state.attendance}/break-start/`, {
-      occurred_at: `${WORK_DATE}T12:00:00+09:00`,
-    }, 200);
-    await requestJson(page, "POST", `/api/v1/my-attendance/${state.attendance}/break-end/`, {
-      occurred_at: `${WORK_DATE}T13:00:00+09:00`,
-    }, 200);
-    await requestJson(page, "POST", `/api/v1/my-attendance/${state.attendance}/clock-out/`, {
-      occurred_at: `${WORK_DATE}T17:00:00+09:00`,
-    }, 200);
+    await expect(page.getByText(/出勤済み/)).toBeVisible();
+    await requestJson(page, "POST", `/api/v1/my-attendance/${state.attendance}/break-start/`, {}, 200);
+    await requestJson(page, "POST", `/api/v1/my-attendance/${state.attendance}/break-end/`, {}, 200);
+    const clockedOut = await requestJson(
+      page,
+      "POST",
+      `/api/v1/my-attendance/${state.attendance}/clock-out/`,
+      {},
+      200,
+    );
+    const clockInEvent = clockedOut.events.find((event: JsonObject) => event.event_type === "clock_in");
+    expect(clockInEvent.occurred_at).toBe(clockedIn.actual_clock_in_at);
+
+    await page.goto("/my/attendance");
+    await page.getByLabel("年").fill(String(YEAR));
+    await page.getByLabel("月").fill(String(MONTH));
+    await page.getByRole("button", { name: WORK_DATE }).click();
+    await expect(page.getByText(clockInEvent.occurred_at, { exact: true })).toBeVisible();
+
     const correction = await requestJson(page, "POST", "/api/v1/my-attendance-corrections/", {
       attendance_record: state.attendance,
       requested_clock_in_at: `${WORK_DATE}T09:15:00+09:00`,
@@ -232,8 +283,7 @@ test.describe.serial("FindManager release candidate workflows", () => {
     await loginApi(page, "staff");
     const rejected = await requestJson(page, "POST", "/api/v1/my-attendance/clock-in/", {
       location: state.location,
-      work_date: `${YEAR}-07-02`,
-      occurred_at: `${YEAR}-07-02T09:00:00+09:00`,
+      work_date: OTHER_WORK_DATE,
     }, 400);
     expect(rejected.code).toBe("validation_error");
   });
@@ -245,8 +295,8 @@ test.describe.serial("FindManager release candidate workflows", () => {
       staff: state.staff,
       employment_type: "hourly",
       base_hourly_rate: "1200.00",
-      valid_from: `${YEAR}-07-01`,
-      valid_to: `${YEAR}-07-31`,
+      valid_from: MONTH_START,
+      valid_to: MONTH_END,
       notes: "E2E",
     });
     await requestJson(page, "POST", "/api/v1/staff-allowance-assignments/", {
@@ -256,8 +306,8 @@ test.describe.serial("FindManager release candidate workflows", () => {
       name: "E2E日額手当",
       allowance_type: "per_worked_day",
       amount: "500.00",
-      valid_from: `${YEAR}-07-01`,
-      valid_to: `${YEAR}-07-31`,
+      valid_from: MONTH_START,
+      valid_to: MONTH_END,
     });
     const period = await requestJson(page, "POST", "/api/v1/labor-cost-estimate-periods/", {
       location: state.location,

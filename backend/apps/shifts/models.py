@@ -885,12 +885,13 @@ class AttendanceRecord(models.Model):
             value = getattr(self, field)
             if value is not None and value % 15 != 0:
                 errors[field] = "offset must be in 15-minute increments."
-        if (
-            self.actual_start_offset_minutes is not None
-            and self.actual_end_offset_minutes is not None
-            and self.actual_start_offset_minutes >= self.actual_end_offset_minutes
-        ):
-            errors["actual_end_offset_minutes"] = "actual_end_offset_minutes must be after start."
+        if self.actual_start_offset_minutes is not None and self.actual_end_offset_minutes is not None:
+            if self.actual_clock_in_at and self.actual_clock_out_at:
+                invalid_actual_order = self.actual_clock_in_at >= self.actual_clock_out_at
+            else:
+                invalid_actual_order = self.actual_start_offset_minutes >= self.actual_end_offset_minutes
+            if invalid_actual_order or self.actual_start_offset_minutes > self.actual_end_offset_minutes:
+                errors["actual_end_offset_minutes"] = "actual_end_offset_minutes must be after start."
         if (
             self.scheduled_start_offset_minutes is not None
             and self.scheduled_end_offset_minutes is not None

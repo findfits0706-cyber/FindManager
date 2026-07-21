@@ -1080,6 +1080,21 @@ button:disabled {
   font-size: 0.78rem;
 }
 
+.staff-list-error {
+  display: grid;
+  gap: 12px;
+  max-width: 680px;
+}
+
+.staff-list-error h2,
+.staff-list-error p {
+  margin: 0;
+}
+
+.staff-list-error button {
+  justify-self: start;
+}
+
 .standalone-error,
 .http-error-page {
   max-width: 680px;

@@ -54,7 +54,11 @@ class User(AbstractUser):
     @property
     def role_keys(self):
         if not hasattr(self, "_role_keys_cache"):
-            self._role_keys_cache = tuple(self.groups.order_by("name").values_list("name", flat=True))
+            prefetched_groups = getattr(self, "_prefetched_objects_cache", {}).get("groups")
+            if prefetched_groups is not None:
+                self._role_keys_cache = tuple(sorted(group.name for group in prefetched_groups))
+            else:
+                self._role_keys_cache = tuple(self.groups.order_by("name").values_list("name", flat=True))
         return list(self._role_keys_cache)
 
     def has_role(self, role: str) -> bool:

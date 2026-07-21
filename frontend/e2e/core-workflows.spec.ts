@@ -79,6 +79,10 @@ test.describe.serial("FindManager release candidate workflows", () => {
     await expect(page.getByRole("heading", { name: "このページを表示する権限がありません" })).toBeVisible();
 
     await loginApi(page, "system_admin");
+    await page.goto("/staff");
+    await expect(page.getByRole("heading", { name: "Staff" })).toBeVisible();
+    const currentAdminRow = page.getByRole("row").filter({ hasText: "EMP-SYSTEM_ADMIN" });
+    await expect(currentAdminRow).toContainText("system_admin");
     await page.goto("/system/status");
     await expect(page.getByRole("heading", { name: "システム状態" })).toBeVisible();
     await page.getByRole("button", { name: "ログアウト" }).click();

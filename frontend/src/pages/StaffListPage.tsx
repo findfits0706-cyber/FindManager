@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
-import { api } from "../api/client";
+import { api, ApiError } from "../api/client";
 import { useAuth } from "../features/auth/AuthContext";
 import type { Paginated, Staff } from "../lib/types";
 
@@ -29,7 +29,18 @@ export function StaffListPage() {
   }
 
   if (query.isError) {
-    return <div className="error">Failed to load staff.</div>;
+    const error = query.error instanceof ApiError ? query.error : null;
+    return (
+      <section className="card staff-list-error" role="alert" aria-live="polite">
+        <h2>スタッフ一覧を取得できませんでした。</h2>
+        <p className="error">{error?.message ?? "予期しないエラーが発生しました。"}</p>
+        {error && error.status > 0 ? <p>HTTPステータス: {error.status}</p> : null}
+        {error?.requestId ? <p className="request-id">リクエストID: {error.requestId}</p> : null}
+        <button type="button" disabled={query.isFetching} onClick={() => void query.refetch()}>
+          再読込
+        </button>
+      </section>
+    );
   }
 
   return (

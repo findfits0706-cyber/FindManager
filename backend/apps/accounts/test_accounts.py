@@ -1,6 +1,8 @@
 from django.contrib.auth.models import Group
 from django.contrib.sessions.models import Session
 from django.core.cache import cache
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from rest_framework.test import APIClient, APITestCase
 
 from apps.common.models import AuditEvent
@@ -117,19 +119,82 @@ class TestAuth(BaseAPITestCase):
 
 
 class TestStaffPermissions(BaseAPITestCase):
-    def test_staff_list_permissions(self):
-        cases = [
-            (self.system_admin, 200),
-            (self.shift_manager, 200),
-            (self.supervisor, 200),
-            (self.staff, 403),
-            (self.viewer, 403),
-        ]
-        for user, expected in cases:
-            client = APIClient()
-            client.force_authenticate(user=user)
-            response = client.get("/api/v1/staff/")
-            self.assertEqual(response.status_code, expected)
+    def test_system_admin_can_list_staff(self):
+        response = self.force_client(self.system_admin).get("/api/v1/staff/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_shift_manager_can_list_staff(self):
+        response = self.force_client(self.shift_manager).get("/api/v1/staff/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_supervisor_can_list_staff_with_permission(self):
+        response = self.force_client(self.supervisor).get("/api/v1/staff/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_staff_and_viewer_cannot_list_staff(self):
+        for user in (self.staff, self.viewer):
+            with self.subTest(username=user.username):
+                response = self.force_client(user).get("/api/v1/staff/")
+                self.assertEqual(response.status_code, 403)
+
+    def test_staff_list_serializes_multiple_users_and_groups(self):
+        self.staff.groups.add(Group.objects.get(name=ROLE_VIEWER))
+
+        response = self.force_client(self.system_admin).get("/api/v1/staff/?page_size=100")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(response.data["count"], 5)
+        serialized_staff = next(item for item in response.data["results"] if item["id"] == str(self.staff.pk))
+        self.assertEqual(serialized_staff["roles"], [ROLE_STAFF, ROLE_VIEWER])
+
+    def test_staff_list_includes_inactive_staff(self):
+        self.staff.is_active = False
+        self.staff.employment_status = User.EmploymentStatus.SUSPENDED
+        self.staff.save(update_fields=["is_active", "employment_status", "updated_at"])
+
+        response = self.force_client(self.system_admin).get("/api/v1/staff/?page_size=100")
+
+        self.assertEqual(response.status_code, 200)
+        serialized_staff = next(item for item in response.data["results"] if item["id"] == str(self.staff.pk))
+        self.assertFalse(serialized_staff["is_active"])
+        self.assertEqual(serialized_staff["employment_status"], User.EmploymentStatus.SUSPENDED)
+
+    def test_staff_list_handles_user_without_roles(self):
+        roleless = User.objects.create_user(
+            username="roleless",
+            password=PASSWORD,
+            display_name="Roleless User",
+            employee_code="EMP-ROLELESS",
+            must_change_password=False,
+        )
+
+        response = self.force_client(self.system_admin).get("/api/v1/staff/?page_size=100")
+
+        self.assertEqual(response.status_code, 200)
+        serialized_user = next(item for item in response.data["results"] if item["id"] == str(roleless.pk))
+        self.assertEqual(serialized_user["roles"], [])
+
+    def test_staff_list_keeps_paginated_response_shape(self):
+        response = self.force_client(self.system_admin).get("/api/v1/staff/?page_size=2")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(set(response.data), {"count", "next", "previous", "results"})
+        self.assertEqual(len(response.data["results"]), 2)
+
+    def test_staff_list_query_count_is_constant(self):
+        def query_count():
+            actor = User.objects.get(pk=self.system_admin.pk)
+            client = self.force_client(actor)
+            with CaptureQueriesContext(connection) as queries:
+                response = client.get("/api/v1/staff/?page_size=100")
+            self.assertEqual(response.status_code, 200)
+            return len(queries)
+
+        baseline = query_count()
+        for index in range(15):
+            self.create_user(f"additional_{index}", ROLE_STAFF)
+
+        self.assertEqual(query_count(), baseline)
 
     def test_staff_create_permissions(self):
         payload = {

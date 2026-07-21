@@ -553,6 +553,24 @@ class TestOperationApi(OperationsBaseTestCase):
 
 class TestSeedDevOperations(APITestCase):
     @override_settings(DEBUG=True)
+    def test_seed_dev_repairs_existing_roleless_system_admin(self):
+        user = User.objects.create_user(
+            username="system_admin",
+            password="ExistingPassword123!",
+            display_name="Legacy Admin",
+            employee_code="LEGACY-ADMIN",
+            must_change_password=False,
+        )
+
+        call_command("seed_dev")
+
+        user.refresh_from_db()
+        self.assertEqual(user.role_keys, ["system_admin"])
+        self.assertTrue(user.is_staff)
+        self.assertTrue(user.is_superuser)
+        self.assertTrue(user.check_password("ExistingPassword123!"))
+
+    @override_settings(DEBUG=True)
     def test_seed_dev_is_idempotent(self):
         call_command("seed_dev")
         first_counts = (

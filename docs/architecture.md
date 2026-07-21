@@ -67,6 +67,8 @@
 - Monthly attendance closing page and self-service monthly attendance page
 - Labor cost estimate pages for rates, allowances, and monthly estimate review
 - Labor cost budget and planned-versus-actual variance management page
+- Revenue and labor-cost ratio management page
+- System administrator operational status page
 
 ## Phase 3 Domain Rules
 
@@ -182,3 +184,31 @@
 
 - Backend: `ruff`, `pytest`, `manage.py check`, `makemigrations --check`
 - Frontend: `eslint`, `tsc --noEmit`, `vitest --run`, `vite build`
+- Cross-domain: nine serial Playwright workflows against a dedicated seeded database
+- Supply chain: `pip-audit`, `npm audit`, lockfile installs, and container image builds in CI
+
+## Revenue Performance
+
+- Revenue performance APIs and `/finance/performance` require `system_admin` or `shift_manager` through `can_manage_financial_performance`.
+- `RevenueCategory` belongs to one location. Revenue budget and actual lines retain category code and name snapshots so historical exports remain meaningful after master changes.
+- `RevenueBudgetPeriod` approval and `RevenueActualPeriod` finalization both require the latest validation fingerprint. Warnings require explicit acknowledgement and errors block the transition.
+- Actual preview resolves approved or finalized sources first. Draft, review, or reopened sources are available only as live fallback values with explicit warnings.
+- Actual finalization locks the period and all selected source periods, then recreates the one-to-one performance snapshot and category line snapshots atomically.
+- Revenue, labor-cost, and ratio calculations use `Decimal` and shared `ROUND_HALF_UP` helpers. Ratios with a zero denominator are unavailable; revenue attainment is `0.00` only when both budget and actual are zero.
+- `content_hash` is generated from stable, sorted business inputs. `validation_fingerprint` is generated from the sorted warning/error set and therefore detects a stale preview.
+- The fixed high labor-cost ratio warning threshold is 40 percent. It is advisory and does not change stored financial values.
+- List, preview, dashboard, snapshot, and CSV paths load related rows in bulk so query counts do not grow with revenue line count.
+- CSV uses UTF-8 with BOM. Formal accounting, tax, payroll, member integration, forecasting, and optimization are outside this domain.
+
+## Production Readiness
+
+- Django reads host, CSRF, database, HTTPS, secure-cookie, HSTS, proxy, frontend-origin, and logging configuration from environment variables. Production mode rejects debug, missing or weak secrets, wildcard hosts, and invalid trusted origins at startup.
+- `/api/v1/health/` is a process liveness probe. `/api/v1/readiness/` checks database connectivity, migration state, and required settings while returning only `ready` or `not_ready`.
+- `check_deployment_readiness` performs deeper settings, infrastructure, master-data, duplicate-period, snapshot-integrity, password-lifecycle, administrator, and financial-role checks. `--settings-only` supports immutable image and CI validation.
+- `RequestIdMiddleware` accepts only restricted `X-Request-ID` values or creates a UUID. The ID is returned in the response, normalized API error payload, and structured request log.
+- Structured logs use an explicit field allowlist for timestamp, level, logger, request metadata, authenticated user/role, duration, status, and exception type. Request bodies, headers, secrets, individual financial values, revenue lines, and contact details are excluded.
+- DRF errors retain existing top-level details and field keys while adding `code`, `message`, `errors`, and `request_id`. Unexpected production errors return no stack trace.
+- The React boundary and global API event handling cover render failures, network errors, server failures, and expired sessions. Destructive operations retain per-action busy/disabled guards.
+- `/system/status` is restricted to `system_admin` and exposes only version, environment, probe and migration summaries, aggregate operational counts, and the latest audit timestamp.
+- PostgreSQL, backend Gunicorn, and frontend unprivileged Nginx images form a minimal validation stack. Secrets remain runtime environment values and are not baked into images.
+- Production deployment itself, certificates, DNS, secret-provider registration, external monitoring/storage/email, and production data are deliberately outside the repository-level release-candidate work.

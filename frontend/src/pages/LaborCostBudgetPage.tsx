@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { Navigate, useSearchParams } from "react-router-dom";
+import { Link, Navigate, useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
 import { useAuth } from "../features/auth/AuthContext";
 import type {
@@ -9,6 +9,7 @@ import type {
   LaborCostIssue,
   Location,
   Paginated,
+  RevenuePerformance,
 } from "../lib/types";
 
 const today = new Date();
@@ -87,6 +88,14 @@ export function LaborCostBudgetPage() {
     queryKey: ["labor-cost-budget-periods", queryString],
     queryFn: () => api<Paginated<LaborCostBudgetPeriod>>(`/api/v1/labor-cost-budget-periods/?${queryString}`),
     enabled: canManage,
+  });
+  const financialPerformanceQuery = useQuery({
+    queryKey: ["labor-budget-financial-performance", location, year, month],
+    queryFn: () =>
+      api<RevenuePerformance>(
+        `/api/v1/financial-performance/?location=${location}&year=${year}&month=${month}`,
+      ),
+    enabled: canManage && Boolean(location),
   });
 
   const choosePeriod = (period: LaborCostBudgetPeriod) => {
@@ -278,6 +287,20 @@ export function LaborCostBudgetPage() {
           </select>
         </label>
       </div>
+      {location && financialPerformanceQuery.data ? (
+        <div className="finance-source-strip labor-budget-finance-link">
+          <span>売上予算: {statusLabel(financialPerformanceQuery.data.revenue_budget_source_status)}</span>
+          <span>売上実績: {statusLabel(financialPerformanceQuery.data.status)}</span>
+          <span>売上予算額: {yen(financialPerformanceQuery.data.summary.revenue_budget_total)}</span>
+          <span>売上実績額: {yen(financialPerformanceQuery.data.summary.revenue_actual_total)}</span>
+          <span>予定人件費率: {percent(financialPerformanceQuery.data.summary.planned_labor_cost_ratio_to_actual_revenue)}</span>
+          <span>実績人件費率: {percent(financialPerformanceQuery.data.summary.actual_labor_cost_ratio)}</span>
+          <Link to={`/finance/performance?location=${location}&year=${year}&month=${month}`}>売上・人件費率へ進む</Link>
+        </div>
+      ) : null}
+      {location && financialPerformanceQuery.isError ? (
+        <p className="error">売上・人件費率の取得に失敗しました。</p>
+      ) : null}
       {error ? <p className="error">{error}</p> : null}
       {message ? <p className="success">{message}</p> : null}
       <div className="compact-form field-grid budget-form-grid">

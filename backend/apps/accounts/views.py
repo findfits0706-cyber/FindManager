@@ -10,6 +10,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
+from apps.common.exceptions import error_payload
 from apps.common.models import AuditEvent
 
 from .constants import ROLE_SHIFT_MANAGER, ROLE_SYSTEM_ADMIN
@@ -60,7 +61,14 @@ class LoginView(APIView):
                 request=request,
                 metadata={"username": username},
             )
-            return Response({"detail": "ユーザー名またはパスワードが正しくありません。"}, status=400)
+            return Response(
+                error_payload(
+                    status_code=400,
+                    data={"detail": "ユーザー名またはパスワードが正しくありません。"},
+                    request_id=request.request_id,
+                ),
+                status=400,
+            )
 
         if not user.check_password(password) or not user.is_login_allowed():
             create_audit_event(
@@ -68,7 +76,14 @@ class LoginView(APIView):
                 target_user=user,
                 request=request,
             )
-            return Response({"detail": "ユーザー名またはパスワードが正しくありません。"}, status=400)
+            return Response(
+                error_payload(
+                    status_code=400,
+                    data={"detail": "ユーザー名またはパスワードが正しくありません。"},
+                    request_id=request.request_id,
+                ),
+                status=400,
+            )
 
         login(request, user)
         request.session.cycle_key()

@@ -370,6 +370,45 @@ const budgetPreview = {
   ],
   can_approve: true,
 };
+const financialPerformance = {
+  period: "rp1",
+  location: "l1",
+  year: 2026,
+  month: 7,
+  status: "finalized",
+  revenue_budget_source_status: "approved",
+  labor_cost_budget_source_status: "approved",
+  labor_cost_estimate_source_status: "finalized",
+  revenue_budget_period: "rb1",
+  labor_cost_budget_period: "b1",
+  labor_cost_estimate_period: "p1",
+  content_hash: "finance-hash",
+  validation_fingerprint: "finance-fingerprint",
+  summary: {
+    revenue_budget_total: "2000000.00",
+    revenue_actual_total: "2100000.00",
+    revenue_variance_amount: "100000.00",
+    revenue_attainment_percent: "105.00",
+    labor_budget_amount: "1000000.00",
+    planned_labor_cost: "920000.00",
+    actual_labor_cost_estimate: "870000.00",
+    budget_labor_cost_ratio: "50.00",
+    planned_labor_cost_ratio_to_budget_revenue: "46.00",
+    planned_labor_cost_ratio_to_actual_revenue: "43.81",
+    actual_labor_cost_ratio: "41.43",
+    planned_vs_labor_budget_amount: "-80000.00",
+    actual_vs_labor_budget_amount: "-130000.00",
+    actual_vs_planned_labor_cost_amount: "-50000.00",
+    line_count: 1,
+    warning_count: 0,
+    error_count: 0,
+  },
+  performance_lines: [],
+  warnings: [],
+  errors: [],
+  issues: [],
+  can_finalize: false,
+};
 
 function renderWithAuth(element: ReactNode, roles = ["system_admin"]) {
   render(
@@ -410,6 +449,9 @@ function mockApi(roles = ["system_admin"]) {
     if (url.endsWith("/api/v1/auth/csrf/")) return { ok: true, json: async () => ({}) } as Response;
     if (url.includes("/api/v1/locations/")) return { ok: true, json: async () => locations } as Response;
     if (url.includes("/api/v1/staff/?")) return { ok: true, json: async () => staff } as Response;
+    if (url.includes("/financial-performance/")) {
+      return { ok: true, json: async () => financialPerformance } as Response;
+    }
     if (url.includes("/labor-cost-budget-periods/") && url.includes("/preview/")) {
       return { ok: true, json: async () => budgetPreview } as Response;
     }
@@ -539,6 +581,12 @@ describe("LaborCost pages", () => {
     );
     await user.click(screen.getByRole("button", { name: "CSV出力" }));
     expect(openMock).toHaveBeenCalledWith("/api/v1/labor-cost-budget-periods/b1/export-csv/", "_blank", "noopener");
+    await user.selectOptions(screen.getByLabelText("拠点"), "l1");
+    expect(await screen.findByRole("link", { name: "売上・人件費率へ進む" })).toHaveAttribute(
+      "href",
+      "/finance/performance?location=l1&year=2026&month=7",
+    );
+    expect(screen.getByText("予定人件費率: 43.81%")).toBeInTheDocument();
   });
 
   it("keeps the labor budget screen inaccessible to supervisors", async () => {

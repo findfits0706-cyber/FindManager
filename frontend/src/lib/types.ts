@@ -1313,6 +1313,200 @@ export type MyCapability = {
   is_active: boolean;
 };
 
+export type RevenueIssue = {
+  severity: "warning" | "error";
+  code: string;
+  message: string;
+  category?: string;
+  related_period_id?: string;
+};
+
+export type RevenueCategory = {
+  id: string;
+  location: string;
+  location_name: string;
+  code: string;
+  name: string;
+  short_name: string;
+  description: string;
+  display_order: number;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type RevenueBudgetPeriod = {
+  id: string;
+  location: string;
+  location_name: string;
+  year: number;
+  month: number;
+  name: string;
+  description: string;
+  status: "draft" | "review" | "approved" | "reopened" | "archived";
+  content_hash: string;
+  validation_fingerprint: string;
+  approved_at: string | null;
+  approved_by: string | null;
+  reopened_at: string | null;
+  reopened_by: string | null;
+  line_count: number;
+  is_active: boolean;
+};
+
+export type RevenueBudgetLine = {
+  id: string;
+  budget_period: string;
+  category: string;
+  category_code: string;
+  category_name: string;
+  category_code_snapshot: string;
+  category_name_snapshot: string;
+  budget_amount: string;
+  notes: string;
+  display_order: number;
+  is_active: boolean;
+};
+
+export type RevenueBudgetPreview = {
+  period: string;
+  location: string;
+  location_name: string;
+  location_code: string;
+  year: number;
+  month: number;
+  status: RevenueBudgetPeriod["status"];
+  content_hash: string;
+  validation_fingerprint: string;
+  lines: RevenueBudgetLine[];
+  warnings: RevenueIssue[];
+  errors: RevenueIssue[];
+  issues: RevenueIssue[];
+  summary: {
+    budget_total: string;
+    line_count: number;
+    warning_count: number;
+    error_count: number;
+  };
+  can_approve: boolean;
+};
+
+export type RevenueActualPeriod = {
+  id: string;
+  location: string;
+  location_name: string;
+  year: number;
+  month: number;
+  revenue_budget_period: string | null;
+  labor_cost_budget_period: string | null;
+  labor_cost_estimate_period: string | null;
+  name: string;
+  description: string;
+  status: "draft" | "review" | "finalized" | "reopened" | "archived";
+  content_hash: string;
+  validation_fingerprint: string;
+  finalized_at: string | null;
+  finalized_by: string | null;
+  reopened_at: string | null;
+  reopened_by: string | null;
+  line_count: number;
+  is_active: boolean;
+};
+
+export type RevenueActualLine = {
+  id: string;
+  actual_period: string;
+  category: string;
+  category_code: string;
+  category_name: string;
+  category_code_snapshot: string;
+  category_name_snapshot: string;
+  actual_amount: string;
+  source: "manual" | "imported" | "adjusted";
+  notes: string;
+  display_order: number;
+  is_active: boolean;
+};
+
+export type RevenuePerformanceLine = {
+  category: string | null;
+  category_code_snapshot: string;
+  category_name_snapshot: string;
+  budget_amount: string;
+  actual_amount: string;
+  variance_amount: string;
+  attainment_percent: string | null;
+  warning_count: number;
+  warnings: RevenueIssue[];
+  error_count: number;
+  errors: RevenueIssue[];
+  display_order: number;
+};
+
+export type RevenuePerformance = {
+  period: string | null;
+  location: string;
+  location_name?: string;
+  location_code?: string;
+  year: number;
+  month: number;
+  status: RevenueActualPeriod["status"] | "unavailable";
+  revenue_budget_source_status: "approved" | "live" | "unavailable";
+  labor_cost_budget_source_status: "approved" | "live" | "unavailable";
+  labor_cost_estimate_source_status: "finalized" | "live" | "unavailable";
+  revenue_budget_period: string | null;
+  labor_cost_budget_period: string | null;
+  labor_cost_estimate_period: string | null;
+  budget_content_hash?: string;
+  labor_budget_content_hash?: string;
+  labor_estimate_content_hash?: string;
+  content_hash: string;
+  validation_fingerprint: string;
+  summary: {
+    revenue_budget_total: string;
+    revenue_actual_total: string;
+    revenue_variance_amount: string;
+    revenue_attainment_percent: string | null;
+    labor_budget_amount: string;
+    planned_labor_cost: string;
+    actual_labor_cost_estimate: string;
+    budget_labor_cost_ratio: string | null;
+    planned_labor_cost_ratio_to_budget_revenue: string | null;
+    planned_labor_cost_ratio_to_actual_revenue: string | null;
+    actual_labor_cost_ratio: string | null;
+    planned_vs_labor_budget_amount: string;
+    actual_vs_labor_budget_amount: string;
+    actual_vs_planned_labor_cost_amount: string;
+    line_count: number;
+    warning_count: number;
+    error_count: number;
+  };
+  lines?: RevenueActualLine[];
+  performance_lines: RevenuePerformanceLine[];
+  warnings: RevenueIssue[];
+  errors: RevenueIssue[];
+  issues: RevenueIssue[];
+  can_finalize: boolean;
+  is_snapshot?: boolean;
+};
+
+export type SystemStatus = {
+  backend_version: string;
+  environment: string;
+  api_health: "ok" | "unavailable";
+  api_readiness: "ready" | "not_ready";
+  migration_status: "up_to_date" | "pending";
+  database_status: "connected" | "unavailable";
+  last_audit_event_at: string | null;
+  active_location_count: number;
+  active_staff_count: number;
+  pending_request_count: number;
+  unclosed_attendance_period_count: number;
+  unfinalized_labor_estimate_period_count: number;
+  unapproved_labor_budget_period_count: number;
+  unfinalized_revenue_actual_period_count: number;
+};
+
 export type Paginated<T> = {
   count: number;
   next: string | null;

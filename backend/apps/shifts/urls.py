@@ -1,6 +1,14 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
+from .revenue_views import (
+    FinancialPerformanceViewSet,
+    RevenueActualLineViewSet,
+    RevenueActualPeriodViewSet,
+    RevenueBudgetLineViewSet,
+    RevenueBudgetPeriodViewSet,
+    RevenueCategoryViewSet,
+)
 from .views import (
     AttendanceClosingPeriodViewSet,
     AttendanceCorrectionRequestViewSet,
@@ -40,6 +48,12 @@ router.register("staff-compensation-profiles", StaffCompensationProfileViewSet, 
 router.register("staff-allowance-assignments", StaffAllowanceAssignmentViewSet, basename="staff-allowance-assignment")
 router.register("labor-cost-estimate-periods", LaborCostEstimatePeriodViewSet, basename="labor-cost-estimate-period")
 router.register("labor-cost-budget-periods", LaborCostBudgetPeriodViewSet, basename="labor-cost-budget-period")
+router.register("revenue-categories", RevenueCategoryViewSet, basename="revenue-category")
+router.register("revenue-budget-periods", RevenueBudgetPeriodViewSet, basename="revenue-budget-period")
+router.register("revenue-budget-lines", RevenueBudgetLineViewSet, basename="revenue-budget-line")
+router.register("revenue-actual-periods", RevenueActualPeriodViewSet, basename="revenue-actual-period")
+router.register("revenue-actual-lines", RevenueActualLineViewSet, basename="revenue-actual-line")
+router.register("financial-performance", FinancialPerformanceViewSet, basename="financial-performance")
 router.register(
     "attendance-correction-requests",
     AttendanceCorrectionRequestViewSet,

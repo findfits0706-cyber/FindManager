@@ -11,3 +11,6 @@ frontend/dist/
 .ruff_cache/
 .mypy_cache/
 .env
+.e2e/
+frontend/test-results/
+frontend/playwright-report/

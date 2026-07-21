@@ -909,3 +909,260 @@ button:disabled {
     -webkit-print-color-adjust: exact;
   }
 }
+
+.finance-page {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.finance-filter-grid {
+  grid-template-columns: minmax(110px, 140px) minmax(110px, 140px) minmax(220px, 1fr);
+}
+
+.segmented-control {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  width: min(720px, 100%);
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.segmented-control button {
+  min-height: 42px;
+  border: 0;
+  border-right: 1px solid #cbd5e1;
+  border-radius: 0;
+  background: #ffffff;
+  color: #334155;
+}
+
+.segmented-control button:last-child {
+  border-right: 0;
+}
+
+.segmented-control button.active {
+  background: #155e75;
+  color: #ffffff;
+}
+
+.segmented-control button:focus-visible {
+  outline: 3px solid #f59e0b;
+  outline-offset: -3px;
+}
+
+.finance-panel {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  padding-block: 4px 20px;
+  border-bottom: 1px solid #dbe3ea;
+}
+
+.finance-source-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  padding: 10px 12px;
+  border-left: 4px solid #0f766e;
+  background: #f0fdfa;
+  color: #134e4a;
+  font-weight: 700;
+}
+
+.finance-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+}
+
+.finance-metric {
+  display: grid;
+  gap: 5px;
+  min-height: 82px;
+  padding: 12px;
+  border: 1px solid #d8e0e7;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.finance-metric span {
+  color: #64748b;
+  font-size: 0.82rem;
+}
+
+.finance-metric strong {
+  overflow-wrap: anywhere;
+  color: #172554;
+  font-size: 1.08rem;
+}
+
+.finance-category-form {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.finance-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.workflow-preview {
+  display: grid;
+  gap: 16px;
+  padding-block: 14px;
+  border-top: 1px solid #cbd5e1;
+}
+
+.finance-entry-table input {
+  width: min(240px, 100%);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 720px) {
+  .finance-filter-grid,
+  .segmented-control {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .segmented-control button:nth-child(2) {
+    border-right: 0;
+  }
+
+  .segmented-control button:nth-child(-n + 2) {
+    border-bottom: 1px solid #cbd5e1;
+  }
+}
+
+.global-error-notice {
+  position: fixed;
+  z-index: 1000;
+  right: 16px;
+  bottom: 16px;
+  width: min(440px, calc(100vw - 32px));
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px;
+  border: 1px solid #b42318;
+  border-radius: 6px;
+  background: #fff7f6;
+  color: #611a15;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 16%);
+}
+
+.global-error-notice p {
+  margin: 4px 0 0;
+}
+
+.notice-actions {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.request-id {
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.78rem;
+}
+
+.staff-list-error {
+  display: grid;
+  gap: 12px;
+  max-width: 680px;
+}
+
+.staff-list-error h2,
+.staff-list-error p {
+  margin: 0;
+}
+
+.staff-list-error button {
+  justify-self: start;
+}
+
+.standalone-error,
+.http-error-page {
+  max-width: 680px;
+  margin: 64px auto;
+  padding: 24px;
+}
+
+.standalone-error h1,
+.http-error-page h1,
+.http-error-page h2 {
+  font-size: 1.5rem;
+}
+
+.status-code {
+  margin: 0;
+  color: #b42318;
+  font-size: 2rem;
+  font-weight: 700;
+}
+
+.system-status-page {
+  display: grid;
+  gap: 20px;
+}
+
+.status-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-block: 1px solid #d6d9dd;
+}
+
+.status-summary > div {
+  display: grid;
+  gap: 4px;
+  min-height: 78px;
+  padding: 14px 16px;
+  border-right: 1px solid #d6d9dd;
+}
+
+.status-summary > div:last-child {
+  border-right: 0;
+}
+
+.status-summary span {
+  color: #5a626b;
+  font-size: 0.82rem;
+}
+
+.status-summary strong {
+  color: #12633f;
+}
+
+.system-status-page caption {
+  padding: 8px 0;
+  text-align: left;
+  font-weight: 700;
+}
+
+@media (max-width: 720px) {
+  .global-error-notice {
+    flex-direction: column;
+  }
+
+  .status-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .status-summary > div:nth-child(2) {
+    border-right: 0;
+  }
+}

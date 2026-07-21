@@ -1,14 +1,16 @@
 import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from threading import Barrier, Lock, Thread
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
-from django.db import IntegrityError, connection
-from django.test import override_settings
+from django.db import IntegrityError, close_old_connections, connection
+from django.test import TransactionTestCase, override_settings, skipUnlessDBFeature
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
+from rest_framework.serializers import ValidationError as DRFValidationError
 from rest_framework.test import APITestCase
 
 from apps.accounts.constants import ROLE_STAFF
@@ -55,6 +57,7 @@ from ..services import (
     build_labor_cost_preview,
     build_monthly_plan_content_hash,
     build_publication_preview,
+    clock_in_attendance,
     seed_shifts,
 )
 
@@ -87,6 +90,11 @@ class ShiftsBaseTestCase(BaseAPITestCase):
         if today > TEST_SHIFT_VALID_FROM:
             StaffLocation.objects.filter(staff__in=self.dev_users.values()).update(valid_from=TEST_SHIFT_VALID_FROM)
             StaffCapability.objects.filter(staff__in=self.dev_users.values()).update(valid_from=TEST_SHIFT_VALID_FROM)
+
+    def post_with_server_time(self, client, path, server_time, data=None):
+        occurred_at = datetime.fromisoformat(server_time) if isinstance(server_time, str) else server_time
+        with patch("apps.shifts.services.timezone.now", return_value=occurred_at):
+            return client.post(path, data or {}, format="json")
 
     def pattern_payload(self, code="api_pattern"):
         return {
@@ -977,60 +985,54 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         snapshot = publication.assignments.get(source_assignment=assignment)
         staff_client = self.force_client(self.staff)
 
-        clock_in = staff_client.post(
+        clock_in = self.post_with_server_time(
+            staff_client,
             "/api/v1/my-attendance/clock-in/",
-            {
-                "location": str(self.location.id),
-                "work_date": "2026-07-01",
-                "occurred_at": "2026-07-01T09:00:00+09:00",
-            },
-            format="json",
+            "2026-07-01T09:00:00+09:00",
+            {"location": str(self.location.id), "work_date": "2026-07-01"},
         )
         self.assertEqual(clock_in.status_code, 201, clock_in.data)
         self.assertEqual(clock_in.data["status"], AttendanceRecord.Status.CLOCKED_IN)
         self.assertEqual(clock_in.data["source"], AttendanceRecord.Source.SCHEDULED)
         self.assertEqual(str(clock_in.data["publication_assignment"]), str(snapshot.id))
         self.assertEqual(
-            staff_client.post(
+            self.post_with_server_time(
+                staff_client,
                 "/api/v1/my-attendance/clock-in/",
-                {
-                    "location": str(self.location.id),
-                    "work_date": "2026-07-01",
-                    "occurred_at": "2026-07-01T09:00:00+09:00",
-                },
-                format="json",
+                "2026-07-01T09:01:00+09:00",
+                {"location": str(self.location.id), "work_date": "2026-07-01"},
             ).status_code,
             400,
         )
         record_id = clock_in.data["id"]
         self.assertEqual(
-            staff_client.post(
+            self.post_with_server_time(
+                staff_client,
                 f"/api/v1/my-attendance/{record_id}/break-start/",
-                {"occurred_at": "2026-07-01T09:15:00+09:00"},
-                format="json",
+                "2026-07-01T09:15:00+09:00",
             ).data["status"],
             AttendanceRecord.Status.ON_BREAK,
         )
         self.assertEqual(
-            staff_client.post(
+            self.post_with_server_time(
+                staff_client,
                 f"/api/v1/my-attendance/{record_id}/break-start/",
-                {"occurred_at": "2026-07-01T09:15:00+09:00"},
-                format="json",
+                "2026-07-01T09:16:00+09:00",
             ).status_code,
             400,
         )
         self.assertEqual(
-            staff_client.post(
+            self.post_with_server_time(
+                staff_client,
                 f"/api/v1/my-attendance/{record_id}/break-end/",
-                {"occurred_at": "2026-07-01T09:30:00+09:00"},
-                format="json",
+                "2026-07-01T09:30:00+09:00",
             ).data["status"],
             AttendanceRecord.Status.CLOCKED_IN,
         )
-        clock_out = staff_client.post(
+        clock_out = self.post_with_server_time(
+            staff_client,
             f"/api/v1/my-attendance/{record_id}/clock-out/",
-            {"occurred_at": "2026-07-01T10:00:00+09:00"},
-            format="json",
+            "2026-07-01T10:00:00+09:00",
         )
         self.assertEqual(clock_out.status_code, 200, clock_out.data)
         self.assertEqual(clock_out.data["status"], AttendanceRecord.Status.CLOCKED_OUT)
@@ -1058,24 +1060,310 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         )
         self.assertTrue(AuditEvent.objects.filter(event_type="attendance_clock_out").exists())
 
-    def test_attendance_manager_permissions_manual_confirm_void_and_audit_rollback(self):
+    def test_self_attendance_uses_server_time_and_rejects_client_clock_fields(self):
         staff_client = self.force_client(self.staff)
-        clock_in = staff_client.post(
+        clock_in_payload = {"location": str(self.location.id), "work_date": "2026-07-10"}
+        for supplied_time in ["2020-01-01T09:00:00+09:00", "2030-01-01T09:00:00+09:00"]:
+            response = staff_client.post(
+                "/api/v1/my-attendance/clock-in/",
+                clock_in_payload | {"occurred_at": supplied_time},
+                format="json",
+            )
+            self.assertEqual(response.status_code, 400, response.data)
+            self.assertIn("occurred_at", response.data["errors"])
+        self.assertFalse(AttendanceRecord.objects.filter(staff=self.staff, work_date="2026-07-10").exists())
+
+        clock_in_at = datetime.fromisoformat("2026-07-10T09:00:03+09:00")
+        clock_in = self.post_with_server_time(
+            staff_client,
             "/api/v1/my-attendance/clock-in/",
+            clock_in_at,
+            clock_in_payload,
+        )
+        self.assertEqual(clock_in.status_code, 201, clock_in.data)
+        record_id = clock_in.data["id"]
+        event = AttendanceEvent.objects.get(
+            attendance_record_id=record_id, event_type=AttendanceEvent.EventType.CLOCK_IN
+        )
+        self.assertEqual(event.occurred_at, clock_in_at)
+
+        rejected_actions = [
+            ("break-start", "2026-07-10T10:00:00+09:00"),
+            ("break-end", "2026-07-10T10:30:00+09:00"),
+            ("clock-out", "2026-07-10T18:00:00+09:00"),
+        ]
+        for action, supplied_time in rejected_actions:
+            response = staff_client.post(
+                f"/api/v1/my-attendance/{record_id}/{action}/",
+                {"occurred_at": supplied_time},
+                format="json",
+            )
+            self.assertEqual(response.status_code, 400, response.data)
+            self.assertIn("occurred_at", response.data["errors"])
+
+        break_start_at = datetime.fromisoformat("2026-07-10T10:00:05+09:00")
+        break_end_at = datetime.fromisoformat("2026-07-10T10:30:07+09:00")
+        clock_out_at = datetime.fromisoformat("2026-07-10T18:00:09+09:00")
+        self.assertEqual(
+            self.post_with_server_time(
+                staff_client,
+                f"/api/v1/my-attendance/{record_id}/break-start/",
+                break_start_at,
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.post_with_server_time(
+                staff_client,
+                f"/api/v1/my-attendance/{record_id}/break-end/",
+                break_end_at,
+            ).status_code,
+            200,
+        )
+        overridden_record_fields = staff_client.post(
+            f"/api/v1/my-attendance/{record_id}/clock-out/",
+            {"location": str(uuid.uuid4()), "work_date": "2026-07-11"},
+            format="json",
+        )
+        self.assertEqual(overridden_record_fields.status_code, 400, overridden_record_fields.data)
+        self.assertEqual(set(overridden_record_fields.data["errors"]), {"location", "work_date"})
+        clock_out = self.post_with_server_time(
+            staff_client,
+            f"/api/v1/my-attendance/{record_id}/clock-out/",
+            clock_out_at,
+        )
+        self.assertEqual(clock_out.status_code, 200, clock_out.data)
+        self.assertEqual(
+            list(
+                AttendanceEvent.objects.filter(attendance_record_id=record_id)
+                .order_by("occurred_at")
+                .values_list("occurred_at", flat=True)
+            ),
+            [clock_in_at, break_start_at, break_end_at, clock_out_at],
+        )
+
+        historical_record = AttendanceRecord.objects.create(
+            location=self.location,
+            staff=self.staff,
+            work_date="2020-01-15",
+        )
+        adjusted = self.force_client(self.system_admin).post(
+            f"/api/v1/attendance-records/{historical_record.id}/manual-adjust/",
             {
-                "location": str(self.location.id),
-                "work_date": "2026-07-02",
-                "occurred_at": "2026-07-02T09:00:00+09:00",
+                "actual_clock_in_at": "2020-01-15T09:00:00+09:00",
+                "actual_clock_out_at": "2020-01-15T17:00:00+09:00",
+                "break_minutes": 60,
             },
             format="json",
+        )
+        self.assertEqual(adjusted.status_code, 200, adjusted.data)
+        self.assertEqual(adjusted.data["actual_clock_in_at"], "2020-01-15T09:00:00+09:00")
+
+    def test_unscheduled_clock_in_requires_dated_active_membership_and_location_local_today(self):
+        staff_client = self.force_client(self.staff)
+
+        def create_location(code, *, is_active=True, timezone_name="Asia/Tokyo"):
+            return Location.objects.create(
+                code=code,
+                name=code,
+                short_name=code,
+                timezone=timezone_name,
+                is_active=is_active,
+            )
+
+        active_location = create_location("clock-active")
+        StaffLocation.objects.create(
+            staff=self.staff,
+            location=active_location,
+            valid_from="2026-07-01",
+            is_active=True,
+        )
+        allowed = self.post_with_server_time(
+            staff_client,
+            "/api/v1/my-attendance/clock-in/",
+            "2026-07-10T09:00:00+09:00",
+            {"location": str(active_location.id), "work_date": "2026-07-10"},
+        )
+        self.assertEqual(allowed.status_code, 201, allowed.data)
+
+        membership_cases = [
+            ("clock-none", None),
+            ("clock-inactive-membership", {"valid_from": "2026-07-01", "is_active": False}),
+            ("clock-before-membership", {"valid_from": "2026-07-11", "is_active": True}),
+            (
+                "clock-after-membership",
+                {"valid_from": "2026-07-01", "valid_until": "2026-07-09", "is_active": True},
+            ),
+        ]
+        for code, membership in membership_cases:
+            location = create_location(code)
+            if membership:
+                StaffLocation.objects.create(staff=self.staff, location=location, **membership)
+            response = self.post_with_server_time(
+                staff_client,
+                "/api/v1/my-attendance/clock-in/",
+                "2026-07-10T09:00:00+09:00",
+                {"location": str(location.id), "work_date": "2026-07-10"},
+            )
+            self.assertEqual(response.status_code, 400, (code, response.data))
+            self.assertIn("location", response.data["errors"])
+
+        inactive_location = create_location("clock-inactive-location", is_active=False)
+        StaffLocation.objects.create(
+            staff=self.staff,
+            location=inactive_location,
+            valid_from="2026-07-01",
+            is_active=True,
+        )
+        inactive_response = self.post_with_server_time(
+            staff_client,
+            "/api/v1/my-attendance/clock-in/",
+            "2026-07-10T09:00:00+09:00",
+            {"location": str(inactive_location.id), "work_date": "2026-07-10"},
+        )
+        self.assertEqual(inactive_response.status_code, 400, inactive_response.data)
+
+        honolulu = create_location("clock-honolulu", timezone_name="Pacific/Honolulu")
+        StaffLocation.objects.create(staff=self.staff, location=honolulu, valid_from="2026-06-01", is_active=True)
+        honolulu_today = self.post_with_server_time(
+            staff_client,
+            "/api/v1/my-attendance/clock-in/",
+            "2026-07-01T02:00:00+00:00",
+            {"location": str(honolulu.id), "work_date": "2026-06-30"},
+        )
+        self.assertEqual(honolulu_today.status_code, 201, honolulu_today.data)
+
+    def test_unscheduled_clock_in_rejects_past_and_future_work_dates(self):
+        staff_client = self.force_client(self.staff)
+        server_now = "2026-07-10T09:00:00+09:00"
+        for work_date in ["2026-07-09", "2026-07-11"]:
+            response = self.post_with_server_time(
+                staff_client,
+                "/api/v1/my-attendance/clock-in/",
+                server_now,
+                {"location": str(self.location.id), "work_date": work_date},
+            )
+            self.assertEqual(response.status_code, 400, response.data)
+            self.assertIn("work_date", response.data["errors"])
+        current = self.post_with_server_time(
+            staff_client,
+            "/api/v1/my-attendance/clock-in/",
+            server_now,
+            {"location": str(self.location.id), "work_date": "2026-07-10"},
+        )
+        self.assertEqual(current.status_code, 201, current.data)
+
+    def test_active_publication_allows_clocking_without_membership_but_withdrawn_publication_does_not(self):
+        withdrawn_staff = self.create_user("withdrawn_clock_staff", ROLE_STAFF)
+        StaffLocation.objects.create(
+            staff=withdrawn_staff,
+            location=self.location,
+            valid_from="2026-07-01",
+            is_active=True,
+        )
+        plan = self.create_plan()
+        self.create_assignment_record(plan, staff=self.staff, work_date="2026-07-10")
+        self.create_assignment_record(plan, staff=withdrawn_staff, work_date="2026-07-10")
+        publication = self.publish_plan(plan)
+        StaffLocation.objects.filter(staff__in=[self.staff, withdrawn_staff], location=self.location).update(
+            is_active=False
+        )
+
+        scheduled = self.post_with_server_time(
+            self.force_client(self.staff),
+            "/api/v1/my-attendance/clock-in/",
+            "2026-07-10T09:00:00+09:00",
+            {"location": str(self.location.id), "work_date": "2026-07-10"},
+        )
+        self.assertEqual(scheduled.status_code, 201, scheduled.data)
+        self.assertEqual(scheduled.data["source"], AttendanceRecord.Source.SCHEDULED)
+
+        publication.is_active = False
+        publication.withdrawn_at = datetime.fromisoformat("2026-07-09T12:00:00+09:00")
+        publication.save(update_fields=["is_active", "withdrawn_at"])
+        withdrawn = self.post_with_server_time(
+            self.force_client(withdrawn_staff),
+            "/api/v1/my-attendance/clock-in/",
+            "2026-07-10T09:00:00+09:00",
+            {"location": str(self.location.id), "work_date": "2026-07-10"},
+        )
+        self.assertEqual(withdrawn.status_code, 400, withdrawn.data)
+        self.assertIn("location", withdrawn.data["errors"])
+
+    def test_next_day_published_shift_clock_out_and_2880_minute_limit(self):
+        outside_staff = self.create_user("outside_clock_staff", ROLE_STAFF)
+        StaffLocation.objects.create(
+            staff=outside_staff,
+            location=self.location,
+            valid_from="2026-07-01",
+            is_active=True,
+        )
+        plan = self.create_plan()
+        self.create_assignment_record(
+            plan,
+            staff=self.staff,
+            work_date="2026-07-01",
+            start_offset_minutes=1380,
+            end_offset_minutes=1500,
+        )
+        self.create_assignment_record(
+            plan,
+            staff=outside_staff,
+            work_date="2026-07-01",
+            start_offset_minutes=1380,
+            end_offset_minutes=1500,
+        )
+        self.publish_plan(plan)
+
+        clock_in = self.post_with_server_time(
+            self.force_client(self.staff),
+            "/api/v1/my-attendance/clock-in/",
+            "2026-07-01T23:30:00+09:00",
+            {"location": str(self.location.id), "work_date": "2026-07-01"},
+        )
+        next_day_clock_out = self.post_with_server_time(
+            self.force_client(self.staff),
+            f"/api/v1/my-attendance/{clock_in.data['id']}/clock-out/",
+            "2026-07-02T01:00:00+09:00",
+        )
+        self.assertEqual(next_day_clock_out.status_code, 200, next_day_clock_out.data)
+        self.assertEqual(next_day_clock_out.data["actual_end_offset_minutes"], 1500)
+
+        outside_clock_in = self.post_with_server_time(
+            self.force_client(outside_staff),
+            "/api/v1/my-attendance/clock-in/",
+            "2026-07-01T23:30:00+09:00",
+            {"location": str(self.location.id), "work_date": "2026-07-01"},
+        )
+        outside_range = self.post_with_server_time(
+            self.force_client(outside_staff),
+            f"/api/v1/my-attendance/{outside_clock_in.data['id']}/clock-out/",
+            "2026-07-03T00:01:00+09:00",
+        )
+        self.assertEqual(outside_range.status_code, 400, outside_range.data)
+        self.assertIn("occurred_at", outside_range.data["errors"])
+        self.assertFalse(
+            AttendanceEvent.objects.filter(
+                attendance_record_id=outside_clock_in.data["id"],
+                event_type=AttendanceEvent.EventType.CLOCK_OUT,
+            ).exists()
+        )
+
+    def test_attendance_manager_permissions_manual_confirm_void_and_audit_rollback(self):
+        staff_client = self.force_client(self.staff)
+        clock_in = self.post_with_server_time(
+            staff_client,
+            "/api/v1/my-attendance/clock-in/",
+            "2026-07-02T09:00:00+09:00",
+            {"location": str(self.location.id), "work_date": "2026-07-02"},
         )
         self.assertEqual(clock_in.status_code, 201, clock_in.data)
         record_id = clock_in.data["id"]
         self.assertEqual(
-            staff_client.post(
+            self.post_with_server_time(
+                staff_client,
                 f"/api/v1/my-attendance/{record_id}/clock-out/",
-                {"occurred_at": "2026-07-02T10:00:00+09:00"},
-                format="json",
+                "2026-07-02T10:00:00+09:00",
             ).status_code,
             200,
         )
@@ -1118,7 +1406,7 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         self.assertEqual(
             staff_client.post(
                 f"/api/v1/my-attendance/{record_id}/break-start/",
-                {"occurred_at": "2026-07-02T10:15:00+09:00"},
+                {},
                 format="json",
             ).status_code,
             400,
@@ -1155,14 +1443,11 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         self.assertEqual(voided.data["status"], AttendanceRecord.Status.VOID)
         self.assertTrue(AuditEvent.objects.filter(event_type="attendance_voided").exists())
 
-        rollback = staff_client.post(
+        rollback = self.post_with_server_time(
+            staff_client,
             "/api/v1/my-attendance/clock-in/",
-            {
-                "location": str(self.location.id),
-                "work_date": "2026-07-03",
-                "occurred_at": "2026-07-03T09:00:00+09:00",
-            },
-            format="json",
+            "2026-07-03T09:00:00+09:00",
+            {"location": str(self.location.id), "work_date": "2026-07-03"},
         )
         admin.raise_request_exception = False
         with patch("apps.shifts.views.record_shift_event", side_effect=RuntimeError("audit failed")):
@@ -1174,21 +1459,18 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
 
     def test_attendance_correction_request_workflow_and_permissions(self):
         staff_client = self.force_client(self.staff)
-        clock_in = staff_client.post(
+        clock_in = self.post_with_server_time(
+            staff_client,
             "/api/v1/my-attendance/clock-in/",
-            {
-                "location": str(self.location.id),
-                "work_date": "2026-07-04",
-                "occurred_at": "2026-07-04T09:00:00+09:00",
-            },
-            format="json",
+            "2026-07-04T09:00:00+09:00",
+            {"location": str(self.location.id), "work_date": "2026-07-04"},
         )
         record_id = clock_in.data["id"]
         self.assertEqual(
-            staff_client.post(
+            self.post_with_server_time(
+                staff_client,
                 f"/api/v1/my-attendance/{record_id}/clock-out/",
-                {"occurred_at": "2026-07-04T10:00:00+09:00"},
-                format="json",
+                "2026-07-04T10:00:00+09:00",
             ).status_code,
             200,
         )
@@ -1268,14 +1550,11 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         self.assertEqual(record.actual_start_offset_minutes, 555)
         self.assertTrue(AuditEvent.objects.filter(event_type="attendance_correction_applied").exists())
 
-        other_clock = self.force_client(self.shift_manager).post(
+        other_clock = self.post_with_server_time(
+            self.force_client(self.shift_manager),
             "/api/v1/my-attendance/clock-in/",
-            {
-                "location": str(self.location.id),
-                "work_date": "2026-07-04",
-                "occurred_at": "2026-07-04T09:00:00+09:00",
-            },
-            format="json",
+            "2026-07-04T09:00:00+09:00",
+            {"location": str(self.location.id), "work_date": "2026-07-04"},
         )
         self.assertEqual(
             staff_client.post(
@@ -1448,14 +1727,11 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         my_published = staff_client.get("/api/v1/my-published-shifts/?date_from=2026-07-01&date_to=2026-07-01")
         self.assertEqual(my_published.status_code, 200, my_published.data)
         self.assertTrue(my_published.data["shifts"][0]["is_month_closed"])
-        locked_clock = staff_client.post(
+        locked_clock = self.post_with_server_time(
+            staff_client,
             "/api/v1/my-attendance/clock-in/",
-            {
-                "location": str(self.location.id),
-                "work_date": "2026-07-01",
-                "occurred_at": "2026-07-01T09:00:00+09:00",
-            },
-            format="json",
+            "2026-07-01T09:00:00+09:00",
+            {"location": str(self.location.id), "work_date": "2026-07-01"},
         )
         self.assertEqual(locked_clock.status_code, 400)
 
@@ -1466,14 +1742,11 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         )
         self.assertEqual(reopened.status_code, 200, reopened.data)
         self.assertEqual(reopened.data["status"], AttendanceClosingPeriod.Status.REOPENED)
-        unlocked_clock = staff_client.post(
+        unlocked_clock = self.post_with_server_time(
+            staff_client,
             "/api/v1/my-attendance/clock-in/",
-            {
-                "location": str(self.location.id),
-                "work_date": "2026-07-01",
-                "occurred_at": "2026-07-01T09:00:00+09:00",
-            },
-            format="json",
+            "2026-07-01T09:00:00+09:00",
+            {"location": str(self.location.id), "work_date": "2026-07-01"},
         )
         self.assertEqual(unlocked_clock.status_code, 201, unlocked_clock.data)
         archived = client.post(
@@ -4305,6 +4578,85 @@ class TestMonthlyShiftApi(ShiftsBaseTestCase):
         self.assertFalse(MonthlyShiftAssignment.objects.filter(monthly_shift_plan=plan).exists())
         plan.refresh_from_db()
         self.assertEqual(plan.last_generated_at, before_last_generated_at)
+
+
+class TestAttendanceClockInConcurrency(TransactionTestCase):
+    @skipUnlessDBFeature("has_select_for_update")
+    def test_concurrent_clock_in_keeps_one_active_record_and_one_clock_in_event(self):
+        staff = User.objects.create_user(
+            username="concurrent_clock_staff",
+            password="DevPassword123!",
+            display_name="Concurrent clock staff",
+            employee_code="EMP-CONCURRENT-CLOCK",
+        )
+        location = Location.objects.create(
+            code="concurrent-clock",
+            name="Concurrent clock",
+            short_name="Concurrent",
+            timezone="Asia/Tokyo",
+        )
+        work_date = date(2026, 7, 10)
+        StaffLocation.objects.create(staff=staff, location=location, valid_from=work_date)
+        barrier = Barrier(2)
+        result_lock = Lock()
+        outcomes = []
+
+        def clock_in_worker():
+            close_old_connections()
+            try:
+                worker_staff = User.objects.get(pk=staff.pk)
+                worker_location = Location.objects.get(pk=location.pk)
+                barrier.wait(timeout=10)
+                record, _ = clock_in_attendance(
+                    staff=worker_staff,
+                    location=worker_location,
+                    work_date=work_date,
+                    actor=worker_staff,
+                )
+                outcome = ("created", str(record.id))
+            except DRFValidationError as exc:
+                outcome = ("rejected", str(exc))
+            except Exception as exc:  # pragma: no cover - assertion below reports unexpected thread failures
+                outcome = ("error", repr(exc))
+            finally:
+                close_old_connections()
+            with result_lock:
+                outcomes.append(outcome)
+
+        threads = [Thread(target=clock_in_worker) for _ in range(2)]
+        with patch(
+            "apps.shifts.services.timezone.now",
+            return_value=datetime.fromisoformat("2026-07-10T09:00:00+09:00"),
+        ):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=15)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads), outcomes)
+        self.assertEqual(sorted(item[0] for item in outcomes), ["created", "rejected"])
+        record = AttendanceRecord.objects.get(
+            staff=staff,
+            location=location,
+            work_date=work_date,
+            is_active=True,
+        )
+        self.assertEqual(
+            AttendanceRecord.objects.filter(
+                staff=staff,
+                location=location,
+                work_date=work_date,
+                is_active=True,
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            AttendanceEvent.objects.filter(
+                attendance_record=record,
+                event_type=AttendanceEvent.EventType.CLOCK_IN,
+            ).count(),
+            1,
+        )
 
 
 class TestSeedDevShifts(APITestCase):

@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import { createContext, useContext, useEffect, useState } from "react";
-import { api } from "../../api/client";
+import { api, SESSION_EXPIRED_EVENT } from "../../api/client";
 import type { User } from "../../lib/types";
 
 type AuthContextValue = {
@@ -29,6 +29,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     void refresh();
+  }, []);
+
+  useEffect(() => {
+    const clearExpiredSession = () => setUser(null);
+    window.addEventListener(SESSION_EXPIRED_EVENT, clearExpiredSession);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, clearExpiredSession);
   }, []);
 
   return <AuthContext.Provider value={{ user, loading, refresh, setUser }}>{children}</AuthContext.Provider>;

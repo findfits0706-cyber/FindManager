@@ -25,6 +25,13 @@ from .models import (
     MonthlyShiftPublicationAssignment,
     MonthlyShiftPublicationSegment,
     MonthlyShiftSegment,
+    RevenueActualLine,
+    RevenueActualPeriod,
+    RevenueBudgetLine,
+    RevenueBudgetPeriod,
+    RevenueCategory,
+    RevenuePerformanceLineSnapshot,
+    RevenuePerformanceSnapshot,
     ShiftChangeRequest,
     ShiftPattern,
     ShiftPatternSegment,
@@ -1707,6 +1714,372 @@ class LaborCostBudgetManagerNoteSerializer(serializers.Serializer):
     manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
 
 
+class RevenueCategorySerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source="location.name", read_only=True)
+    created_by_display_name = serializers.CharField(source="created_by.display_name", read_only=True)
+    updated_by_display_name = serializers.CharField(source="updated_by.display_name", read_only=True)
+
+    class Meta:
+        model = RevenueCategory
+        validators = []
+        fields = [
+            "id",
+            "location",
+            "location_name",
+            "code",
+            "name",
+            "short_name",
+            "description",
+            "display_order",
+            "is_active",
+            "created_by",
+            "created_by_display_name",
+            "updated_by",
+            "updated_by_display_name",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_by", "updated_by", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        if self.instance is not None and "location" in attrs and attrs["location"].id != self.instance.location_id:
+            raise serializers.ValidationError({"location": "作成後は変更できません。"})
+        return attrs
+
+    def create(self, validated_data):
+        actor = self.context["request"].user
+        category = RevenueCategory(created_by=actor, updated_by=actor, **validated_data)
+        category.full_clean()
+        category.save()
+        return category
+
+    def update(self, instance, validated_data):
+        for field in ["code", "name", "short_name", "description", "display_order", "is_active"]:
+            if field in validated_data:
+                setattr(instance, field, validated_data[field])
+        instance.updated_by = self.context["request"].user
+        instance.full_clean()
+        instance.save()
+        return instance
+
+
+class RevenueBudgetPeriodSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source="location.name", read_only=True)
+    approved_by_display_name = serializers.CharField(source="approved_by.display_name", read_only=True)
+    reopened_by_display_name = serializers.CharField(source="reopened_by.display_name", read_only=True)
+    line_count = serializers.SerializerMethodField()
+    name = serializers.CharField(required=False, allow_blank=True, trim_whitespace=True)
+
+    class Meta:
+        model = RevenueBudgetPeriod
+        validators = []
+        fields = [
+            "id",
+            "location",
+            "location_name",
+            "year",
+            "month",
+            "name",
+            "description",
+            "status",
+            "content_hash",
+            "validation_fingerprint",
+            "approved_at",
+            "approved_by",
+            "approved_by_display_name",
+            "reopened_at",
+            "reopened_by",
+            "reopened_by_display_name",
+            "created_by",
+            "updated_by",
+            "line_count",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+        read_only_fields = [
+            "id",
+            "status",
+            "content_hash",
+            "validation_fingerprint",
+            "approved_at",
+            "approved_by",
+            "reopened_at",
+            "reopened_by",
+            "created_by",
+            "updated_by",
+            "line_count",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+
+    def get_line_count(self, obj):
+        if hasattr(obj, "line_total"):
+            return obj.line_total
+        return obj.lines.filter(is_active=True).count()
+
+    def validate(self, attrs):
+        if self.instance is not None:
+            if self.instance.status == RevenueBudgetPeriod.Status.ARCHIVED:
+                raise serializers.ValidationError({"status": "アーカイブ済み売上予算は編集できません。"})
+            if self.instance.status == RevenueBudgetPeriod.Status.APPROVED:
+                raise serializers.ValidationError({"status": "承認済み売上予算は再オープン後に編集してください。"})
+            errors = {}
+            for field in ["location", "year", "month"]:
+                if field in attrs and attrs[field] != getattr(self.instance, field):
+                    errors[field] = "作成後は変更できません。"
+            if errors:
+                raise serializers.ValidationError(errors)
+        return attrs
+
+    def create(self, validated_data):
+        actor = self.context["request"].user
+        if not validated_data.get("name"):
+            location = validated_data["location"]
+            year = validated_data["year"]
+            month = validated_data["month"]
+            validated_data["name"] = f"{location.short_name} {year}-{month:02d} 売上予算"
+        period = RevenueBudgetPeriod(created_by=actor, updated_by=actor, **validated_data)
+        period.full_clean()
+        period.save()
+        return period
+
+    def update(self, instance, validated_data):
+        for field in ["name", "description"]:
+            if field in validated_data:
+                setattr(instance, field, validated_data[field])
+        instance.updated_by = self.context["request"].user
+        instance.full_clean()
+        instance.save()
+        return instance
+
+
+class RevenueBudgetLineSerializer(serializers.ModelSerializer):
+    category_code = serializers.CharField(source="category.code", read_only=True)
+    category_name = serializers.CharField(source="category.name", read_only=True)
+
+    class Meta:
+        model = RevenueBudgetLine
+        validators = []
+        fields = [
+            "id",
+            "budget_period",
+            "category",
+            "category_code",
+            "category_name",
+            "category_code_snapshot",
+            "category_name_snapshot",
+            "budget_amount",
+            "notes",
+            "display_order",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "category_code_snapshot", "category_name_snapshot", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        if self.instance is not None:
+            for field in ["budget_period", "category"]:
+                if field in attrs and attrs[field] != getattr(self.instance, field):
+                    raise serializers.ValidationError({field: "作成後は変更できません。"})
+        return attrs
+
+    def create(self, validated_data):
+        category = validated_data["category"]
+        line = RevenueBudgetLine(
+            category_code_snapshot=category.code,
+            category_name_snapshot=category.name,
+            **validated_data,
+        )
+        line.full_clean()
+        line.save()
+        return line
+
+    def update(self, instance, validated_data):
+        for field in ["budget_amount", "notes", "display_order", "is_active"]:
+            if field in validated_data:
+                setattr(instance, field, validated_data[field])
+        instance.full_clean()
+        instance.save()
+        return instance
+
+
+class RevenueActualPeriodSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source="location.name", read_only=True)
+    finalized_by_display_name = serializers.CharField(source="finalized_by.display_name", read_only=True)
+    reopened_by_display_name = serializers.CharField(source="reopened_by.display_name", read_only=True)
+    line_count = serializers.SerializerMethodField()
+    name = serializers.CharField(required=False, allow_blank=True, trim_whitespace=True)
+
+    class Meta:
+        model = RevenueActualPeriod
+        validators = []
+        fields = [
+            "id",
+            "location",
+            "location_name",
+            "year",
+            "month",
+            "revenue_budget_period",
+            "labor_cost_budget_period",
+            "labor_cost_estimate_period",
+            "name",
+            "description",
+            "status",
+            "content_hash",
+            "validation_fingerprint",
+            "finalized_at",
+            "finalized_by",
+            "finalized_by_display_name",
+            "reopened_at",
+            "reopened_by",
+            "reopened_by_display_name",
+            "created_by",
+            "updated_by",
+            "line_count",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+        read_only_fields = [
+            "id",
+            "status",
+            "content_hash",
+            "validation_fingerprint",
+            "finalized_at",
+            "finalized_by",
+            "reopened_at",
+            "reopened_by",
+            "created_by",
+            "updated_by",
+            "line_count",
+            "created_at",
+            "updated_at",
+            "is_active",
+        ]
+
+    def get_line_count(self, obj):
+        if hasattr(obj, "line_total"):
+            return obj.line_total
+        return obj.lines.filter(is_active=True).count()
+
+    def validate(self, attrs):
+        if self.instance is not None:
+            if self.instance.status == RevenueActualPeriod.Status.ARCHIVED:
+                raise serializers.ValidationError({"status": "アーカイブ済み売上実績は編集できません。"})
+            if self.instance.status == RevenueActualPeriod.Status.FINALIZED:
+                raise serializers.ValidationError({"status": "確定済み売上実績は再オープン後に編集してください。"})
+            errors = {}
+            for field in ["location", "year", "month"]:
+                if field in attrs and attrs[field] != getattr(self.instance, field):
+                    errors[field] = "作成後は変更できません。"
+            if errors:
+                raise serializers.ValidationError(errors)
+        return attrs
+
+    def create(self, validated_data):
+        actor = self.context["request"].user
+        if not validated_data.get("name"):
+            location = validated_data["location"]
+            year = validated_data["year"]
+            month = validated_data["month"]
+            validated_data["name"] = f"{location.short_name} {year}-{month:02d} 売上実績"
+        period = RevenueActualPeriod(created_by=actor, updated_by=actor, **validated_data)
+        period.full_clean()
+        period.save()
+        return period
+
+    def update(self, instance, validated_data):
+        for field in [
+            "name",
+            "description",
+            "revenue_budget_period",
+            "labor_cost_budget_period",
+            "labor_cost_estimate_period",
+        ]:
+            if field in validated_data:
+                setattr(instance, field, validated_data[field])
+        instance.updated_by = self.context["request"].user
+        instance.full_clean()
+        instance.save()
+        return instance
+
+
+class RevenueActualLineSerializer(serializers.ModelSerializer):
+    category_code = serializers.CharField(source="category.code", read_only=True)
+    category_name = serializers.CharField(source="category.name", read_only=True)
+
+    class Meta:
+        model = RevenueActualLine
+        validators = []
+        fields = [
+            "id",
+            "actual_period",
+            "category",
+            "category_code",
+            "category_name",
+            "category_code_snapshot",
+            "category_name_snapshot",
+            "actual_amount",
+            "source",
+            "notes",
+            "display_order",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "category_code_snapshot", "category_name_snapshot", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        if self.instance is not None:
+            for field in ["actual_period", "category"]:
+                if field in attrs and attrs[field] != getattr(self.instance, field):
+                    raise serializers.ValidationError({field: "作成後は変更できません。"})
+        return attrs
+
+    def create(self, validated_data):
+        category = validated_data["category"]
+        line = RevenueActualLine(
+            category_code_snapshot=category.code,
+            category_name_snapshot=category.name,
+            **validated_data,
+        )
+        line.full_clean()
+        line.save()
+        return line
+
+    def update(self, instance, validated_data):
+        for field in ["actual_amount", "source", "notes", "display_order", "is_active"]:
+            if field in validated_data:
+                setattr(instance, field, validated_data[field])
+        instance.full_clean()
+        instance.save()
+        return instance
+
+
+class RevenuePerformanceSnapshotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RevenuePerformanceSnapshot
+        fields = "__all__"
+
+
+class RevenuePerformanceLineSnapshotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RevenuePerformanceLineSnapshot
+        fields = "__all__"
+
+
+class RevenueWorkflowSerializer(serializers.Serializer):
+    acknowledge_warnings = serializers.BooleanField(default=False)
+    validation_fingerprint = serializers.CharField(max_length=64)
+
+
+class RevenueManagerNoteSerializer(serializers.Serializer):
+    manager_note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
+
+
 class AttendanceEventSerializer(serializers.ModelSerializer):
     actor_display_name = serializers.CharField(source="actor.display_name", read_only=True)
 
@@ -1959,15 +2332,28 @@ class AttendanceRecordSerializer(serializers.ModelSerializer):
         return period.name if period else ""
 
 
-class AttendanceClockInSerializer(serializers.Serializer):
+class AttendanceServerTimedSerializer(serializers.Serializer):
+    server_managed_fields = ("occurred_at",)
+
+    def validate(self, attrs):
+        errors = {
+            field: "本人打刻では指定できません。サーバー時刻を使用します。"
+            for field in self.server_managed_fields
+            if field in self.initial_data
+        }
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
+
+class AttendanceClockInSerializer(AttendanceServerTimedSerializer):
     location = serializers.PrimaryKeyRelatedField(queryset=Location.objects.filter(is_active=True))
     work_date = serializers.DateField()
-    occurred_at = serializers.DateTimeField(required=False, allow_null=True)
     note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
 
 
-class AttendanceClockEventSerializer(serializers.Serializer):
-    occurred_at = serializers.DateTimeField(required=False, allow_null=True)
+class AttendanceClockEventSerializer(AttendanceServerTimedSerializer):
+    server_managed_fields = ("occurred_at", "location", "work_date")
     note = serializers.CharField(required=False, allow_blank=True, trim_whitespace=False)
 
 
